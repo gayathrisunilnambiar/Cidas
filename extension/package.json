@@ -1,0 +1,72 @@
+{
+  "name": "cidas",
+  "displayName": "CIDAS — npm Security Screening",
+  "description": "Pre-install npm package security screening powered by a local AI daemon.",
+  "version": "0.1.0",
+  "publisher": "cidas",
+  "engines": { "vscode": "^1.89.0" },
+  "categories": ["Other", "Linters"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "cidas.screenPackage",
+        "title": "CIDAS: Screen npm Package"
+      },
+      {
+        "command": "cidas.startDaemon",
+        "title": "CIDAS: Start Local Daemon"
+      },
+      {
+        "command": "cidas.stopDaemon",
+        "title": "CIDAS: Stop Local Daemon"
+      },
+      {
+        "command": "cidas.showStatus",
+        "title": "CIDAS: Show Status"
+      }
+    ],
+    "configuration": {
+      "title": "CIDAS",
+      "properties": {
+        "cidas.daemonUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:7979",
+          "description": "URL of the CIDAS local daemon."
+        },
+        "cidas.daemonSecret": {
+          "type": "string",
+          "default": "",
+          "description": "Shared secret for daemon authentication (must match DAEMON_SECRET in .env)."
+        },
+        "cidas.autoScreen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically screen packages when npm install is detected."
+        },
+        "cidas.blockOnHighRisk": {
+          "type": "boolean",
+          "default": true,
+          "description": "Block installation when risk score exceeds the BLOCK threshold."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "vitest run",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.89.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0",
+    "@vitest/coverage-v8": "^1.6.0"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.0"
+  }
+}
