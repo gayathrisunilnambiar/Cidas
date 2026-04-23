@@ -1,82 +1,86 @@
 # CIDAS Threat Model
 
-## Scope
+## Adversary model
 
-CIDAS defends a developer workstation from **supply-chain attacks delivered
-via npm packages** at install time. It does not replace production runtime
-security tooling (SCA scanners, WAFs, SAST).
+| Capability level | Description |
+|---|---|
+| **Registry write** | Attacker can publish packages to the npm registry |
+| **Metadata control** | Attacker controls package description, README, scripts |
+| **LLM API access** | Attacker can craft inputs to AI coding assistants |
+
+CIDAS is scoped to the **developer workstation** — it does not defend running
+production systems or CI pipelines where the shim is not installed.
 
 ## Assets
 
 | Asset | Value |
 |---|---|
-| Developer credentials (git tokens, cloud keys) | High |
-| Source code | High |
+| Developer credentials (git tokens, cloud API keys) | Critical |
+| Source code and IP | High |
 | CI/CD pipeline configuration | High |
-| Installed npm packages | Medium |
+| Developer machine environment | Medium |
 
-## Threat actors
+## Attack vector categories
 
-| Actor | Motivation | Capability |
-|---|---|---|
-| Typosquatter | Financial gain via credential theft | Low–Medium |
-| Compromised maintainer | Supply-chain sabotage | Medium–High |
-| Nation-state / APT | Targeted espionage | High |
+### AV-1 — Typosquatting
+Attacker publishes `lodasH` (1-char drift from `lodash`). A mistyped install
+silently executes a malicious `postinstall`.
 
-## Threat scenarios
+**Coverage:** Sentinel pillar (Levenshtein ≤ 2 → +40 risk).
+**Residual risk:** Packages beyond the top-500 list are not checked.
 
-### T1 — Typosquatting
-Attacker publishes `lodasH` (1-char difference from `lodash`). Developer
-mistype triggers a malicious install.
+### AV-2 — Dependency hijack / abandoned package
+A formerly safe package is taken over by a malicious actor, or a package with
+known CVEs is pinned without version bumps.
 
-**CIDAS mitigation:** Sentinel pillar runs Levenshtein distance check against
-the top 20 packages. Distance ≤ 2 → +50 risk points.
+**Coverage:** Shield pillar queries OSV; Sentinel checks package age and
+maintainer count.
 
-### T2 — Malicious install script
-Package includes a `postinstall` script that exfiltrates `process.env` variables
-containing API keys.
+### AV-3 — AI hallucination exploit
+Developer asks Copilot/Claude to suggest a package; the model hallucinates a
+plausible-but-nonexistent name. Attacker registers that name first.
 
-**CIDAS mitigation:** Shield pillar pattern-matches lifecycle scripts for
-`process.env.*KEY|TOKEN|SECRET`, network calls, and `eval`. High-confidence
-match → large risk contribution.
+**Coverage:** SentinelHook tags packages pasted from AI responses.  Sentinel
+pillar runs a full registry existence + download-count check only for
+`ai_suggested=true` packages.
 
-### T3 — New / abandoned package with CVEs
-Developer installs an old pinned version that has unpatched CVEs.
+### AV-4 — Malicious install script
+Package includes a `postinstall` that phones home, exfiltrates env vars, or
+downloads a second-stage payload.
 
-**CIDAS mitigation:** Shield pillar queries OSV for every requested package +
-version. Each CVE adds 25 points to the risk score.
+**Coverage:** Shield pillar pattern-scans lifecycle scripts for `curl`, `eval`,
+base64 decode, `process.env.*TOKEN`, obfuscated hex strings.
 
-### T4 — Dependency confusion
-Attacker publishes a public package with the same name as an internal private
-package, exploiting npm's resolution order.
+### AV-5 — Adversarial scanner attack (prompt injection in README)
+Attacker embeds "ignore previous instructions" style text in the package
+README/description, hoping to manipulate AI-assisted code review or CIDAS's
+future LLM secondary verification pass.
 
-**CIDAS mitigation:** Contextify pillar notes that the package name has no
-match in existing project imports (unfamiliar pattern signal). Sentinel notes
-the package is new and has low downloads. Combined score is likely WARN.
-CIDAS does **not** fully block this class — teams should also use `--prefer-offline`
-or scoped package configurations.
+**Coverage:** Shield pillar `detect_injection_patterns()` regex scan flags
+known injection phrases.  Full LLM-based secondary verification is planned for
+phase-2 (`TODO(phase-2): secondary_verification`).
 
-### T5 — Daemon MITM / API abuse
-Attacker on the local machine intercepts traffic between the shim and daemon.
+## Pillar coverage matrix
 
-**CIDAS mitigation:** Traffic is localhost-only (127.0.0.1). Shared secret
-header (`X-CIDAS-Secret`) prevents requests from other processes. HTTPS is
-not strictly necessary on loopback but can be added via a self-signed cert.
+| Attack vector | Contextify | Sentinel | Shield |
+|---|:---:|:---:|:---:|
+| Typosquatting | — | ✓ | — |
+| Dependency hijack / CVE | — | ✓ | ✓ |
+| AI hallucination exploit | — | ✓ (ai_suggested) | — |
+| Malicious install script | — | — | ✓ |
+| Prompt injection in metadata | — | — | ✓ |
+| Dependency confusion | ✓ (unfamiliar) | ✓ (new/low-dl) | — |
 
-## Limitations
+## Explicit out-of-scope items
 
-- CIDAS screens at **install time only**. Packages already in `node_modules`
-  are not re-scanned unless the cache is cleared.
-- The typosquat list covers only 20 popular packages; expand `_POPULAR_PACKAGES`
-  in `sentinel.py` as needed.
-- Obfuscated malware that does not match the pattern list in Shield will not be
-  caught heuristically — OSV remains the primary defence in that case.
-- CIDAS can be bypassed by setting `CIDAS_BYPASS=1` in the environment; this
-  is intentional to avoid blocking critical CI pipelines, but should be audited.
+- Packages already installed in `node_modules` (scan-on-install only).
+- Lock-file tampering (CIDAS does not validate `package-lock.json`).
+- CI pipelines where the npm shim is not installed.
+- Runtime behaviour of installed packages.
+- Transitive (indirect) dependencies.
+- Windows-native `cmd.exe` / PowerShell shim (shim is bash/node only).
 
-## Residual risk
+## Trust bypass
 
-After CIDAS mitigations, residual risk is highest for:
-- Novel malware with clean OSV records and no suspicious script patterns
-- Packages installed via CI where the shim is not present
-- Packages injected via lock-file tampering (CIDAS does not validate lockfiles)
+`CIDAS_BYPASS=1` (shim) and `/api/v1/trust` (daemon) provide escape hatches
+for emergency situations.  Both should be audited in CI policy.

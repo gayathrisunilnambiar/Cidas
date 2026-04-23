@@ -1,44 +1,87 @@
+/**
+ * DaemonClient — HTTP client for the local CIDAS daemon.
+ *
+ * If the daemon is unreachable every method fails open: scan() returns a
+ * safe ALLOW response with a warning flag rather than throwing, ensuring
+ * that a stopped daemon never blocks the developer's workflow.
+ */
 import * as vscode from "vscode";
-import type { CidasConfig, DaemonHealth, ScreenRequest, ScreenResponse } from "./types";
+import { Decision, PackageScanRequest, ScanResponse } from "./types";
 
-function getConfig(): CidasConfig {
-  const cfg = vscode.workspace.getConfiguration("cidas");
+function _daemonUrl(port: number): string {
+  return `http://127.0.0.1:${port}/api/v1`;
+}
+
+function _safeAllow(packageName: string, reason: string): ScanResponse {
+  const zeroPillar = { score: 0, confidence: 0, flags: ["daemon_offline"], metadata: {} };
   return {
-    daemonUrl: cfg.get<string>("daemonUrl", "http://127.0.0.1:7979"),
-    daemonSecret: cfg.get<string>("daemonSecret", ""),
-    autoScreen: cfg.get<boolean>("autoScreen", true),
-    blockOnHighRisk: cfg.get<boolean>("blockOnHighRisk", true),
+    package_name: packageName,
+    version: null,
+    decision: Decision.ALLOW,
+    risk_score: 0,
+    contextify: zeroPillar,
+    sentinel: zeroPillar,
+    shield: zeroPillar,
+    alternatives: [],
+    explanation: `CIDAS daemon unreachable — failing open. Reason: ${reason}`,
+    latency_ms: 0,
   };
 }
 
-async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const { daemonUrl, daemonSecret } = getConfig();
-  const url = `${daemonUrl}/api/v1${path}`;
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    ...(daemonSecret ? { "X-CIDAS-Secret": daemonSecret } : {}),
-  };
+export class DaemonClient {
+  private readonly port: number;
 
-  const response = await fetch(url, { ...options, headers: { ...headers, ...(options.headers as Record<string, string> | undefined) } });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`CIDAS daemon error ${response.status}: ${body}`);
+  constructor(port: number) {
+    this.port = port;
   }
-  return response.json() as Promise<T>;
-}
 
-export async function checkHealth(): Promise<DaemonHealth> {
-  return apiFetch<DaemonHealth>("/health");
-}
+  /** Screen a package; returns a safe ALLOW if the daemon is offline. */
+  async scan(request: PackageScanRequest): Promise<ScanResponse> {
+    try {
+      const resp = await fetch(`${_daemonUrl(this.port)}/scan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request),
+      });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => String(resp.status));
+        throw new Error(`HTTP ${resp.status}: ${text}`);
+      }
+      return (await resp.json()) as ScanResponse;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      vscode.window.showWarningMessage(`CIDAS: daemon unreachable during scan — ${msg}`);
+      return _safeAllow(request.package_name, msg);
+    }
+  }
 
-export async function screenPackage(req: ScreenRequest): Promise<ScreenResponse> {
-  return apiFetch<ScreenResponse>("/screen", {
-    method: "POST",
-    body: JSON.stringify(req),
-  });
-}
+  /** Returns true when the daemon responds to the health endpoint. */
+  async health(): Promise<boolean> {
+    try {
+      const resp = await fetch(`${_daemonUrl(this.port)}/health`);
+      return resp.ok;
+    } catch {
+      return false;
+    }
+  }
 
-export async function clearCache(): Promise<{ purged: number }> {
-  return apiFetch<{ purged: number }>("/cache", { method: "DELETE" });
+  /** Add a package to the daemon's local trust bypass list. */
+  async trust(packageName: string): Promise<void> {
+    const resp = await fetch(`${_daemonUrl(this.port)}/trust`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ package_name: packageName }),
+    });
+    if (!resp.ok) {
+      throw new Error(`Trust call failed: HTTP ${resp.status}`);
+    }
+  }
+
+  /** Purge expired entries from the daemon scan cache. */
+  async clearCache(): Promise<void> {
+    const resp = await fetch(`${_daemonUrl(this.port)}/cache`, { method: "DELETE" });
+    if (!resp.ok) {
+      throw new Error(`Cache clear failed: HTTP ${resp.status}`);
+    }
+  }
 }

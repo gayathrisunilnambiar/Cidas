@@ -1,21 +1,35 @@
-"""FastAPI router — all HTTP endpoints."""
+"""FastAPI router — all HTTP endpoints for the CIDAS daemon.
+
+Endpoints
+---------
+GET  /health   — liveness probe, no auth
+POST /scan     — screen an npm package (main entry point)
+POST /trust    — add a package to the local trust bypass list
+DELETE /cache  — purge expired cache entries
+"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Header
+import asyncio
+import time
 
-from .config import settings
-from .database import get_cached, set_cached
-from .models import HealthResponse, ScreenRequest, ScreenResponse
-from .pillars.aggregator import aggregate
+from fastapi import APIRouter, HTTPException
+
+from .config import get_settings
+from .database import add_trusted, clear_expired, get_cached_result, is_trusted, store_result
+from .models import HealthResponse, PackageScanRequest, PillarScore, ScanResponse
+from .pillars.aggregator import Aggregator
+from .pillars.contextify import Contextify
+from .pillars.sentinel import Sentinel
+from .pillars.shield import Shield
 from .utils.logger import get_logger
 
 log = get_logger(__name__)
 router = APIRouter()
 
-
-def _verify_secret(x_cidas_secret: str | None = Header(default=None)) -> None:
-    if settings.daemon_secret and x_cidas_secret != settings.daemon_secret:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-CIDAS-Secret header")
+_contextify = Contextify()
+_sentinel = Sentinel()
+_shield = Shield()
+_aggregator = Aggregator()
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -23,22 +37,77 @@ async def health() -> HealthResponse:
     return HealthResponse()
 
 
-@router.post("/screen", response_model=ScreenResponse, dependencies=[Depends(_verify_secret)])
-async def screen(req: ScreenRequest) -> ScreenResponse:
-    log.info("screen request: %s@%s", req.package_name, req.version or "latest")
+@router.post("/scan", response_model=ScanResponse)
+async def scan(req: PackageScanRequest) -> ScanResponse:
+    """Screen an npm package; returns a cached result when available."""
+    t0 = time.perf_counter()
+    log.info("scan: %s@%s (ai_suggested=%s)", req.package_name, req.version or "latest", req.ai_suggested)
 
-    cached = await get_cached(req.package_name, req.version)
+    # Trust bypass
+    if await is_trusted(req.package_name):
+        log.info("trust bypass for %s", req.package_name)
+        trusted_score = PillarScore(score=0.0, confidence=1.0, flags=["trusted"], metadata={})
+        return ScanResponse(
+            package_name=req.package_name,
+            version=req.version,
+            decision="ALLOW",
+            risk_score=0.0,
+            contextify=trusted_score,
+            sentinel=trusted_score,
+            shield=trusted_score,
+            explanation=f"'{req.package_name}' is in the local trust list.",
+            latency_ms=(time.perf_counter() - t0) * 1000,
+        )
+
+    # Cache lookup
+    cached = await get_cached_result(req.package_name, req.version)
     if cached:
-        log.debug("cache hit for %s", req.package_name)
+        log.debug("cache hit: %s", req.package_name)
+        cached.latency_ms = (time.perf_counter() - t0) * 1000
         return cached
 
-    response = await aggregate(req)
-    await set_cached(response)
+    # Run all three pillars concurrently
+    ctx_score, sen_score, shi_score = await asyncio.gather(
+        _contextify.score(req.package_name, req.project_path),
+        _sentinel.score(req.package_name, req.ai_suggested),
+        _shield.score(req.package_name, None),
+    )
+
+    settings = get_settings()
+    risk_score, explanation = _aggregator.aggregate(ctx_score, sen_score, shi_score, settings)
+    decision = _aggregator.get_decision(risk_score, settings)
+
+    response = ScanResponse(
+        package_name=req.package_name,
+        version=req.version,
+        decision=decision,  # type: ignore[arg-type]
+        risk_score=risk_score,
+        contextify=ctx_score,
+        sentinel=sen_score,
+        shield=shi_score,
+        explanation=explanation,
+        latency_ms=(time.perf_counter() - t0) * 1000,
+    )
+
+    await store_result(response)
+    log.info("result: decision=%s score=%.1f package=%s", decision, risk_score, req.package_name)
     return response
 
 
-@router.delete("/cache", dependencies=[Depends(_verify_secret)])
-async def clear_cache() -> dict:
-    from .database import purge_expired
-    removed = await purge_expired()
+@router.post("/trust")
+async def trust(body: dict) -> dict:
+    """Add a package to the local trust bypass list."""
+    package_name = body.get("package_name", "")
+    if not package_name:
+        raise HTTPException(status_code=422, detail="package_name is required")
+    await add_trusted(package_name)
+    log.info("trusted: %s", package_name)
+    return {"trusted": package_name}
+
+
+@router.delete("/cache")
+async def cache_delete() -> dict:
+    """Purge all expired scan cache entries."""
+    removed = await clear_expired()
+    log.info("cache purge: removed %d expired entries", removed)
     return {"purged": removed}

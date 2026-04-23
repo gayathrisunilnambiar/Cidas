@@ -1,69 +1,63 @@
 /**
- * SentinelHook — watches VS Code terminal output for npm install commands
- * and triggers daemon screening before the install proceeds.
+ * SentinelHook — tracks packages suggested by AI assistants (Copilot, chat)
+ * and marks them so the daemon applies the full hallucination-risk check.
  *
- * Because VS Code cannot intercept terminal stdin, we rely on the npm-shim
- * (intercept/npm-shim.js) which calls the daemon directly. This module
- * provides a complementary in-extension hook for workspace-level installs
- * triggered via the extension API or task providers.
+ * Detection strategy
+ * ------------------
+ * 1. Listen for terminal write events and parse "import X from 'Y'" patterns
+ *    to catch packages pasted from AI suggestions.
+ * 2. Expose ``registerAiSuggested()`` for other extension components that
+ *    have direct knowledge of an AI suggestion event.
+ *
+ * TODO(phase-2): integrate with vscode.lm onDidReceiveMessage when the
+ * Copilot-specific suggestion event API becomes stable and publicly available.
+ * See: https://github.com/microsoft/vscode/issues/XXXX
  */
 import * as vscode from "vscode";
-import { screenPackage } from "./daemonClient";
-import { showAllowNotification, showBlockNotification, showWarnNotification } from "./notificationUI";
-import { CidasStatusBar } from "./statusBar";
-import type { ScreenRequest, ScreenResponse } from "./types";
 
-export class SentinelHook {
-  private readonly statusBar: CidasStatusBar;
+const _IMPORT_RE = /(?:import\s+\S+\s+from\s+|require\s*\(\s*)['"](@?[\w/-]+)['"]/g;
 
-  constructor(statusBar: CidasStatusBar) {
-    this.statusBar = statusBar;
+export class SentinelHook implements vscode.Disposable {
+  private readonly _aiSuggested: Map<string, boolean> = new Map();
+  private readonly _disposables: vscode.Disposable[] = [];
+
+  activate(context: vscode.ExtensionContext): void {
+    // Listen to terminal output to detect packages pasted from AI responses
+    const termListener = vscode.window.onDidWriteTerminalData((e) => {
+      this._parseTerminalData(e.data);
+    });
+    this._disposables.push(termListener);
+    context.subscriptions.push(termListener);
+
+    // TODO(phase-2): Register handler for vscode.lm.onDidReceiveMessage when
+    // the API is available to detect Copilot inline completions.
+    // Example (not yet stable):
+    //   const lm = (vscode as { lm?: { onDidReceiveMessage?: unknown } }).lm;
+    //   if (lm?.onDidReceiveMessage) { ... }
   }
 
-  /** Screen a package programmatically (called from interceptor or commands). */
-  async screen(packageName: string, version?: string): Promise<ScreenResponse | null> {
-    const projectRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  /** Manually register a package as AI-suggested (e.g. from a Copilot event). */
+  registerAiSuggested(packageName: string): void {
+    this._aiSuggested.set(packageName, true);
+  }
 
-    const req: ScreenRequest = {
-      package_name: packageName,
-      version,
-      project_root: projectRoot,
-    };
+  /** Return true if this package was detected as coming from an AI suggestion. */
+  isAiSuggested(packageName: string): boolean {
+    return this._aiSuggested.get(packageName) === true;
+  }
 
-    this.statusBar.setScreening(packageName);
-
-    let response: ScreenResponse;
-    try {
-      response = await screenPackage(req);
-    } catch (err) {
-      vscode.window.showErrorMessage(`CIDAS: Failed to screen '${packageName}': ${String(err)}`);
-      this.statusBar.setOffline();
-      return null;
-    }
-
-    this.statusBar.setVerdict(packageName, response.verdict, response.risk_score);
-
-    switch (response.verdict) {
-      case "ALLOW":
-        await showAllowNotification(response);
-        break;
-      case "WARN": {
-        const proceed = await showWarnNotification(response);
-        if (!proceed) {
-          return { ...response, message: "Installation cancelled by user." };
-        }
-        break;
-      }
-      case "BLOCK": {
-        const override = await showBlockNotification(response);
-        if (!override) {
-          return { ...response, message: "Installation blocked by CIDAS." };
-        }
-        vscode.window.showWarningMessage(`CIDAS: User overrode block for '${packageName}'.`);
-        break;
+  private _parseTerminalData(data: string): void {
+    let match: RegExpExecArray | null;
+    _IMPORT_RE.lastIndex = 0;
+    while ((match = _IMPORT_RE.exec(data)) !== null) {
+      const pkg = match[1];
+      if (pkg && !pkg.startsWith(".")) {
+        this._aiSuggested.set(pkg.split("/")[0], true);
       }
     }
+  }
 
-    return response;
+  dispose(): void {
+    this._disposables.forEach((d) => d.dispose());
   }
 }

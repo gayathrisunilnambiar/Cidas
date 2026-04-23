@@ -4,25 +4,23 @@
 set -euo pipefail
 
 CIDAS_DIR="${HOME}/.cidas"
-SHIM_LINK="${CIDAS_DIR}/npm"
-REAL_NPM_FILE="${CIDAS_DIR}/real-npm"
+WRAPPER="${CIDAS_DIR}/npm"
+SHIM_DEST="${CIDAS_DIR}/npm-shim.js"
 
 echo "[CIDAS] Uninstalling npm shim…"
 
-if [[ -f "${SHIM_LINK}" ]]; then
-  rm -f "${SHIM_LINK}"
-  echo "[CIDAS] Removed shim: ${SHIM_LINK}"
-else
-  echo "[CIDAS] Shim not found at ${SHIM_LINK} — nothing to remove."
-fi
+for f in "${WRAPPER}" "${SHIM_DEST}"; do
+  if [[ -f "${f}" ]]; then
+    rm -f "${f}"
+    echo "[CIDAS] Removed: ${f}"
+  fi
+done
 
-# Remove PATH line from shell rc files
 for RC in "${HOME}/.zshrc" "${HOME}/.bashrc" "${HOME}/.profile"; do
   if [[ -f "${RC}" ]] && grep -qF "CIDAS npm shim" "${RC}"; then
-    # Portable in-place deletion (works on both Linux sed and macOS)
-    grep -vF "CIDAS npm shim" "${RC}" > "${RC}.cidas_tmp" && mv "${RC}.cidas_tmp" "${RC}"
+    grep -vF "CIDAS npm shim" "${RC}" > "${RC}.cidas_bak" && mv "${RC}.cidas_bak" "${RC}"
     echo "[CIDAS] Removed PATH entry from ${RC}"
   fi
 done
 
-echo "[CIDAS] Uninstallation complete. Open a new terminal or re-source your shell RC."
+echo "[CIDAS] Uninstall complete. Open a new terminal or re-source your shell RC."

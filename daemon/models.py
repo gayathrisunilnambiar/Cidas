@@ -1,52 +1,59 @@
+"""Pydantic models shared between the router, pillars, and database layers.
+
+Keeping all external-facing request/response shapes in one module ensures
+pillar implementations and the router stay in sync automatically.
+"""
 from __future__ import annotations
 
-from enum import Enum
-from typing import Any
+from typing import Literal, Optional
+
 from pydantic import BaseModel, Field
 
 
-class Verdict(str, Enum):
-    ALLOW = "ALLOW"
-    WARN = "WARN"
-    BLOCK = "BLOCK"
+# ── Request ───────────────────────────────────────────────────────────────────
+
+class PackageScanRequest(BaseModel):
+    """Payload sent by the npm shim or VS Code extension to POST /scan."""
+
+    package_name: str = Field(..., description="npm package name (no version suffix)")
+    version: Optional[str] = Field(None, description="Specific version; None = latest")
+    project_path: str = Field(..., description="Absolute path of the project root")
+    ai_suggested: bool = Field(
+        default=False,
+        description="True when the package was suggested by an LLM/Copilot",
+    )
+    requesting_tool: Optional[str] = Field(
+        None,
+        description="Identifier of the calling tool, e.g. 'npm-shim' or 'vscode-extension'",
+    )
 
 
-# ── Request / Response ────────────────────────────────────────────────────────
+# ── Pillar output ─────────────────────────────────────────────────────────────
 
-class ScreenRequest(BaseModel):
-    package_name: str = Field(..., description="npm package name")
-    version: str | None = Field(None, description="Specific version; None = latest")
-    project_root: str | None = Field(None, description="Absolute path to the project being installed into")
-    install_args: list[str] = Field(default_factory=list, description="Raw npm install arguments")
+class PillarScore(BaseModel):
+    """Risk contribution from a single analysis pillar."""
 
-
-class PillarResult(BaseModel):
-    pillar: str
-    score: float = Field(..., ge=0, le=100, description="Risk contribution 0–100")
-    signals: dict[str, Any] = Field(default_factory=dict)
-    notes: str = ""
+    score: float = Field(..., ge=0.0, le=100.0, description="Risk 0–100 (higher = riskier)")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence in the score")
+    flags: list[str] = Field(default_factory=list, description="Human-readable signal labels")
+    metadata: dict = Field(default_factory=dict, description="Raw signals for debugging")
 
 
-class ScreenResponse(BaseModel):
+# ── Scan response ─────────────────────────────────────────────────────────────
+
+class ScanResponse(BaseModel):
+    """Complete screening result returned to the caller."""
+
     package_name: str
-    version: str | None
-    verdict: Verdict
-    risk_score: float = Field(..., ge=0, le=100)
-    pillars: list[PillarResult]
-    cached: bool = False
-    message: str = ""
-
-
-# ── Cache row ─────────────────────────────────────────────────────────────────
-
-class CacheEntry(BaseModel):
-    package_name: str
-    version: str | None
-    verdict: Verdict
-    risk_score: float
-    pillars_json: str
-    created_at: float     # Unix timestamp
-    expires_at: float
+    version: Optional[str]
+    decision: Literal["ALLOW", "WARN", "BLOCK"]
+    risk_score: float = Field(..., ge=0.0, le=100.0)
+    contextify: PillarScore
+    sentinel: PillarScore
+    shield: PillarScore
+    alternatives: list[str] = Field(default_factory=list, description="Safer package suggestions")
+    explanation: str = Field(default="", description="Human-readable summary of the decision")
+    latency_ms: float = Field(default=0.0, description="Total scan duration in milliseconds")
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

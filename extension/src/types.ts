@@ -1,37 +1,43 @@
-export type Verdict = "ALLOW" | "WARN" | "BLOCK";
+/** Shared TypeScript types mirroring the daemon Pydantic models. */
 
-export interface PillarResult {
-  pillar: string;
-  score: number;
-  signals: Record<string, unknown>;
-  notes: string;
+export enum Decision {
+  ALLOW = "ALLOW",
+  WARN  = "WARN",
+  BLOCK = "BLOCK",
 }
 
-export interface ScreenResponse {
+export interface PillarScore {
+  score: number;
+  confidence: number;
+  flags: string[];
+  metadata: Record<string, unknown>;
+}
+
+export interface ScanResponse {
   package_name: string;
   version: string | null;
-  verdict: Verdict;
+  decision: Decision;
   risk_score: number;
-  pillars: PillarResult[];
-  cached: boolean;
-  message: string;
+  contextify: PillarScore;
+  sentinel: PillarScore;
+  shield: PillarScore;
+  alternatives: string[];
+  explanation: string;
+  latency_ms: number;
 }
 
-export interface ScreenRequest {
+export interface PackageScanRequest {
   package_name: string;
   version?: string;
-  project_root?: string;
-  install_args?: string[];
-}
-
-export interface DaemonHealth {
-  status: string;
-  version: string;
+  project_path: string;
+  ai_suggested?: boolean;
+  requesting_tool?: string;
 }
 
 export interface CidasConfig {
-  daemonUrl: string;
-  daemonSecret: string;
-  autoScreen: boolean;
-  blockOnHighRisk: boolean;
+  daemonPort: number;
+  autoScan: boolean;
+  blockInstalls: boolean;
 }
+
+export type StatusState = "idle" | "scanning" | "blocked" | "warned" | "error";

@@ -1,40 +1,60 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
+"""Configuration module for the CIDAS daemon.
+
+Reads all settings from environment variables / .env file using pydantic-settings.
+Import the singleton via ``get_settings()`` rather than instantiating Settings directly
+to avoid re-loading the .env file on every access.
+"""
+from __future__ import annotations
+
+from functools import lru_cache
+
 from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    """All runtime configuration for the CIDAS daemon.
+
+    Each field maps directly to an environment variable of the same name
+    (case-insensitive).  Defaults match the values in .env.example.
+    """
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
     )
 
-    # Daemon
+    # ── Daemon ────────────────────────────────────────────────────────────
     daemon_host: str = "127.0.0.1"
-    daemon_port: int = 7979
-    daemon_log_level: str = "info"
-    daemon_secret: str = Field(default="", description="Shared secret for extension auth")
+    daemon_port: int = 7355
+    log_level: str = Field(default="info", description="debug | info | warning | error")
 
-    # NPM registry
-    npm_registry_url: str = "https://registry.npmjs.org"
-    npm_registry_timeout: int = 10
-    npm_max_concurrent: int = 5
+    # ── Scoring thresholds ────────────────────────────────────────────────
+    block_threshold: int = Field(default=80, ge=1, le=100)
+    warn_threshold: int = Field(default=40, ge=1, le=100)
 
-    # OSV
-    osv_api_url: str = "https://api.osv.dev/v1"
-    osv_timeout: int = 10
+    # ── Pillar weights (must sum to ~1.0) ─────────────────────────────────
+    context_weight: float = Field(default=0.15, ge=0.0, le=1.0)
+    sentinel_weight: float = Field(default=0.40, ge=0.0, le=1.0)
+    shield_weight: float = Field(default=0.45, ge=0.0, le=1.0)
 
-    # Embeddings
+    # ── Embeddings ────────────────────────────────────────────────────────
     embedding_model: str = "all-MiniLM-L6-v2"
     chroma_persist_dir: str = ".cidas_chroma"
 
-    # SQLite cache
+    # ── SQLite cache ──────────────────────────────────────────────────────
     sqlite_db_path: str = ".cidas_cache.db"
-    cache_ttl_seconds: int = 3600
 
-    # Scoring
-    block_threshold: int = 80
-    warn_threshold: int = 40
+    # ── NPM registry ──────────────────────────────────────────────────────
+    npm_registry_url: str = "https://registry.npmjs.org"
 
 
-settings = Settings()
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Return the cached singleton Settings instance.
+
+    The instance is created once on first call and reused for the lifetime of
+    the process.  Call ``get_settings.cache_clear()`` in tests to reset.
+    """
+    return Settings()

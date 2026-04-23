@@ -1,56 +1,55 @@
-"""Embedding service backed by sentence-transformers + ChromaDB."""
+"""Sentence-transformer embedding utilities.
+
+The model is loaded lazily on first call and cached for the process lifetime.
+All public functions are synchronous wrappers suitable for use with
+``asyncio.to_thread`` from async callers.
+
+Usage::
+
+    from daemon.utils.embeddings import embed_text, embed_batch, cosine_similarity
+    vec = embed_text("lodash")
+    sim = cosine_similarity(vec, embed_text("underscore"))
+"""
 from __future__ import annotations
 
-import asyncio
+import time
 from functools import lru_cache
-from typing import Sequence
 
-from ..config import settings
+import numpy as np
+
 from .logger import get_logger
 
 log = get_logger(__name__)
 
 
 @lru_cache(maxsize=1)
-def _load_model():
+def _load_model():  # type: ignore[return]
+    """Load the SentenceTransformer model; cached after first call."""
     from sentence_transformers import SentenceTransformer
-    log.info("Loading embedding model: %s", settings.embedding_model)
-    return SentenceTransformer(settings.embedding_model)
+
+    from ..config import get_settings
+
+    model_name = get_settings().embedding_model
+    t0 = time.perf_counter()
+    log.info("Loading embedding model: %s", model_name)
+    model = SentenceTransformer(model_name)
+    log.info("Model loaded in %.1f s", time.perf_counter() - t0)
+    return model
 
 
-class EmbeddingService:
-    """Thin async wrapper around SentenceTransformer."""
+def embed_text(text: str) -> list[float]:
+    """Embed a single string and return a plain Python float list."""
+    model = _load_model()
+    vec: np.ndarray = model.encode(text, show_progress_bar=False)
+    return vec.tolist()
 
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        model = await asyncio.to_thread(_load_model)
-        vectors = await asyncio.to_thread(model.encode, list(texts), show_progress_bar=False)
-        return vectors.tolist()
 
-    async def cosine_similarity(self, a: str, b: str) -> float:
-        vecs = await self.embed([a, b])
-        va, vb = vecs[0], vecs[1]
-        dot = sum(x * y for x, y in zip(va, vb))
-        norm_a = sum(x ** 2 for x in va) ** 0.5
-        norm_b = sum(x ** 2 for x in vb) ** 0.5
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return dot / (norm_a * norm_b)
-
-    async def max_similarity(self, query: str, candidates: Sequence[str]) -> float:
-        """Return the maximum cosine similarity between query and any candidate."""
-        if not candidates:
-            return 0.0
-        all_texts = [query] + list(candidates)
-        vecs = await self.embed(all_texts)
-        q_vec = vecs[0]
-        norm_q = sum(x ** 2 for x in q_vec) ** 0.5
-
-        max_sim = 0.0
-        for c_vec in vecs[1:]:
-            dot = sum(x * y for x, y in zip(q_vec, c_vec))
-            norm_c = sum(x ** 2 for x in c_vec) ** 0.5
-            if norm_q > 0 and norm_c > 0:
-                sim = dot / (norm_q * norm_c)
-                if sim > max_sim:
-                    max_sim = sim
-        return max_sim
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Compute cosine similarity between two embedding vectors."""
+    va = np.array(a, dtype=np.float32)
+    vb = np.array(b, dtype=np.float32)
+    norm_a = float(np.linalg.norm(va))
+    norm_b = float(np.linalg.norm(vb))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return float(np.dot(va, vb) / (norm_a * norm_b))

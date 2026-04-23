@@ -1,79 +1,82 @@
-"""Async NPM registry client with rate limiting."""
+"""Async npm registry client.
+
+All functions are module-level coroutines (not methods) so they can be
+imported and mocked individually in tests without instantiating any class.
+
+A 404 from the registry is treated as "package not found" and returns None,
+which the calling pillar should treat as a high-risk signal.
+"""
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import httpx
 
-from ..config import settings
+from ..config import get_settings
 from .logger import get_logger
 
 log = get_logger(__name__)
 
+_TIMEOUT = httpx.Timeout(5.0)
+_DOWNLOADS_BASE = "https://api.npmjs.org/downloads/point/last-month"
 
-class NpmRegistryClient:
-    """Async context manager wrapping httpx for NPM registry queries."""
 
-    def __init__(self) -> None:
-        self._sem = asyncio.Semaphore(settings.npm_max_concurrent)
-        self._client: httpx.AsyncClient | None = None
-
-    async def __aenter__(self) -> "NpmRegistryClient":
-        self._client = httpx.AsyncClient(
-            base_url=settings.npm_registry_url,
-            timeout=settings.npm_registry_timeout,
-            headers={"Accept": "application/json"},
-            follow_redirects=True,
-        )
-        return self
-
-    async def __aexit__(self, *_) -> None:
-        if self._client:
-            await self._client.aclose()
-
-    async def _get(self, path: str) -> dict | None:
-        assert self._client, "Use as async context manager"
-        async with self._sem:
-            try:
-                resp = await self._client.get(path)
+async def _get(url: str) -> dict[str, Any] | None:
+    """Make a single GET request; returns parsed JSON or None on error."""
+    for attempt in (1, 2):
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
+                resp = await client.get(url, headers={"Accept": "application/json"})
                 if resp.status_code == 404:
                     return None
                 resp.raise_for_status()
-                return resp.json()
-            except httpx.HTTPStatusError as exc:
-                log.warning("HTTP %s for %s", exc.response.status_code, path)
+                return resp.json()  # type: ignore[return-value]
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            if attempt == 2:
+                log.warning("GET %s failed after 2 attempts: %s", url, exc)
                 return None
-            except httpx.RequestError as exc:
-                log.warning("Request error for %s: %s", path, exc)
-                return None
-
-    async def fetch_metadata(self, name: str) -> dict[str, Any] | None:
-        """Fetch full package metadata (all versions)."""
-        return await self._get(f"/{name}")
-
-    async def fetch_package_json(self, name: str, version: str | None) -> dict[str, Any] | None:
-        """Fetch the package.json for a specific (or latest) version."""
-        meta = await self.fetch_metadata(name)
-        if meta is None:
+            log.debug("GET %s attempt %d failed, retrying: %s", url, attempt, exc)
+        except httpx.HTTPStatusError as exc:
+            log.warning("HTTP %s from %s", exc.response.status_code, url)
             return None
-        if version:
-            return meta.get("versions", {}).get(version)
-        dist_tags = meta.get("dist-tags", {})
-        latest = dist_tags.get("latest")
-        if latest:
-            return meta.get("versions", {}).get(latest)
-        return None
+    return None  # unreachable, but satisfies mypy
 
-    async def fetch_download_count(self, name: str, period: str = "last-week") -> int:
-        """Query the NPM downloads API."""
-        assert self._client
-        try:
-            resp = await self._client.get(
-                f"https://api.npmjs.org/downloads/point/{period}/{name}"
-            )
-            resp.raise_for_status()
-            return resp.json().get("downloads", 0)
-        except Exception as exc:
-            log.debug("Download count fetch failed for %s: %s", name, exc)
-            return 0
+
+async def get_package_metadata(name: str, version: str | None = None) -> dict[str, Any] | None:
+    """Return full package metadata from the registry.
+
+    If *version* is given, returns the version-specific package.json dict;
+    otherwise returns the full registry document for *name*.
+    """
+    settings = get_settings()
+    url = f"{settings.npm_registry_url}/{name}"
+    meta = await _get(url)
+    if meta is None:
+        return None
+    if version:
+        return meta.get("versions", {}).get(version)
+    return meta
+
+
+async def get_download_count(name: str) -> int:
+    """Return last-month download count from the npm downloads API."""
+    data = await _get(f"{_DOWNLOADS_BASE}/{name}")
+    if data is None:
+        return 0
+    return int(data.get("downloads", 0))
+
+
+async def get_package_tarball_info(name: str, version: str | None) -> dict[str, Any] | None:
+    """Return the dist/tarball metadata for a specific package version."""
+    meta = await get_package_metadata(name)
+    if meta is None:
+        return None
+    dist_tags: dict = meta.get("dist-tags", {})
+    resolved_version = version or dist_tags.get("latest")
+    if not resolved_version:
+        return None
+    versions: dict = meta.get("versions", {})
+    pkg = versions.get(resolved_version)
+    if pkg is None:
+        return None
+    return pkg.get("dist")

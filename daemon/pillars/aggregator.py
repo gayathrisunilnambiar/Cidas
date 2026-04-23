@@ -1,79 +1,83 @@
-"""Aggregator pillar — combine pillar scores into a final verdict."""
+"""Aggregator pillar — weighted combination of pillar scores into a final verdict.
+
+The ``aggregate`` method is intentionally a pure function of its inputs so
+that it can be unit-tested without mocking any external services.
+
+Weights are read from ``Settings`` at call time so that changing them in
+``.env`` takes effect without restarting the daemon (call
+``get_settings.cache_clear()`` to invalidate the cache).
+"""
 from __future__ import annotations
 
-import asyncio
-
-from ..config import settings
-from ..models import PillarResult, ScreenRequest, ScreenResponse, Verdict
+from ..config import Settings
+from ..models import PillarScore
 from ..utils.logger import get_logger
-from .contextify import run as contextify
-from .sentinel import run as sentinel
-from .shield import run as shield
 
 log = get_logger(__name__)
 
-# Pillar weights must sum to 1.0
-_WEIGHTS: dict[str, float] = {
-    "contextify": 0.15,
-    "sentinel":   0.40,
-    "shield":     0.45,
-}
 
+class Aggregator:
+    """Pillar 4: compute the final weighted risk score and human-readable explanation."""
 
-def _weighted_score(pillars: list[PillarResult]) -> float:
-    total = 0.0
-    for p in pillars:
-        weight = _WEIGHTS.get(p.pillar, 0.0)
-        total += p.score * weight
-    return round(total, 2)
+    def aggregate(
+        self,
+        contextify: PillarScore,
+        sentinel: PillarScore,
+        shield: PillarScore,
+        settings: Settings,
+    ) -> tuple[float, str]:
+        """Return ``(risk_score, explanation)`` from the three pillar scores.
 
-
-def _verdict(score: float) -> Verdict:
-    if score >= settings.block_threshold:
-        return Verdict.BLOCK
-    if score >= settings.warn_threshold:
-        return Verdict.WARN
-    return Verdict.ALLOW
-
-
-def _message(verdict: Verdict, score: float, name: str) -> str:
-    if verdict == Verdict.BLOCK:
-        return (
-            f"CIDAS blocked installation of '{name}' (risk score {score:.0f}/100). "
-            "One or more security checks failed. Review the signals before proceeding."
+        risk_score is 0–100 (weighted sum capped at 100).
+        explanation is a plain-English summary listing the top signal flags.
+        """
+        score = (
+            settings.context_weight * contextify.score
+            + settings.sentinel_weight * sentinel.score
+            + settings.shield_weight * shield.score
         )
-    if verdict == Verdict.WARN:
+        score = round(min(score, 100.0), 2)
+
+        explanation = self._build_explanation(score, contextify, sentinel, shield, settings)
+        return score, explanation
+
+    @staticmethod
+    def get_decision(score: float, settings: Settings) -> str:
+        """Map a numeric risk score to a decision string."""
+        if score >= settings.block_threshold:
+            return "BLOCK"
+        if score >= settings.warn_threshold:
+            return "WARN"
+        return "ALLOW"
+
+    def _build_explanation(
+        self,
+        score: float,
+        contextify: PillarScore,
+        sentinel: PillarScore,
+        shield: PillarScore,
+        settings: Settings,
+    ) -> str:
+        decision = self.get_decision(score, settings)
+        all_flags = contextify.flags + sentinel.flags + shield.flags
+
+        if not all_flags:
+            if decision == "ALLOW":
+                return f"Package passed all checks (risk score {score:.0f}/100)."
+            return f"Package has a moderate risk score ({score:.0f}/100) but no specific flags were raised."
+
+        top_flags = ", ".join(all_flags[:5])
+        if decision == "BLOCK":
+            return (
+                f"Installation blocked (risk score {score:.0f}/100). "
+                f"Top signals: {top_flags}."
+            )
+        if decision == "WARN":
+            return (
+                f"Proceed with caution (risk score {score:.0f}/100). "
+                f"Signals detected: {top_flags}."
+            )
         return (
-            f"CIDAS flagged '{name}' with a moderate risk score ({score:.0f}/100). "
-            "Proceed with caution and review the details."
+            f"Package passed screening (risk score {score:.0f}/100). "
+            f"Minor signals noted: {top_flags}."
         )
-    return f"'{name}' passed all CIDAS checks (risk score {score:.0f}/100)."
-
-
-async def aggregate(req: ScreenRequest) -> ScreenResponse:
-    log.debug("aggregating pillars for %s@%s", req.package_name, req.version or "latest")
-
-    pillar_results: list[PillarResult] = await asyncio.gather(
-        contextify(req),
-        sentinel(req),
-        shield(req),
-    )
-
-    score = _weighted_score(pillar_results)
-    verdict = _verdict(score)
-    message = _message(verdict, score, req.package_name)
-
-    log.info(
-        "verdict=%s score=%.1f package=%s@%s",
-        verdict.value, score, req.package_name, req.version or "latest",
-    )
-
-    return ScreenResponse(
-        package_name=req.package_name,
-        version=req.version,
-        verdict=verdict,
-        risk_score=score,
-        pillars=pillar_results,
-        cached=False,
-        message=message,
-    )

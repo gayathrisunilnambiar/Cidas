@@ -1,60 +1,59 @@
+/**
+ * NotificationUI — user-facing dialogs and webview panel for scan results.
+ */
 import * as vscode from "vscode";
-import type { ScreenResponse } from "./types";
+import { Decision, ScanResponse } from "./types";
 
-const DETAILS_ACTION = "View Details";
-const PROCEED_ACTION = "Proceed Anyway";
-const CANCEL_ACTION = "Cancel Install";
+const _SHOW_DETAILS = "Show Details";
+const _PROCEED = "Proceed Anyway";
+const _CANCEL = "Cancel";
 
-export async function showAllowNotification(response: ScreenResponse): Promise<void> {
-  const msg = `CIDAS: '${response.package_name}' passed security checks (score ${response.risk_score.toFixed(0)}/100).`;
-  vscode.window.setStatusBarMessage(msg, 5000);
+export function showAllowNotification(packageName: string): void {
+  vscode.window.setStatusBarMessage(`$(check) CIDAS: '${packageName}' passed security screening`, 4000);
 }
 
-export async function showWarnNotification(response: ScreenResponse): Promise<boolean> {
+export async function showWarnNotification(response: ScanResponse): Promise<boolean> {
   const choice = await vscode.window.showWarningMessage(
-    `CIDAS Warning: '${response.package_name}' has a moderate risk score (${response.risk_score.toFixed(0)}/100).\n${response.message}`,
+    `CIDAS: '${response.package_name}' has a moderate risk score (${response.risk_score.toFixed(0)}/100). ${response.explanation}`,
     { modal: false },
-    PROCEED_ACTION,
-    DETAILS_ACTION,
+    _PROCEED,
+    _SHOW_DETAILS,
   );
-
-  if (choice === DETAILS_ACTION) {
-    _showDetailsPanel(response);
-    // Ask again after showing details
+  if (choice === _SHOW_DETAILS) {
+    showDetailsPanel(response);
     const second = await vscode.window.showWarningMessage(
-      `Still proceed with installing '${response.package_name}'?`,
+      `Still install '${response.package_name}'?`,
       { modal: true },
-      PROCEED_ACTION,
-      CANCEL_ACTION,
+      _PROCEED,
+      _CANCEL,
     );
-    return second === PROCEED_ACTION;
+    return second === _PROCEED;
   }
-  return choice === PROCEED_ACTION;
+  return choice === _PROCEED;
 }
 
-export async function showBlockNotification(response: ScreenResponse): Promise<boolean> {
+export async function showBlockNotification(response: ScanResponse): Promise<boolean> {
   const choice = await vscode.window.showErrorMessage(
-    `CIDAS BLOCKED: '${response.package_name}' failed security screening (score ${response.risk_score.toFixed(0)}/100).\n${response.message}`,
+    `CIDAS BLOCKED: '${response.package_name}' failed security screening (score ${response.risk_score.toFixed(0)}/100). ${response.explanation}`,
     { modal: true },
-    DETAILS_ACTION,
-    PROCEED_ACTION,   // escape hatch — user can override
-    CANCEL_ACTION,
+    _SHOW_DETAILS,
+    _PROCEED,
+    _CANCEL,
   );
-
-  if (choice === DETAILS_ACTION) {
-    _showDetailsPanel(response);
+  if (choice === _SHOW_DETAILS) {
+    showDetailsPanel(response);
     const second = await vscode.window.showErrorMessage(
-      `Override CIDAS block and install '${response.package_name}'?`,
+      `Override CIDAS and install '${response.package_name}' anyway?`,
       { modal: true },
-      PROCEED_ACTION,
-      CANCEL_ACTION,
+      _PROCEED,
+      _CANCEL,
     );
-    return second === PROCEED_ACTION;
+    return second === _PROCEED;
   }
-  return choice === PROCEED_ACTION;
+  return choice === _PROCEED;
 }
 
-function _showDetailsPanel(response: ScreenResponse): void {
+export function showDetailsPanel(response: ScanResponse): void {
   const panel = vscode.window.createWebviewPanel(
     "cidasDetails",
     `CIDAS: ${response.package_name}`,
@@ -62,44 +61,55 @@ function _showDetailsPanel(response: ScreenResponse): void {
     { enableScripts: false },
   );
 
-  const pillarRows = response.pillars
-    .map(
-      (p) =>
-        `<tr>
-          <td>${p.pillar}</td>
-          <td>${p.score.toFixed(1)}</td>
-          <td>${p.notes}</td>
-        </tr>`,
-    )
+  const decisionColor: Record<Decision, string> = {
+    [Decision.ALLOW]: "var(--vscode-terminal-ansiGreen)",
+    [Decision.WARN]:  "var(--vscode-terminal-ansiYellow)",
+    [Decision.BLOCK]: "var(--vscode-terminal-ansiRed)",
+  };
+
+  const pillars = [
+    { name: "Contextify", data: response.contextify },
+    { name: "Sentinel",   data: response.sentinel },
+    { name: "Shield",     data: response.shield },
+  ];
+
+  const pillarRows = pillars
+    .map(({ name, data }) => {
+      const flags = data.flags.join(", ") || "—";
+      return `<tr><td>${name}</td><td>${data.score.toFixed(1)}</td><td>${data.confidence.toFixed(2)}</td><td>${flags}</td></tr>`;
+    })
     .join("\n");
+
+  const altList = response.alternatives.length
+    ? `<p><strong>Alternatives:</strong> ${response.alternatives.join(", ")}</p>`
+    : "";
 
   panel.webview.html = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
 <style>
-  body { font-family: var(--vscode-font-family); padding: 16px; }
-  h1   { font-size: 1.2em; }
-  table{ border-collapse: collapse; width: 100%; margin-top: 12px; }
-  th,td{ border: 1px solid var(--vscode-panel-border); padding: 6px 10px; text-align: left; }
-  th   { background: var(--vscode-editor-background); }
-  .verdict-ALLOW { color: var(--vscode-terminal-ansiGreen); }
-  .verdict-WARN  { color: var(--vscode-terminal-ansiYellow); }
-  .verdict-BLOCK { color: var(--vscode-terminal-ansiRed); }
+  body  { font-family: var(--vscode-font-family); padding: 16px; font-size: 13px; }
+  h1    { font-size: 1.1em; margin-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+  th, td{ border: 1px solid var(--vscode-panel-border); padding: 5px 10px; text-align: left; }
+  th    { background: var(--vscode-editor-inactiveSelectionBackground); }
+  .decision { font-weight: bold; color: ${decisionColor[response.decision]}; }
 </style>
 </head>
 <body>
-<h1>CIDAS Screening Report: <code>${response.package_name}</code></h1>
-<p>Verdict: <strong class="verdict-${response.verdict}">${response.verdict}</strong>
-   &nbsp;|&nbsp; Risk score: <strong>${response.risk_score.toFixed(1)} / 100</strong>
-   ${response.cached ? "&nbsp;|&nbsp; <em>(cached)</em>" : ""}
-</p>
-<p>${response.message}</p>
+<h1>CIDAS Scan Report — <code>${response.package_name}</code>${response.version ? `@${response.version}` : ""}</h1>
+<p>Decision: <span class="decision">${response.decision}</span> &nbsp;|&nbsp;
+   Risk score: <strong>${response.risk_score.toFixed(1)}/100</strong> &nbsp;|&nbsp;
+   Latency: ${response.latency_ms.toFixed(0)} ms</p>
+<p>${response.explanation}</p>
+${altList}
 <table>
-  <thead><tr><th>Pillar</th><th>Score</th><th>Notes</th></tr></thead>
+  <thead><tr><th>Pillar</th><th>Score</th><th>Confidence</th><th>Flags</th></tr></thead>
   <tbody>${pillarRows}</tbody>
 </table>
+<pre style="margin-top:16px;font-size:11px;opacity:0.6">${JSON.stringify(response, null, 2)}</pre>
 </body>
 </html>`;
 }
