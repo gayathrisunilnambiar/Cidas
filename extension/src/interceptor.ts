@@ -18,7 +18,7 @@ interface PackageJson {
   devDependencies?: Record<string, string>;
 }
 
-function _parseDeps(raw: string): Set<string> {
+export function _parseDeps(raw: string): Set<string> {
   try {
     const pkg = JSON.parse(raw) as PackageJson;
     return new Set([
@@ -59,10 +59,13 @@ export class Interceptor implements vscode.Disposable {
       return;
     }
 
-    const raw = await vscode.workspace.fs
-      .readFile(uri)
-      .then((b) => Buffer.from(b).toString("utf-8"))
-      .catch(() => null);
+    let raw: string | null;
+    try {
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      raw = Buffer.from(bytes).toString("utf-8");
+    } catch {
+      raw = null;
+    }
     if (!raw) {
       return;
     }

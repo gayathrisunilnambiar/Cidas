@@ -23,7 +23,11 @@ export class SentinelHook implements vscode.Disposable {
 
   activate(context: vscode.ExtensionContext): void {
     // Listen to terminal output to detect packages pasted from AI responses
-    const termListener = vscode.window.onDidWriteTerminalData((e) => {
+    // onDidWriteTerminalData is a proposed API not yet in @types/vscode 1.89
+    const win = vscode.window as unknown as {
+      onDidWriteTerminalData: (cb: (e: { data: string }) => void) => vscode.Disposable;
+    };
+    const termListener = win.onDidWriteTerminalData((e) => {
       this._parseTerminalData(e.data);
     });
     this._disposables.push(termListener);
