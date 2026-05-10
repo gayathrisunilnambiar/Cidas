@@ -394,6 +394,118 @@ describe("integrity check — hash matches", () => {
   });
 });
 
+// ── _shouldPromptForWarn ──────────────────────────────────────────────────────
+
+describe("_shouldPromptForWarn", () => {
+  it("returns false when stdin is not a TTY (CI / piped input)", () => {
+    readFileSyncSpy.mockImplementation((filePath, opts) => {
+      if (filePath === CONFIG_PATH)
+        return JSON.stringify({ warn_requires_confirmation: true });
+      if (filePath === HASH_PATH)
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return _realReadFileSync(filePath, opts);
+    });
+    jest.resetModules();
+    shim = loadShim();
+    // Non-TTY: even with config + scan flag set, no prompt.
+    expect(shim._shouldPromptForWarn({ requires_confirmation: true }, false)).toBe(false);
+  });
+
+  it("returns true on TTY when local config sets warn_requires_confirmation", () => {
+    readFileSyncSpy.mockImplementation((filePath, opts) => {
+      if (filePath === CONFIG_PATH)
+        return JSON.stringify({ warn_requires_confirmation: true });
+      if (filePath === HASH_PATH)
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return _realReadFileSync(filePath, opts);
+    });
+    jest.resetModules();
+    shim = loadShim();
+    expect(shim._shouldPromptForWarn({ requires_confirmation: false }, true)).toBe(true);
+  });
+
+  it("returns true on TTY when scanResult.requires_confirmation is true (policy override)", () => {
+    // Local config does NOT request confirmation, but the daemon's policy says it does.
+    expect(shim._shouldPromptForWarn({ requires_confirmation: true }, true)).toBe(true);
+  });
+
+  it("returns false on TTY when neither config nor scan result asks for it", () => {
+    expect(shim._shouldPromptForWarn({ requires_confirmation: false }, true)).toBe(false);
+    expect(shim._shouldPromptForWarn({}, true)).toBe(false);
+    expect(shim._shouldPromptForWarn(null, true)).toBe(false);
+  });
+});
+
+// ── _promptProceed ────────────────────────────────────────────────────────────
+
+describe("_promptProceed", () => {
+  let questionMock;
+  let createInterfaceSpy;
+  let rl;
+
+  beforeEach(() => {
+    questionMock = jest.fn();
+    rl = {
+      question: questionMock,
+      close:    jest.fn(),
+      on:       jest.fn(),
+    };
+    const readline = require("readline");
+    createInterfaceSpy = jest.spyOn(readline, "createInterface").mockReturnValue(rl);
+  });
+
+  afterEach(() => {
+    createInterfaceSpy.mockRestore();
+  });
+
+  it("resolves true when the user types 'proceed'", async () => {
+    questionMock.mockImplementation((_q, cb) => cb("proceed"));
+    await expect(shim._promptProceed()).resolves.toBe(true);
+    expect(rl.close).toHaveBeenCalled();
+  });
+
+  it("is case-insensitive on the proceed keyword", async () => {
+    questionMock.mockImplementation((_q, cb) => cb("PROCEED"));
+    await expect(shim._promptProceed()).resolves.toBe(true);
+  });
+
+  it("ignores leading/trailing whitespace around 'proceed'", async () => {
+    questionMock.mockImplementation((_q, cb) => cb("  proceed  \n"));
+    await expect(shim._promptProceed()).resolves.toBe(true);
+  });
+
+  it("resolves false when the user types anything else", async () => {
+    questionMock.mockImplementation((_q, cb) => cb("yes"));
+    await expect(shim._promptProceed()).resolves.toBe(false);
+  });
+
+  it("resolves false on empty input (just Enter)", async () => {
+    questionMock.mockImplementation((_q, cb) => cb(""));
+    await expect(shim._promptProceed()).resolves.toBe(false);
+  });
+
+  it("uses the prescribed prompt text on the question", async () => {
+    questionMock.mockImplementation((q, cb) => cb("proceed"));
+    await shim._promptProceed();
+    expect(questionMock.mock.calls[0][0]).toContain("Type 'proceed'");
+    expect(questionMock.mock.calls[0][0]).toContain("Ctrl-C");
+  });
+
+  it("exits with code 1 when SIGINT fires while the prompt is open", () => {
+    // The promise stays pending — we just need to fire the SIGINT handler.
+    let sigintHandler;
+    rl.on.mockImplementation((event, handler) => {
+      if (event === "SIGINT") sigintHandler = handler;
+    });
+    questionMock.mockImplementation(() => { /* never resolves */ });
+    void shim._promptProceed();
+    expect(sigintHandler).toBeDefined();
+    sigintHandler();
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(rl.close).toHaveBeenCalled();
+  });
+});
+
 describe("integrity check — hash mismatch (tampered shim)", () => {
   beforeEach(() => {
     readFileSyncSpy.mockImplementation((filePath, opts) => {

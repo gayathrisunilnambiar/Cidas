@@ -38,6 +38,16 @@ describe("showAllowNotification", () => {
 describe("showWarnNotification", () => {
   beforeEach(() => vi.clearAllMocks());
 
+  it("renders Show Details as the primary (first) action button", async () => {
+    vi.mocked(vscode.window.showWarningMessage).mockResolvedValue(undefined);
+    await showWarnNotification(makeResponse(Decision.WARN));
+    const args = vi.mocked(vscode.window.showWarningMessage).mock.calls[0];
+    // First positional after the message+options is the primary action.
+    expect(args[2]).toBe("Show Details");
+    expect(args[3]).toBe("Proceed Anyway");
+    expect(args[4]).toBe("Cancel install");
+  });
+
   it("returns true when user chooses Proceed Anyway", async () => {
     vi.mocked(vscode.window.showWarningMessage).mockResolvedValue("Proceed Anyway" as any);
     const result = await showWarnNotification(makeResponse(Decision.WARN));
@@ -67,10 +77,10 @@ describe("showWarnNotification", () => {
     expect(result).toBe(true);
   });
 
-  it("returns false when Show Details is followed by Cancel in the modal", async () => {
+  it("returns false when Show Details is followed by Cancel install in the modal", async () => {
     vi.mocked(vscode.window.showWarningMessage)
       .mockResolvedValueOnce("Show Details" as any)
-      .mockResolvedValueOnce("Cancel" as any);
+      .mockResolvedValueOnce("Cancel install" as any);
     const result = await showWarnNotification(makeResponse(Decision.WARN));
     expect(result).toBe(false);
   });
@@ -78,7 +88,7 @@ describe("showWarnNotification", () => {
   it("calls onProceed callback when user chooses Proceed Anyway", async () => {
     vi.mocked(vscode.window.showWarningMessage).mockResolvedValue("Proceed Anyway" as any);
     const onProceed = vi.fn().mockResolvedValue(undefined);
-    const result = await showWarnNotification(makeResponse(Decision.WARN), onProceed);
+    const result = await showWarnNotification(makeResponse(Decision.WARN), { onProceed });
     expect(result).toBe(true);
     expect(onProceed).toHaveBeenCalledOnce();
   });
@@ -88,7 +98,7 @@ describe("showWarnNotification", () => {
       .mockResolvedValueOnce("Show Details" as any)
       .mockResolvedValueOnce("Proceed Anyway" as any);
     const onProceed = vi.fn().mockResolvedValue(undefined);
-    const result = await showWarnNotification(makeResponse(Decision.WARN), onProceed);
+    const result = await showWarnNotification(makeResponse(Decision.WARN), { onProceed });
     expect(result).toBe(true);
     expect(onProceed).toHaveBeenCalledOnce();
   });
@@ -96,9 +106,30 @@ describe("showWarnNotification", () => {
   it("does not call onProceed when user cancels", async () => {
     vi.mocked(vscode.window.showWarningMessage).mockResolvedValue(undefined);
     const onProceed = vi.fn().mockResolvedValue(undefined);
-    const result = await showWarnNotification(makeResponse(Decision.WARN), onProceed);
+    const result = await showWarnNotification(makeResponse(Decision.WARN), { onProceed });
     expect(result).toBe(false);
     expect(onProceed).not.toHaveBeenCalled();
+  });
+
+  it("calls onCancel and shows info message when user clicks Cancel install", async () => {
+    vi.mocked(vscode.window.showWarningMessage).mockResolvedValue("Cancel install" as any);
+    const onCancel = vi.fn().mockResolvedValue(undefined);
+    const result = await showWarnNotification(makeResponse(Decision.WARN), { onCancel });
+    expect(result).toBe(false);
+    expect(onCancel).toHaveBeenCalledOnce();
+    expect(vscode.window.showInformationMessage).toHaveBeenCalledOnce();
+    const note = vi.mocked(vscode.window.showInformationMessage).mock.calls[0][0] as string;
+    expect(note).toContain("cancel intent recorded");
+  });
+
+  it("calls onCancel after Show Details + Cancel install in the modal", async () => {
+    vi.mocked(vscode.window.showWarningMessage)
+      .mockResolvedValueOnce("Show Details" as any)
+      .mockResolvedValueOnce("Cancel install" as any);
+    const onCancel = vi.fn().mockResolvedValue(undefined);
+    const result = await showWarnNotification(makeResponse(Decision.WARN), { onCancel });
+    expect(result).toBe(false);
+    expect(onCancel).toHaveBeenCalledOnce();
   });
 });
 

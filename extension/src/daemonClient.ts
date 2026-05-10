@@ -182,6 +182,23 @@ export class DaemonClient {
    * Failures are swallowed — a logging error must not interrupt the install.
    */
   async reportOverride(packageName: string, version?: string | null, verdictWas = "WARN"): Promise<void> {
+    await this._postAuditEvent(packageName, version, verdictWas, "user_override");
+  }
+
+  /**
+   * Record a user "Cancel install" intent.  The shim install runs out-of-process
+   * and cannot be stopped from VS Code; this just preserves the audit trail.
+   */
+  async reportCancel(packageName: string, version?: string | null, verdictWas = "WARN"): Promise<void> {
+    await this._postAuditEvent(packageName, version, verdictWas, "user_cancel_intent");
+  }
+
+  private async _postAuditEvent(
+    packageName: string,
+    version: string | null | undefined,
+    verdictWas: string,
+    event: string,
+  ): Promise<void> {
     try {
       await fetch(`${_daemonUrl(this.port)}/audit/override`, {
         method: "POST",
@@ -190,6 +207,7 @@ export class DaemonClient {
           package_name: packageName,
           version: version ?? null,
           verdict_was: verdictWas,
+          event,
         }),
       });
     } catch {

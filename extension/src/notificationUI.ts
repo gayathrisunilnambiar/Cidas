@@ -4,9 +4,17 @@
 import * as vscode from "vscode";
 import { Decision, ScanResponse } from "./types";
 
-const _SHOW_DETAILS = "Show Details";
-const _PROCEED = "Proceed Anyway";
-const _CANCEL = "Cancel";
+const _SHOW_DETAILS  = "Show Details";
+const _PROCEED       = "Proceed Anyway";
+const _CANCEL_INSTALL = "Cancel install";
+const _CANCEL        = "Cancel";
+
+export interface WarnCallbacks {
+  /** Called when the user picks "Proceed Anyway". */
+  onProceed?: () => Promise<void>;
+  /** Called when the user picks "Cancel install" so the daemon can record intent. */
+  onCancel?:  () => Promise<void>;
+}
 
 export function showAllowNotification(packageName: string): void {
   vscode.window.setStatusBarMessage(`$(check) CIDAS: '${packageName}' passed security screening`, 4000);
@@ -14,33 +22,57 @@ export function showAllowNotification(packageName: string): void {
 
 export async function showWarnNotification(
   response: ScanResponse,
-  onProceed?: () => Promise<void>,
+  callbacks?: WarnCallbacks,
 ): Promise<boolean> {
+  // Order matters: VS Code renders the first action as the primary (recommended)
+  // button. We deliberately put "Show Details" first so users read the warning
+  // before clicking through, and "Cancel install" last as the safest fallback.
   const choice = await vscode.window.showWarningMessage(
     `CIDAS: '${response.package_name}' has a moderate risk score (${response.risk_score.toFixed(0)}/100). ${response.explanation}`,
     { modal: false },
-    _PROCEED,
     _SHOW_DETAILS,
+    _PROCEED,
+    _CANCEL_INSTALL,
   );
+
   if (choice === _SHOW_DETAILS) {
     showDetailsPanel(response);
     const second = await vscode.window.showWarningMessage(
       `Still install '${response.package_name}'?`,
       { modal: true },
+      _CANCEL_INSTALL,
       _PROCEED,
-      _CANCEL,
     );
     if (second === _PROCEED) {
-      await onProceed?.();
+      await callbacks?.onProceed?.();
       return true;
+    }
+    if (second === _CANCEL_INSTALL) {
+      await _handleCancel(response, callbacks);
     }
     return false;
   }
+
   if (choice === _PROCEED) {
-    await onProceed?.();
+    await callbacks?.onProceed?.();
     return true;
   }
+
+  if (choice === _CANCEL_INSTALL) {
+    await _handleCancel(response, callbacks);
+  }
   return false;
+}
+
+async function _handleCancel(response: ScanResponse, callbacks?: WarnCallbacks): Promise<void> {
+  await callbacks?.onCancel?.();
+  // The shim install runs in a separate terminal — the extension cannot reach
+  // into that subprocess to abort it.  Make the limitation explicit so the
+  // user knows to Ctrl-C in their terminal as well.
+  vscode.window.showInformationMessage(
+    `CIDAS: cancel intent recorded for '${response.package_name}'. ` +
+    `If an npm install is already running, abort it in your terminal (Ctrl-C).`,
+  );
 }
 
 export async function showBlockNotification(response: ScanResponse): Promise<boolean> {

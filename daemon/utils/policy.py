@@ -60,6 +60,14 @@ class Policy(BaseModel):
     max_sentinel_distance: Optional[int] = Field(default=None, ge=0)
     require_repository_link: Optional[bool] = None
     contextify_weight: Optional[float] = Field(default=None, ge=0.0, le=0.5)
+    warn_requires_confirmation: Optional[bool] = Field(
+        default=None,
+        description=(
+            "When true, the npm shim must prompt the developer to type 'proceed' "
+            "before any WARN install proceeds (interactive TTY only).  Surfaced "
+            "to the shim via ScanResponse.requires_confirmation."
+        ),
+    )
 
 
 def get_json_schema() -> dict:

@@ -104,10 +104,10 @@ export class Interceptor implements vscode.Disposable {
         break;
       case Decision.WARN:
         this._statusBar.setState("warned", response.explanation);
-        await showWarnNotification(
-          response,
-          () => this._client.reportOverride(response.package_name, response.version, "WARN"),
-        );
+        await showWarnNotification(response, {
+          onProceed: () => this._client.reportOverride(response.package_name, response.version, "WARN"),
+          onCancel:  () => this._client.reportCancel(response.package_name, response.version, "WARN"),
+        });
         break;
       case Decision.BLOCK:
         this._statusBar.setState("blocked", response.explanation);

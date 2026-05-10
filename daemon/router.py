@@ -107,6 +107,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
     # both the local trust DB and the per-machine cache.
     policy_dict, policy_path = policy.resolve(req.project_path)
     policy_file_str = str(policy_path) if policy_path else None
+    requires_confirmation = bool(policy_dict.get("warn_requires_confirmation"))
 
     if req.package_name in policy_dict.get("block_list", []):
         log.warning("policy block_list match: %s", req.package_name)
@@ -127,6 +128,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
             ),
             latency_ms=(time.perf_counter() - t0) * 1000,
             policy_file=policy_file_str,
+            requires_confirmation=requires_confirmation,
         )
         await _audit_scan(req, response, cached=False)
         return response
@@ -150,6 +152,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
             ),
             latency_ms=(time.perf_counter() - t0) * 1000,
             policy_file=policy_file_str,
+            requires_confirmation=requires_confirmation,
         )
         await record_allow(req.package_name, req.version)
         await _audit_scan(req, response, cached=False)
@@ -174,6 +177,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
             explanation=f"'{req.package_name}' is in the local trust list (HMAC verified).",
             latency_ms=(time.perf_counter() - t0) * 1000,
             policy_file=policy_file_str,
+            requires_confirmation=requires_confirmation,
         )
         await _audit_scan(req, response, cached=False)
         return response
@@ -200,6 +204,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
             latency_ms=(time.perf_counter() - t0) * 1000,
             trust_flags=trust_result.flags,
             policy_file=policy_file_str,
+            requires_confirmation=requires_confirmation,
         )
         await _audit_scan(req, response, cached=False)
         return response
@@ -216,6 +221,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
         if tamper_flags:
             cached.trust_flags = tamper_flags
         cached.policy_file = policy_file_str
+        cached.requires_confirmation = requires_confirmation
         await _audit_scan(req, cached, cached=True)
         return cached
 
@@ -267,6 +273,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
         file_scan_summary=shi_score.metadata.get("file_scan_summary"),
         trust_flags=tamper_flags,
         policy_file=policy_file_str,
+            requires_confirmation=requires_confirmation,
     )
 
     await store_result(response)
@@ -416,12 +423,13 @@ async def audit_override(body: dict) -> dict:
         raise HTTPException(status_code=422, detail="package_name is required")
     version     = body.get("version") or None
     verdict_was = body.get("verdict_was", "WARN")
+    event       = body.get("event", "user_override")
     record = {
         "ts":          datetime.now(timezone.utc).isoformat(),
-        "event":       "user_override",
+        "event":       event,
         "package":     f"{package_name}@{version or 'latest'}",
         "verdict_was": verdict_was,
     }
     await audit_log.append(record)
-    log.info("audit: user_override for %s (verdict_was=%s)", record["package"], verdict_was)
-    return {"logged": True, "package": record["package"]}
+    log.info("audit: %s for %s (verdict_was=%s)", event, record["package"], verdict_was)
+    return {"logged": True, "package": record["package"], "event": event}

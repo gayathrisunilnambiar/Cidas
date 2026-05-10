@@ -414,3 +414,89 @@ async def test_get_policy_no_file_returns_null(async_client, tmp_path, monkeypat
 async def test_get_policy_missing_query_param_returns_422(async_client):
     resp = await async_client.get("/api/v1/policy")
     assert resp.status_code == 422
+
+
+# ── warn_requires_confirmation flag propagation ──────────────────────────────
+
+def test_validator_accepts_warn_requires_confirmation():
+    out = pol.validate({"version": 1, "warn_requires_confirmation": False})
+    assert out["warn_requires_confirmation"] is False
+
+
+def test_validator_rejects_non_boolean_warn_requires_confirmation():
+    with pytest.raises(ValidationError):
+        pol.validate({"version": 1, "warn_requires_confirmation": ["maybe"]})
+
+
+async def test_scan_response_carries_requires_confirmation_when_policy_sets_it(
+    async_client, mock_db_pillars_audit, tmp_path,
+):
+    """A policy with warn_requires_confirmation: true must surface as
+    requires_confirmation: true on the ScanResponse."""
+    _write_policy(tmp_path, warn_requires_confirmation=True)
+    resp = await async_client.post("/api/v1/scan", json={
+        "package_name": "lodash",
+        "project_path": str(tmp_path),
+    })
+    assert resp.status_code == 200
+    assert resp.json()["requires_confirmation"] is True
+
+
+async def test_scan_response_requires_confirmation_defaults_to_false(
+    async_client, mock_db_pillars_audit, tmp_path,
+):
+    """No policy / policy silent on the field → requires_confirmation: false."""
+    resp = await async_client.post("/api/v1/scan", json={
+        "package_name": "lodash",
+        "project_path": str(tmp_path),
+    })
+    assert resp.status_code == 200
+    assert resp.json()["requires_confirmation"] is False
+
+
+async def test_block_list_response_also_carries_requires_confirmation(
+    async_client, mock_db_pillars_audit, tmp_path,
+):
+    """The fast-path BLOCK / TRUST short-circuits must still propagate the flag."""
+    _write_policy(
+        tmp_path,
+        block_list=["evil"],
+        warn_requires_confirmation=True,
+    )
+    resp = await async_client.post("/api/v1/scan", json={
+        "package_name": "evil",
+        "project_path": str(tmp_path),
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["decision"] == "BLOCK"
+    assert body["requires_confirmation"] is True
+
+
+# ── /audit/override accepts an event override ─────────────────────────────────
+
+async def test_audit_override_accepts_user_cancel_event(async_client, tmp_path, monkeypatch):
+    """The shim/UX layer can record cancel intent via event=user_cancel_intent."""
+    import daemon.utils.audit_log as _al
+    monkeypatch.setattr(_al, "_DEFAULT_PATH", tmp_path / "audit.log")
+    resp = await async_client.post("/api/v1/audit/override", json={
+        "package_name": "lodash",
+        "version": "4.17.21",
+        "verdict_was": "WARN",
+        "event": "user_cancel_intent",
+    })
+    assert resp.status_code == 200
+    assert resp.json()["event"] == "user_cancel_intent"
+    import json as _json
+    record = _json.loads((tmp_path / "audit.log").read_text().strip())
+    assert record["event"] == "user_cancel_intent"
+
+
+async def test_audit_override_default_event_is_user_override(async_client, tmp_path, monkeypatch):
+    import daemon.utils.audit_log as _al
+    monkeypatch.setattr(_al, "_DEFAULT_PATH", tmp_path / "audit.log")
+    resp = await async_client.post("/api/v1/audit/override", json={
+        "package_name": "lodash",
+    })
+    assert resp.status_code == 200
+    assert resp.json()["event"] == "user_override"

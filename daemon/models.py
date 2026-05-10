@@ -75,6 +75,14 @@ class ScanResponse(BaseModel):
             "or null when no project policy was discovered."
         ),
     )
+    requires_confirmation: bool = Field(
+        default=False,
+        description=(
+            "When true, the npm shim must prompt the developer to type 'proceed' "
+            "before a WARN install continues.  Set by the daemon when the resolved "
+            "policy has warn_requires_confirmation: true."
+        ),
+    )
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

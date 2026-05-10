@@ -18,7 +18,14 @@
  *   CIDAS_REAL_NPM    — path to the real npm binary (auto-detected if unset)
  *
  * Admin configuration (~/.cidas/config.json):
- *   bypass_disabled: true  — prevents CIDAS_BYPASS=1 from working (CI enforcement)
+ *   bypass_disabled: true            — prevents CIDAS_BYPASS=1 (CI enforcement)
+ *   warn_requires_confirmation: true — on every WARN, prompt the developer
+ *                                       to type 'proceed' before continuing
+ *                                       (interactive TTY only; no-op in CI)
+ *
+ * Project policy (.cidas/policy.json) may also set warn_requires_confirmation
+ * — the daemon surfaces it on the ScanResponse as ``requires_confirmation: true``,
+ * which forces the prompt regardless of local config.
  */
 "use strict";
 
@@ -231,6 +238,46 @@ function _passthrough() {
   process.exit(result.status ?? 0);
 }
 
+/**
+ * Decide whether the shim should prompt the user before continuing past a
+ * WARN. Returns true when the policy/config asks for confirmation AND the
+ * shell is interactive — non-TTY environments (CI, scripts) skip the prompt
+ * so unattended runs don't hang.
+ */
+function _shouldPromptForWarn(scanResult, isTTY) {
+  if (!isTTY) return false;
+  if (scanResult && scanResult.requires_confirmation === true) return true;
+  const config = _readCidasConfig();
+  return config.warn_requires_confirmation === true;
+}
+
+/**
+ * Prompt on stderr for a confirmation. Resolves true only when the user types
+ * "proceed" (case-insensitive). Any other input resolves false. Ctrl-C while
+ * the prompt is open exits with code 1 so unattended kills are unambiguous.
+ */
+function _promptProceed() {
+  const readline = require("readline");
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input:  process.stdin,
+      output: process.stderr,
+    });
+    rl.on("SIGINT", () => {
+      rl.close();
+      process.stderr.write("\n\x1b[31m[CIDAS]\x1b[0m Install cancelled by user.\n");
+      process.exit(1);
+    });
+    rl.question(
+      "[CIDAS] Type 'proceed' to continue or press Ctrl-C to cancel: ",
+      (answer) => {
+        rl.close();
+        resolve(String(answer).trim().toLowerCase() === "proceed");
+      },
+    );
+  });
+}
+
 // ── Main execution (skipped when require()'d by tests) ────────────────────────
 
 const args = process.argv.slice(2);
@@ -304,6 +351,16 @@ function _main() {
         blocked = true;
       } else if (decision === "WARN") {
         process.stderr.write(`\x1b[33m[CIDAS WARNING]\x1b[0m ${explanation}\n`);
+        if (_shouldPromptForWarn(result, process.stdin.isTTY)) {
+          const proceeded = await _promptProceed();
+          if (!proceeded) {
+            process.stderr.write(
+              "\x1b[31m[CIDAS]\x1b[0m Install aborted: confirmation required " +
+              "but user did not type 'proceed'.\n"
+            );
+            process.exit(1);
+          }
+        }
       } else {
         process.stdout.write(`\x1b[32m[CIDAS ALLOW]\x1b[0m ${explanation}\n`);
       }
@@ -332,4 +389,6 @@ module.exports = {
   _checkOfflineCache,
   _readDaemonToken,
   _scan,
+  _shouldPromptForWarn,
+  _promptProceed,
 };

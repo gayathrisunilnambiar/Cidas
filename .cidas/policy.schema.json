@@ -73,6 +73,19 @@
       ],
       "default": null,
       "title": "Contextify Weight"
+    },
+    "warn_requires_confirmation": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "When true, the npm shim must prompt the developer to type 'proceed' before any WARN install proceeds (interactive TTY only).  Surfaced to the shim via ScanResponse.requires_confirmation.",
+      "title": "Warn Requires Confirmation"
     }
   },
   "title": "CIDAS Project Policy",
