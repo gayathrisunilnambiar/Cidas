@@ -24,6 +24,7 @@ export interface ScanResponse {
   alternatives: string[];
   explanation: string;
   latency_ms: number;
+  policy_file?: string | null;
 }
 
 export interface PackageScanRequest {

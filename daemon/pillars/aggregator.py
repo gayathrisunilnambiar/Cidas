@@ -37,8 +37,11 @@ _CONTEXTIFY_WEIGHT_MIN: float = 0.0
 _CONTEXTIFY_WEIGHT_MAX: float = 0.5
 
 
-def _resolved_weights(settings: Settings) -> tuple[float, float, float]:
-    """Return ``(context_w, sentinel_w, shield_w)`` after admin-config override.
+def _resolved_weights(
+    settings: Settings,
+    policy_overrides: dict | None = None,
+) -> tuple[float, float, float]:
+    """Return ``(context_w, sentinel_w, shield_w)`` after policy / admin override.
 
     Default weights have been rebalanced from 0.15/0.40/0.45 to 0.30/0.35/0.35
     (set in config.py): the old split made Contextify nearly inert — even at
@@ -48,13 +51,19 @@ def _resolved_weights(settings: Settings) -> tuple[float, float, float]:
     keeps Sentinel+Shield collectively dominant (0.70) because they detect the
     most concrete signals, but lets Contextify actually move the needle.
 
-    When the admin sets ``contextify_weight`` in ~/.cidas/config.json, that
-    value replaces the env-derived ``context_weight`` and the remainder
-    (1 - contextify_weight) is split between Sentinel and Shield in the same
-    ratio as the env-derived weights. This is for projects that legitimately
-    mix domains (ML + web + tooling) where a low Contextify weight is desired.
+    Override layers (highest priority first)
+    ----------------------------------------
+    1. ``policy_overrides`` — a project's ``.cidas/policy.json`` (already
+       merged with admin config by ``utils.policy.resolve``).
+    2. ``~/.cidas/config.json`` (admin per-machine config) — used when the
+       caller passes ``policy_overrides=None``.
+    3. Env-derived ``settings.context_weight`` etc.
+
+    When ``contextify_weight`` is overridden, the remainder is split between
+    Sentinel and Shield in the same ratio as their env-derived weights.
     """
-    cfg_weight = get_admin_config().get("contextify_weight")
+    overrides = policy_overrides if policy_overrides is not None else get_admin_config()
+    cfg_weight = overrides.get("contextify_weight")
     if cfg_weight is None:
         return settings.context_weight, settings.sentinel_weight, settings.shield_weight
 
@@ -90,13 +99,16 @@ class Aggregator:
         sentinel: PillarScore,
         shield: PillarScore,
         settings: Settings,
+        policy_overrides: dict | None = None,
     ) -> tuple[float, str]:
         """Return ``(risk_score, explanation)`` from the three pillar scores.
 
         risk_score is 0–100 (weighted sum capped at 100).
         explanation is a plain-English summary listing the top signal flags.
+        ``policy_overrides`` is the merged project policy from
+        ``utils.policy.resolve`` and takes precedence over admin config.
         """
-        ctx_w, sen_w, shi_w = _resolved_weights(settings)
+        ctx_w, sen_w, shi_w = _resolved_weights(settings, policy_overrides)
         score = (
             ctx_w * contextify.score
             + sen_w * sentinel.score

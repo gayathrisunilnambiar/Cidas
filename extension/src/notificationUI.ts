@@ -95,6 +95,10 @@ export function showDetailsPanel(response: ScanResponse): void {
     ? `<p><strong>Alternatives:</strong> ${response.alternatives.join(", ")}</p>`
     : "";
 
+  const policyLine = response.policy_file
+    ? `<p><strong>Project policy:</strong> <code>${response.policy_file}</code></p>`
+    : "";
+
   panel.webview.html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -116,6 +120,7 @@ export function showDetailsPanel(response: ScanResponse): void {
    Latency: ${response.latency_ms.toFixed(0)} ms</p>
 <p>${response.explanation}</p>
 ${altList}
+${policyLine}
 <table>
   <thead><tr><th>Pillar</th><th>Score</th><th>Confidence</th><th>Flags</th></tr></thead>
   <tbody>${pillarRows}</tbody>

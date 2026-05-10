@@ -10,6 +10,7 @@ DELETE /cache               — purge expired cache entries
 POST /cache/invalidate      — emergency per-package cache invalidation (auth required)
 GET  /audit                 — query structured scan audit log (auth required)
 POST /audit/override        — record a user "Proceed Anyway" override event
+GET  /policy                — return resolved project policy for a path
 """
 from __future__ import annotations
 
@@ -40,7 +41,7 @@ from .pillars.aggregator import Aggregator
 from .pillars.contextify import Contextify
 from .pillars.sentinel import Sentinel
 from .pillars.shield import Shield
-from .utils import audit_log
+from .utils import audit_log, policy
 from .utils.logger import get_logger
 from .utils.offline_cache import record_allow
 
@@ -100,6 +101,60 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
     t0 = time.perf_counter()
     log.info("scan: %s@%s (ai_suggested=%s)", req.package_name, req.version or "latest", req.ai_suggested)
 
+    # ── Project policy resolution ─────────────────────────────────────────
+    # Discovered before any other check so block_list / trust_list rules
+    # decided by the security lead in .cidas/policy.json take precedence over
+    # both the local trust DB and the per-machine cache.
+    policy_dict, policy_path = policy.resolve(req.project_path)
+    policy_file_str = str(policy_path) if policy_path else None
+
+    if req.package_name in policy_dict.get("block_list", []):
+        log.warning("policy block_list match: %s", req.package_name)
+        blocked_score = PillarScore(
+            score=100.0, confidence=1.0, flags=["policy_block"], metadata={},
+        )
+        response = ScanResponse(
+            package_name=req.package_name,
+            version=req.version,
+            decision="BLOCK",
+            risk_score=100.0,
+            contextify=blocked_score,
+            sentinel=blocked_score,
+            shield=blocked_score,
+            explanation=(
+                f"'{req.package_name}' is on the project block_list "
+                f"({policy_file_str}). Installation refused."
+            ),
+            latency_ms=(time.perf_counter() - t0) * 1000,
+            policy_file=policy_file_str,
+        )
+        await _audit_scan(req, response, cached=False)
+        return response
+
+    if req.package_name in policy_dict.get("trust_list", []):
+        log.info("policy trust_list match: %s", req.package_name)
+        trusted_score = PillarScore(
+            score=0.0, confidence=1.0, flags=["policy_trust"], metadata={},
+        )
+        response = ScanResponse(
+            package_name=req.package_name,
+            version=req.version,
+            decision="ALLOW",
+            risk_score=0.0,
+            contextify=trusted_score,
+            sentinel=trusted_score,
+            shield=trusted_score,
+            explanation=(
+                f"'{req.package_name}' is on the project trust_list "
+                f"({policy_file_str})."
+            ),
+            latency_ms=(time.perf_counter() - t0) * 1000,
+            policy_file=policy_file_str,
+        )
+        await record_allow(req.package_name, req.version)
+        await _audit_scan(req, response, cached=False)
+        return response
+
     # Trust bypass — check HMAC integrity before honoring the trust list.
     token = get_or_create_token()
     trust_result = await check_trust(req.package_name, token)
@@ -118,6 +173,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
             shield=trusted_score,
             explanation=f"'{req.package_name}' is in the local trust list (HMAC verified).",
             latency_ms=(time.perf_counter() - t0) * 1000,
+            policy_file=policy_file_str,
         )
         await _audit_scan(req, response, cached=False)
         return response
@@ -143,6 +199,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
             ),
             latency_ms=(time.perf_counter() - t0) * 1000,
             trust_flags=trust_result.flags,
+            policy_file=policy_file_str,
         )
         await _audit_scan(req, response, cached=False)
         return response
@@ -158,6 +215,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
         cached.latency_ms = (time.perf_counter() - t0) * 1000
         if tamper_flags:
             cached.trust_flags = tamper_flags
+        cached.policy_file = policy_file_str
         await _audit_scan(req, cached, cached=True)
         return cached
 
@@ -169,7 +227,30 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
     )
 
     settings = get_settings()
-    risk_score, explanation = _aggregator.aggregate(ctx_score, sen_score, shi_score, settings)
+    risk_score, explanation = _aggregator.aggregate(
+        ctx_score, sen_score, shi_score, settings, policy_overrides=policy_dict,
+    )
+
+    # ── Policy penalties (apply on top of the weighted score) ─────────────
+    # These rules are project-policy ceilings on what can pass: a low download
+    # count for an AI-suggested package, or a missing repo link, are not
+    # malware tells on their own — but a security lead may want them treated
+    # as risk multipliers in their codebase.
+    policy_flags: list[str] = []
+    min_dl = policy_dict.get("min_monthly_downloads")
+    if (
+        isinstance(min_dl, int)
+        and req.ai_suggested
+        and (sen_score.metadata.get("monthly_downloads") or 0) < min_dl
+    ):
+        risk_score = min(risk_score + 15.0, 100.0)
+        policy_flags.append("policy_low_downloads")
+    if policy_dict.get("require_repository_link") and not sen_score.metadata.get("has_repository", True):
+        risk_score = min(risk_score + 10.0, 100.0)
+        policy_flags.append("policy_no_repository")
+
+    if policy_flags:
+        sen_score.flags.extend(policy_flags)
     decision = _aggregator.get_decision(risk_score, settings)
 
     response = ScanResponse(
@@ -185,6 +266,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
         tarball_url=shi_score.metadata.get("tarball_url"),
         file_scan_summary=shi_score.metadata.get("file_scan_summary"),
         trust_flags=tamper_flags,
+        policy_file=policy_file_str,
     )
 
     await store_result(response)
@@ -295,6 +377,24 @@ async def audit_query(
     events = await audit_log.read_records(last=last, verdict=verdict, package=package, since=since)
     log.debug("audit: returned %d records (filters: verdict=%s package=%s since=%s)", len(events), verdict, package, since)
     return {"events": events, "total": len(events)}
+
+
+@router.get("/policy", dependencies=[Depends(require_token)])
+async def policy_resolved(
+    project_path: str = Query(..., description="Absolute path of the project to resolve policy for"),
+) -> dict:
+    """Return the merged policy for *project_path* and the source file path.
+
+    Walks up from *project_path* looking for ``.cidas/policy.json`` (capped
+    at ten levels), validates it, and merges its values over the per-user
+    admin config.  ``policy_file`` is null when no project policy was found.
+    """
+    merged, source = policy.resolve(project_path)
+    return {
+        "project_path": project_path,
+        "policy_file":  str(source) if source else None,
+        "resolved":     merged,
+    }
 
 
 @router.post("/audit/override", dependencies=[Depends(require_token)])

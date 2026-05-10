@@ -68,6 +68,13 @@ class ScanResponse(BaseModel):
             "mismatches, 'trust_legacy_no_mac' when the row predates integrity protection."
         ),
     )
+    policy_file: Optional[str] = Field(
+        default=None,
+        description=(
+            "Absolute path of the .cidas/policy.json file that was applied to this scan, "
+            "or null when no project policy was discovered."
+        ),
+    )
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
