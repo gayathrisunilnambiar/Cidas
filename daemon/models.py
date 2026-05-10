@@ -54,6 +54,13 @@ class ScanResponse(BaseModel):
     alternatives: list[str] = Field(default_factory=list, description="Safer package suggestions")
     explanation: str = Field(default="", description="Human-readable summary of the decision")
     latency_ms: float = Field(default=0.0, description="Total scan duration in milliseconds")
+    tarball_url: Optional[str] = Field(
+        default=None, description="The dist.tarball URL that Shield's file scan downloaded",
+    )
+    file_scan_summary: Optional[dict] = Field(
+        default=None,
+        description="Shield file-scan stats: files_scanned, flags, skipped (or None when no scan ran)",
+    )
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

@@ -66,6 +66,34 @@ async def get_download_count(name: str) -> int:
     return int(data.get("downloads", 0))
 
 
+async def download_tarball(url: str, dest_path: str) -> bool:
+    """Stream a tarball from *url* to *dest_path*. Returns True on success.
+
+    Capped at 25 MiB to avoid pathological packages exhausting disk; npm's
+    own per-tarball limit is well below this. Network failures return False
+    so callers can degrade gracefully (skip the file scan).
+    """
+    max_bytes = 25 * 1024 * 1024
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True) as client:
+            async with client.stream("GET", url) as resp:
+                if resp.status_code != 200:
+                    log.warning("tarball GET %s returned HTTP %s", url, resp.status_code)
+                    return False
+                written = 0
+                with open(dest_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                        written += len(chunk)
+                        if written > max_bytes:
+                            log.warning("tarball %s exceeded %d-byte cap", url, max_bytes)
+                            return False
+                        f.write(chunk)
+        return True
+    except (httpx.TimeoutException, httpx.NetworkError, OSError) as exc:
+        log.warning("tarball download failed for %s: %s", url, exc)
+        return False
+
+
 async def get_package_tarball_info(name: str, version: str | None) -> dict[str, Any] | None:
     """Return the dist/tarball metadata for a specific package version."""
     meta = await get_package_metadata(name)

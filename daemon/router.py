@@ -92,6 +92,8 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
         shield=shi_score,
         explanation=explanation,
         latency_ms=(time.perf_counter() - t0) * 1000,
+        tarball_url=shi_score.metadata.get("tarball_url"),
+        file_scan_summary=shi_score.metadata.get("file_scan_summary"),
     )
 
     await store_result(response)

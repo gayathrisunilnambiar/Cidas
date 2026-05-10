@@ -9,7 +9,14 @@ import pytest
 
 from daemon.config import get_settings
 from daemon.models import PillarScore
+from daemon.pillars import aggregator as aggregator_module
 from daemon.pillars.aggregator import Aggregator
+
+
+@pytest.fixture(autouse=True)
+def _no_admin_config(monkeypatch):
+    """Disable ~/.cidas/config.json influence so unit tests stay deterministic."""
+    monkeypatch.setattr(aggregator_module, "get_admin_config", lambda: {})
 
 
 @pytest.fixture
@@ -19,11 +26,12 @@ def aggregator() -> Aggregator:
 
 @pytest.fixture
 def settings():
+    get_settings.cache_clear()
     return get_settings()
 
 
-def _ps(score: float, flags: list[str] | None = None) -> PillarScore:
-    return PillarScore(score=score, confidence=0.9, flags=flags or [], metadata={})
+def _ps(score: float, flags: list[str] | None = None, metadata: dict | None = None) -> PillarScore:
+    return PillarScore(score=score, confidence=0.9, flags=flags or [], metadata=metadata or {})
 
 
 # ── Score computation tests ───────────────────────────────────────────────────
@@ -38,8 +46,8 @@ def test_all_low_scores_allow(aggregator: Aggregator, settings) -> None:
 
 def test_high_contextify_warns(aggregator: Aggregator, settings) -> None:
     """Pillar combination that produces a score in [warn_threshold, block_threshold) → WARN."""
-    # sentinel=60 → 0.40*60=24, shield=40 → 0.45*40=18, contextify=0 → total=42 → WARN
-    risk, explanation = aggregator.aggregate(_ps(0), _ps(60), _ps(40), settings)
+    # 0.30*0 + 0.35*80 + 0.35*40 = 0 + 28 + 14 = 42 → WARN (with default 0.30/0.35/0.35)
+    risk, explanation = aggregator.aggregate(_ps(0), _ps(80), _ps(40), settings)
     assert settings.warn_threshold <= risk < settings.block_threshold
     assert aggregator.get_decision(risk, settings) == "WARN"
     assert explanation  # not empty
@@ -47,8 +55,8 @@ def test_high_contextify_warns(aggregator: Aggregator, settings) -> None:
 
 def test_any_pillar_above_block_threshold_blocks(aggregator: Aggregator, settings) -> None:
     """When the weighted score reaches block_threshold the decision must be BLOCK."""
-    # sentinel=100, shield=100 → 0.40*100 + 0.45*100 = 85 → BLOCK
-    risk, explanation = aggregator.aggregate(_ps(0), _ps(100), _ps(100), settings)
+    # All pillars at 100 → score 100 → BLOCK regardless of weight redistribution.
+    risk, explanation = aggregator.aggregate(_ps(100), _ps(100), _ps(100), settings)
     assert risk >= settings.block_threshold
     assert aggregator.get_decision(risk, settings) == "BLOCK"
 
@@ -86,3 +94,97 @@ def test_get_decision_boundaries(aggregator: Aggregator, settings) -> None:
     assert aggregator.get_decision(settings.warn_threshold, settings) == "WARN"
     assert aggregator.get_decision(settings.block_threshold - 1, settings) == "WARN"
     assert aggregator.get_decision(settings.block_threshold, settings) == "BLOCK"
+
+
+# ── Contextify floor rule ─────────────────────────────────────────────────────
+
+def test_alien_package_pushed_to_warn_by_floor(aggregator: Aggregator, settings) -> None:
+    """A package wholly unrelated to the project (similarity ~ 0) must reach WARN
+    even when Sentinel and Shield report only modest signals."""
+    # Realistic shape: Contextify returns 25 for "unfamiliar in mature project",
+    # similarity ~ 0 triggers the +20 floor; modest Sentinel/Shield baseline.
+    ctx = _ps(25, flags=["unfamiliar_in_mature_project"], metadata={"similarity": 0.01})
+    sen = _ps(20)
+    shi = _ps(10)
+    # 0.30*25 + 0.35*20 + 0.35*10 + 20 (floor) = 7.5 + 7.0 + 3.5 + 20 = 38.0
+    # → still ALLOW; bump Sentinel slightly to land in WARN.
+    sen = _ps(30)
+    risk, _ = aggregator.aggregate(ctx, sen, shi, settings)
+    assert risk >= settings.warn_threshold
+    assert aggregator.get_decision(risk, settings) == "WARN"
+    assert "alien_to_project" in ctx.flags
+
+
+def test_floor_not_applied_when_similarity_above_threshold(aggregator: Aggregator, settings) -> None:
+    """Floor must not fire for packages with even modest similarity to the project."""
+    ctx = _ps(15, metadata={"similarity": 0.10})
+    sen = _ps(10)
+    shi = _ps(10)
+    # Without floor: 0.30*15 + 0.35*10 + 0.35*10 = 4.5 + 3.5 + 3.5 = 11.5
+    risk, _ = aggregator.aggregate(ctx, sen, shi, settings)
+    assert risk < 15  # nowhere near the +20 the floor would have added
+    assert "alien_to_project" not in ctx.flags
+
+
+def test_floor_skipped_when_metadata_missing(aggregator: Aggregator, settings) -> None:
+    """If Contextify did not record a similarity (e.g. empty project) the floor
+    must NOT fire — there is no evidence the package is alien."""
+    ctx = _ps(5, metadata={})
+    risk, _ = aggregator.aggregate(ctx, _ps(0), _ps(0), settings)
+    assert risk < 10
+    assert "alien_to_project" not in ctx.flags
+
+
+def test_high_contextify_similarity_lowers_final_score(aggregator: Aggregator, settings) -> None:
+    """A high-similarity (well-fitting) package must produce a lower final
+    score than a low-similarity one with the same Sentinel/Shield signals."""
+    sen, shi = _ps(20), _ps(10)
+    aligned = _ps(0,  metadata={"similarity": 0.80})  # great fit
+    alien   = _ps(25, metadata={"similarity": 0.02})  # alien → triggers floor
+
+    risk_aligned, _ = aggregator.aggregate(aligned, sen, shi, settings)
+    risk_alien,   _ = aggregator.aggregate(alien,   sen, shi, settings)
+    assert risk_aligned < risk_alien
+    # And the gap is meaningful: at minimum the floor penalty.
+    assert risk_alien - risk_aligned >= aggregator_module.CONTEXTIFY_FLOOR_PENALTY - 1
+
+
+# ── Admin-config override (~/.cidas/config.json: contextify_weight) ───────────
+
+def test_admin_config_overrides_contextify_weight(aggregator, settings, monkeypatch) -> None:
+    """Setting contextify_weight in the admin config replaces the env-derived
+    weight; Sentinel/Shield split the remainder proportionally."""
+    monkeypatch.setattr(aggregator_module, "get_admin_config",
+                        lambda: {"contextify_weight": 0.5})
+    # ctx=80 with weight 0.5 → 40; sentinel=0, shield=0 → final 40 → WARN.
+    risk, _ = aggregator.aggregate(_ps(80), _ps(0), _ps(0), settings)
+    assert risk == pytest.approx(40.0, abs=0.5)
+    assert aggregator.get_decision(risk, settings) == "WARN"
+
+
+def test_admin_config_zero_weight_disables_contextify(aggregator, settings, monkeypatch) -> None:
+    """Mixed-domain projects can set contextify_weight=0 to silence the pillar."""
+    monkeypatch.setattr(aggregator_module, "get_admin_config",
+                        lambda: {"contextify_weight": 0.0})
+    # Even a maximum Contextify score must contribute zero to the final score.
+    # Use empty metadata so the alien-floor doesn't fire.
+    risk, _ = aggregator.aggregate(_ps(100), _ps(0), _ps(0), settings)
+    assert risk == pytest.approx(0.0, abs=0.5)
+
+
+def test_admin_config_clamps_out_of_range_weight(aggregator, settings, monkeypatch) -> None:
+    """Values above the 0.5 ceiling must be clamped, not accepted blindly."""
+    monkeypatch.setattr(aggregator_module, "get_admin_config",
+                        lambda: {"contextify_weight": 0.95})
+    # ctx=100 weight clamped to 0.5 → contributes 50, not 95.
+    risk, _ = aggregator.aggregate(_ps(100), _ps(0), _ps(0), settings)
+    assert risk == pytest.approx(50.0, abs=0.5)
+
+
+def test_admin_config_invalid_value_falls_back_to_default(aggregator, settings, monkeypatch) -> None:
+    """Non-numeric admin-config values must not crash the aggregator."""
+    monkeypatch.setattr(aggregator_module, "get_admin_config",
+                        lambda: {"contextify_weight": "not-a-number"})
+    risk, _ = aggregator.aggregate(_ps(100), _ps(0), _ps(0), settings)
+    # Falls back to env default (0.30) → 30.
+    assert risk == pytest.approx(30.0, abs=0.5)

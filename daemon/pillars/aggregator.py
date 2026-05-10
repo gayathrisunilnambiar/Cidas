@@ -9,11 +9,76 @@ Weights are read from ``Settings`` at call time so that changing them in
 """
 from __future__ import annotations
 
-from ..config import Settings
+from ..config import Settings, get_admin_config
 from ..models import PillarScore
 from ..utils.logger import get_logger
 
 log = get_logger(__name__)
+
+# ── Contextify floor rule ─────────────────────────────────────────────────────
+#
+# A package whose embedding similarity to the project fingerprint is below this
+# threshold is treated as "alien" — completely unrelated to anything the
+# project already imports. Even with the rebalanced weights below, Contextify's
+# compute_score caps at 25, which only contributes ~7.5 points at weight 0.30 —
+# nowhere near the 40-point WARN threshold. The floor adds a flat additive
+# penalty so a sufficiently alien package, combined with even modest Sentinel
+# or Shield signals, lands in WARN territory rather than ALLOW. This closes the
+# "clean-scripted, unique-named, off-topic dropper" hole where every other
+# pillar is silent because the package has no obvious malware tells.
+CONTEXTIFY_FLOOR_SIMILARITY: float = 0.05
+CONTEXTIFY_FLOOR_PENALTY: float    = 20.0
+
+# Admin override: per-machine Contextify weight clamp (read from
+# ~/.cidas/config.json, key "contextify_weight"). Range is bounded so a
+# misconfigured value cannot drown out Sentinel/Shield, which carry the
+# concrete malware signals.
+_CONTEXTIFY_WEIGHT_MIN: float = 0.0
+_CONTEXTIFY_WEIGHT_MAX: float = 0.5
+
+
+def _resolved_weights(settings: Settings) -> tuple[float, float, float]:
+    """Return ``(context_w, sentinel_w, shield_w)`` after admin-config override.
+
+    Default weights have been rebalanced from 0.15/0.40/0.45 to 0.30/0.35/0.35
+    (set in config.py): the old split made Contextify nearly inert — even at
+    its max of 25 it contributed only 3.75 points, so a malicious package with
+    a unique name (Sentinel quiet) and no install scripts (Shield quiet) would
+    sail through as ALLOW regardless of how out-of-place it was. The new split
+    keeps Sentinel+Shield collectively dominant (0.70) because they detect the
+    most concrete signals, but lets Contextify actually move the needle.
+
+    When the admin sets ``contextify_weight`` in ~/.cidas/config.json, that
+    value replaces the env-derived ``context_weight`` and the remainder
+    (1 - contextify_weight) is split between Sentinel and Shield in the same
+    ratio as the env-derived weights. This is for projects that legitimately
+    mix domains (ML + web + tooling) where a low Contextify weight is desired.
+    """
+    cfg_weight = get_admin_config().get("contextify_weight")
+    if cfg_weight is None:
+        return settings.context_weight, settings.sentinel_weight, settings.shield_weight
+
+    try:
+        ctx_w = float(cfg_weight)
+    except (TypeError, ValueError):
+        log.warning("invalid contextify_weight in admin config: %r — ignoring", cfg_weight)
+        return settings.context_weight, settings.sentinel_weight, settings.shield_weight
+
+    if not _CONTEXTIFY_WEIGHT_MIN <= ctx_w <= _CONTEXTIFY_WEIGHT_MAX:
+        log.warning(
+            "contextify_weight=%s outside allowed range [%s, %s] — clamping",
+            ctx_w, _CONTEXTIFY_WEIGHT_MIN, _CONTEXTIFY_WEIGHT_MAX,
+        )
+        ctx_w = max(_CONTEXTIFY_WEIGHT_MIN, min(_CONTEXTIFY_WEIGHT_MAX, ctx_w))
+
+    remaining = 1.0 - ctx_w
+    s_plus_h  = settings.sentinel_weight + settings.shield_weight
+    if s_plus_h <= 0:
+        # Defensive: split remainder evenly when env weights are degenerate.
+        return ctx_w, remaining / 2.0, remaining / 2.0
+    sen_w = remaining * (settings.sentinel_weight / s_plus_h)
+    shi_w = remaining * (settings.shield_weight   / s_plus_h)
+    return ctx_w, sen_w, shi_w
 
 
 class Aggregator:
@@ -31,11 +96,21 @@ class Aggregator:
         risk_score is 0–100 (weighted sum capped at 100).
         explanation is a plain-English summary listing the top signal flags.
         """
+        ctx_w, sen_w, shi_w = _resolved_weights(settings)
         score = (
-            settings.context_weight * contextify.score
-            + settings.sentinel_weight * sentinel.score
-            + settings.shield_weight * shield.score
+            ctx_w * contextify.score
+            + sen_w * sentinel.score
+            + shi_w * shield.score
         )
+
+        # Contextify floor: additive penalty for packages that are wholly
+        # unrelated to the project, regardless of weight configuration.
+        similarity = contextify.metadata.get("similarity") if contextify.metadata else None
+        if isinstance(similarity, (int, float)) and similarity < CONTEXTIFY_FLOOR_SIMILARITY:
+            score += CONTEXTIFY_FLOOR_PENALTY
+            if "alien_to_project" not in contextify.flags:
+                contextify.flags.append("alien_to_project")
+
         score = round(min(score, 100.0), 2)
 
         # A nonexistent AI-suggested package is unambiguously hallucinated — force BLOCK.

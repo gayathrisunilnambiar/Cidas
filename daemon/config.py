@@ -37,9 +37,13 @@ class Settings(BaseSettings):
     warn_threshold: int = Field(default=40, ge=1, le=100)
 
     # ── Pillar weights (must sum to ~1.0) ─────────────────────────────────
-    context_weight: float = Field(default=0.15, ge=0.0, le=1.0)
-    sentinel_weight: float = Field(default=0.40, ge=0.0, le=1.0)
-    shield_weight: float = Field(default=0.45, ge=0.0, le=1.0)
+    # Rebalanced from 0.15/0.40/0.45: the old Contextify weight was too low to
+    # catch a clean-scripted, unique-named, off-topic package — see
+    # daemon/pillars/aggregator.py for the full rationale. Admins can override
+    # context_weight per-machine via ~/.cidas/config.json (key "contextify_weight").
+    context_weight: float = Field(default=0.30, ge=0.0, le=1.0)
+    sentinel_weight: float = Field(default=0.35, ge=0.0, le=1.0)
+    shield_weight: float = Field(default=0.35, ge=0.0, le=1.0)
 
     # ── Embeddings ────────────────────────────────────────────────────────
     embedding_model: str = "all-MiniLM-L6-v2"
@@ -74,6 +78,15 @@ def get_admin_config() -> dict:
     --------------
     bypass_disabled : bool
         When true the npm shim refuses CIDAS_BYPASS=1 and exits with code 1.
+    package_file_scan : bool (default true)
+        When false, Shield skips downloading and extracting the package
+        tarball — useful on slow connections or air-gapped CI runners.
+        Lifecycle-script and README scans still run.
+    contextify_weight : float (0.0–0.5)
+        Per-machine override for the Contextify pillar weight. Useful for
+        projects that legitimately mix domains (e.g. ML + web + tooling) where
+        a low Contextify weight reduces nuisance "alien_to_project" hits.
+        Out-of-range values are clamped; non-numeric values are ignored.
     """
     config_path = Path.home() / ".cidas" / "config.json"
     try:

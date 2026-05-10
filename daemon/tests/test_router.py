@@ -85,10 +85,10 @@ async def test_scan_allow(async_client, mock_db, mock_pillars_low):
 
 async def test_scan_warn(async_client, mock_db):
     """Pillar scores that land in the WARN band (40–79) must produce WARN."""
-    # sentinel=60 → 0.40×60=24; shield=40 → 0.45×40=18; total=42 → WARN
+    # 0.30×0 + 0.35×80 + 0.35×40 = 0 + 28 + 14 = 42 → WARN
     with (
         patch("daemon.router._contextify.score", new=AsyncMock(return_value=_ps(0.0))),
-        patch("daemon.router._sentinel.score", new=AsyncMock(return_value=_ps(60.0))),
+        patch("daemon.router._sentinel.score", new=AsyncMock(return_value=_ps(80.0))),
         patch("daemon.router._shield.score", new=AsyncMock(return_value=_ps(40.0))),
     ):
         response = await async_client.post("/api/v1/scan", json={
@@ -104,10 +104,10 @@ async def test_scan_warn(async_client, mock_db):
 
 async def test_scan_block(async_client, mock_db):
     """High pillar scores must produce BLOCK with risk_score >= 80."""
-    # sentinel=100 + shield=100 → 0.40×100+0.45×100=85 → BLOCK
+    # ctx=100 + sentinel=100 + shield=100 → 100 → BLOCK.
     high = _ps(100.0, flags=["package_not_found", "eval_usage"])
     with (
-        patch("daemon.router._contextify.score", new=AsyncMock(return_value=_ps(0.0))),
+        patch("daemon.router._contextify.score", new=AsyncMock(return_value=_ps(100.0))),
         patch("daemon.router._sentinel.score", new=AsyncMock(return_value=high)),
         patch("daemon.router._shield.score", new=AsyncMock(return_value=high)),
     ):
@@ -205,7 +205,7 @@ async def test_warn_verdict_does_NOT_write_offline_cache(async_client, mock_db):
     """WARN must not enter the offline cache — silent install would be unsafe."""
     with (
         patch("daemon.router._contextify.score", new=AsyncMock(return_value=_ps(0.0))),
-        patch("daemon.router._sentinel.score",   new=AsyncMock(return_value=_ps(60.0))),
+        patch("daemon.router._sentinel.score",   new=AsyncMock(return_value=_ps(80.0))),
         patch("daemon.router._shield.score",     new=AsyncMock(return_value=_ps(40.0))),
         patch("daemon.router.record_allow",      new=AsyncMock()) as rec_mock,
     ):
