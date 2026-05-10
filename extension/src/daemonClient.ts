@@ -5,11 +5,39 @@
  * safe ALLOW response with a warning flag rather than throwing, ensuring
  * that a stopped daemon never blocks the developer's workflow.
  */
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import * as vscode from "vscode";
 import { Decision, PackageScanRequest, ScanResponse } from "./types";
 
 function _daemonUrl(port: number): string {
   return `http://127.0.0.1:${port}/api/v1`;
+}
+
+const TOKEN_PATH = process.env.CIDAS_TOKEN_FILE
+  || path.join(os.homedir(), ".cidas", "daemon.token");
+
+/**
+ * Read the daemon's bearer token from disk. Returns null when the file is
+ * absent (daemon hasn't started yet) so callers can decide how to react.
+ * Cached after first successful read to avoid hitting the FS per request.
+ */
+let _tokenCache: string | null | undefined;
+function _readToken(): string | null {
+  if (_tokenCache !== undefined) return _tokenCache;
+  try {
+    const t = fs.readFileSync(TOKEN_PATH, "utf8").trim();
+    _tokenCache = t || null;
+  } catch {
+    _tokenCache = null;
+  }
+  return _tokenCache;
+}
+
+function _authHeader(): Record<string, string> {
+  const t = _readToken();
+  return t ? { "Authorization": `Bearer ${t}` } : {};
 }
 
 function _safeAllow(packageName: string, reason: string): ScanResponse {
@@ -46,7 +74,7 @@ export class DaemonClient {
     try {
       const resp = await fetch(`${_daemonUrl(this.port)}/scan`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ..._authHeader() },
         body: JSON.stringify(request),
       });
       if (!resp.ok) {
@@ -130,7 +158,7 @@ export class DaemonClient {
   async trust(packageName: string): Promise<void> {
     const resp = await fetch(`${_daemonUrl(this.port)}/trust`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ..._authHeader() },
       body: JSON.stringify({ package_name: packageName }),
     });
     if (!resp.ok) {
@@ -140,7 +168,10 @@ export class DaemonClient {
 
   /** Purge expired entries from the daemon scan cache. */
   async clearCache(): Promise<void> {
-    const resp = await fetch(`${_daemonUrl(this.port)}/cache`, { method: "DELETE" });
+    const resp = await fetch(`${_daemonUrl(this.port)}/cache`, {
+      method: "DELETE",
+      headers: { ..._authHeader() },
+    });
     if (!resp.ok) {
       throw new Error(`Cache clear failed: HTTP ${resp.status}`);
     }

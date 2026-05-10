@@ -13,6 +13,7 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+from .auth import get_or_create_token
 from .config import get_settings
 from .database import init_db
 from .router import router
@@ -25,6 +26,7 @@ log = get_logger(__name__)
 async def _lifespan(app: FastAPI):  # type: ignore[type-arg]
     settings = get_settings()
     log.info("CIDAS daemon starting on %s:%s", settings.daemon_host, settings.daemon_port)
+    get_or_create_token()  # ensure ~/.cidas/daemon.token exists before any client calls
     await init_db()
     yield
     log.info("CIDAS daemon shutting down")

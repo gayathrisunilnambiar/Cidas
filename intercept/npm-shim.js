@@ -73,6 +73,8 @@ const fs    = require("fs");
 const DAEMON_URL = process.env.CIDAS_DAEMON_URL || "http://127.0.0.1:7355";
 const BYPASS     = Boolean(process.env.CIDAS_BYPASS);
 const REAL_NPM   = process.env.CIDAS_REAL_NPM || _findRealNpm();
+const TOKEN_PATH = process.env.CIDAS_TOKEN_FILE ||
+  path.join(os.homedir(), ".cidas", "daemon.token");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -168,6 +170,20 @@ function _handleBypass(packageNames) {
   );
 }
 
+/**
+ * Read ~/.cidas/daemon.token (written at first daemon start). Returns null
+ * when the file is absent; callers decide how to react. Whitespace and a
+ * trailing newline are stripped so the bearer header is well-formed.
+ */
+function _readDaemonToken() {
+  try {
+    const t = fs.readFileSync(TOKEN_PATH, "utf8").trim();
+    return t || null;
+  } catch {
+    return null;
+  }
+}
+
 function _scan(name, version) {
   return new Promise((resolve, reject) => {
     const url    = new URL("/api/v1/scan", DAEMON_URL);
@@ -179,9 +195,11 @@ function _scan(name, version) {
       requesting_tool: "npm-shim",
     });
     const lib    = url.protocol === "https:" ? https : http;
+    const token  = _readDaemonToken();
     const headers = {
       "Content-Type": "application/json",
       "Content-Length": Buffer.byteLength(body),
+      ...(token ? { "Authorization": `Bearer ${token}` } : {}),
     };
     const options = {
       hostname: url.hostname,
@@ -236,6 +254,17 @@ function _main() {
   if (packages.length === 0) {
     // Bare `npm install` — installs from package.json; nothing to screen
     _passthrough();
+  }
+
+  // Refuse to proceed unauthenticated — a missing token means the daemon
+  // has never run, so we can't actually screen anything anyway.
+  if (!_readDaemonToken()) {
+    process.stderr.write(
+      "\x1b[31m[CIDAS]\x1b[0m Daemon token not found at " + TOKEN_PATH + ".\n" +
+      "  Start the daemon at least once (it generates the token on first run).\n" +
+      "  Refusing to install without authenticated screening.\n"
+    );
+    process.exit(1);
   }
 
   (async () => {
@@ -299,5 +328,6 @@ module.exports = {
   _writeAuditLog,
   _handleBypass,
   _checkOfflineCache,
+  _readDaemonToken,
   _scan,
 };

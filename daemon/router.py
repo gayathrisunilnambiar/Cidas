@@ -14,8 +14,9 @@ import json
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from .auth import require_token
 from .config import get_settings
 from .database import add_trusted, clear_expired, get_cached_result, is_trusted, store_result
 from .models import HealthResponse, PackageScanRequest, PillarScore, ScanResponse
@@ -40,7 +41,7 @@ async def health() -> HealthResponse:
     return HealthResponse()
 
 
-@router.post("/scan", response_model=ScanResponse)
+@router.post("/scan", response_model=ScanResponse, dependencies=[Depends(require_token)])
 async def scan(req: PackageScanRequest) -> ScanResponse:
     """Screen an npm package; returns a cached result when available."""
     t0 = time.perf_counter()
@@ -102,7 +103,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
     return response
 
 
-@router.post("/trust")
+@router.post("/trust", dependencies=[Depends(require_token)])
 async def trust(body: dict) -> dict:
     """Add a package to the local trust bypass list."""
     package_name = body.get("package_name", "")
@@ -113,7 +114,7 @@ async def trust(body: dict) -> dict:
     return {"trusted": package_name}
 
 
-@router.delete("/cache")
+@router.delete("/cache", dependencies=[Depends(require_token)])
 async def cache_delete() -> dict:
     """Purge all expired scan cache entries."""
     removed = await clear_expired()

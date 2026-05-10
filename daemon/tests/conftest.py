@@ -40,9 +40,19 @@ _SAMPLE_META: dict = {
 
 @pytest.fixture
 async def async_client() -> AsyncGenerator[AsyncClient, None]:
-    """FastAPI test client using ASGI transport (no real network)."""
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        yield client
+    """FastAPI test client using ASGI transport (no real network).
+
+    The bearer-token auth dependency is overridden to a no-op for these
+    tests — auth itself is exercised in test_auth.py, and forcing every
+    router test to manage tokens would obscure the routing assertions.
+    """
+    from daemon.auth import require_token
+    app.dependency_overrides[require_token] = lambda: None
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            yield client
+    finally:
+        app.dependency_overrides.pop(require_token, None)
 
 
 @pytest.fixture
