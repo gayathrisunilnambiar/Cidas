@@ -16,7 +16,10 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from daemon import auth
+from daemon.database import TRUST_STATUS_UNKNOWN, TrustCheckResult
 from daemon.main import app
+
+_UNKNOWN_TRUST = TrustCheckResult(status=TRUST_STATUS_UNKNOWN, package_name="")
 
 
 # ── Token file fixture ────────────────────────────────────────────────────────
@@ -79,11 +82,12 @@ def mock_db_for_auth():
     from daemon.models import PillarScore
     low = PillarScore(score=0.0, confidence=0.9, flags=[], metadata={})
     with (
-        patch("daemon.router.is_trusted",        new=AsyncMock(return_value=False)),
+        patch("daemon.router.check_trust",       new=AsyncMock(return_value=_UNKNOWN_TRUST)),
         patch("daemon.router.get_cached_result", new=AsyncMock(return_value=None)),
         patch("daemon.router.store_result",      new=AsyncMock()),
         patch("daemon.router.add_trusted",       new=AsyncMock()),
         patch("daemon.router.clear_expired",     new=AsyncMock(return_value=0)),
+        patch("daemon.router.list_all_trusted",  new=AsyncMock(return_value=[])),
         patch("daemon.router.record_allow",      new=AsyncMock()),
         patch("daemon.router._contextify.score", new=AsyncMock(return_value=low)),
         patch("daemon.router._sentinel.score",   new=AsyncMock(return_value=low)),

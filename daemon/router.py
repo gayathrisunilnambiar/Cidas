@@ -5,6 +5,7 @@ Endpoints
 GET  /health            — liveness probe, no auth
 POST /scan              — screen an npm package (main entry point)
 POST /trust             — add a package to the local trust bypass list
+GET  /trust/verify      — audit all trust-list HMACs (auth required)
 DELETE /cache           — purge expired cache entries
 POST /cache/invalidate  — emergency per-package cache invalidation (auth required)
 """
@@ -17,14 +18,18 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from .auth import require_token
+from .auth import get_or_create_token, require_token
 from .config import get_settings
 from .database import (
+    TRUST_STATUS_LEGACY,
+    TRUST_STATUS_TAMPERED,
+    TRUST_STATUS_VERIFIED,
     add_trusted,
+    check_trust,
     clear_expired,
     get_cached_result,
     invalidate_package,
-    is_trusted,
+    list_all_trusted,
     store_result,
 )
 from .models import HealthResponse, PackageScanRequest, PillarScore, ScanResponse
@@ -55,9 +60,12 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
     t0 = time.perf_counter()
     log.info("scan: %s@%s (ai_suggested=%s)", req.package_name, req.version or "latest", req.ai_suggested)
 
-    # Trust bypass
-    if await is_trusted(req.package_name):
-        log.info("trust bypass for %s", req.package_name)
+    # Trust bypass — check HMAC integrity before honoring the trust list.
+    token = get_or_create_token()
+    trust_result = await check_trust(req.package_name, token)
+
+    if trust_result.status == TRUST_STATUS_VERIFIED:
+        log.info("trust bypass (verified) for %s", req.package_name)
         trusted_score = PillarScore(score=0.0, confidence=1.0, flags=["trusted"], metadata={})
         await record_allow(req.package_name, req.version)
         return ScanResponse(
@@ -68,9 +76,36 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
             contextify=trusted_score,
             sentinel=trusted_score,
             shield=trusted_score,
-            explanation=f"'{req.package_name}' is in the local trust list.",
+            explanation=f"'{req.package_name}' is in the local trust list (HMAC verified).",
             latency_ms=(time.perf_counter() - t0) * 1000,
         )
+
+    if trust_result.status == TRUST_STATUS_LEGACY:
+        # Pre-MAC rows: trusted but unverified — return WARN so users know
+        # re-adding via /trust will give them full integrity protection.
+        log.warning("trust bypass (legacy, no MAC) for %s", req.package_name)
+        legacy_score = PillarScore(
+            score=0.0, confidence=0.5, flags=["trust_legacy_no_mac"], metadata={}
+        )
+        return ScanResponse(
+            package_name=req.package_name,
+            version=req.version,
+            decision="WARN",
+            risk_score=40.0,
+            contextify=legacy_score,
+            sentinel=legacy_score,
+            shield=legacy_score,
+            explanation=(
+                f"'{req.package_name}' is in the local trust list but was added before "
+                "integrity protection was enabled. Re-add via POST /trust to upgrade."
+            ),
+            latency_ms=(time.perf_counter() - t0) * 1000,
+            trust_flags=trust_result.flags,
+        )
+
+    # TAMPERED: log.critical was emitted inside check_trust; fall through to
+    # a full pillar scan and attach the flag so the VS Code panel can alert.
+    tamper_flags = trust_result.flags if trust_result.status == TRUST_STATUS_TAMPERED else []
 
     # Cache lookup
     cached = await get_cached_result(req.package_name, req.version)
@@ -102,6 +137,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
         latency_ms=(time.perf_counter() - t0) * 1000,
         tarball_url=shi_score.metadata.get("tarball_url"),
         file_scan_summary=shi_score.metadata.get("file_scan_summary"),
+        trust_flags=tamper_flags,
     )
 
     await store_result(response)
@@ -115,13 +151,43 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
 
 @router.post("/trust", dependencies=[Depends(require_token)])
 async def trust(body: dict) -> dict:
-    """Add a package to the local trust bypass list."""
+    """Add a package to the local trust bypass list with an HMAC integrity tag."""
     package_name = body.get("package_name", "")
     if not package_name:
         raise HTTPException(status_code=422, detail="package_name is required")
-    await add_trusted(package_name)
+    token = get_or_create_token()
+    await add_trusted(package_name, token)
     log.info("trusted: %s", package_name)
     return {"trusted": package_name}
+
+
+@router.get("/trust/verify", dependencies=[Depends(require_token)])
+async def trust_verify() -> dict:
+    """Audit every trust-list row and report HMAC verification results.
+
+    Returns a summary count and the full list, including any rows that appear
+    to have been tampered with directly in the SQLite file.
+    Auth required so an attacker cannot probe which packages are trusted.
+    """
+    token = get_or_create_token()
+    rows = await list_all_trusted(token)
+    tampered = [r for r in rows if r["verification"] == TRUST_STATUS_TAMPERED]
+    legacy   = [r for r in rows if r["verification"] == TRUST_STATUS_LEGACY]
+    verified = len(rows) - len(tampered) - len(legacy)
+    if tampered:
+        log.critical(
+            "trust/verify: %d tampered rows detected: %s",
+            len(tampered),
+            [r["package_name"] for r in tampered],
+        )
+    return {
+        "total":            len(rows),
+        "verified":         verified,
+        "legacy_no_mac":    len(legacy),
+        "tampered":         len(tampered),
+        "tampered_packages": tampered,
+        "entries":          rows,
+    }
 
 
 @router.delete("/cache", dependencies=[Depends(require_token)])

@@ -9,15 +9,24 @@ import aiosqlite
 
 from daemon.database import (
     _SCHEMA_VERSION,
+    TRUST_STATUS_LEGACY,
+    TRUST_STATUS_TAMPERED,
+    TRUST_STATUS_VERIFIED,
+    TRUST_STATUS_UNKNOWN,
+    _compute_trust_mac,
     add_trusted,
+    check_trust,
     clear_expired,
     get_cached_result,
     init_db,
     invalidate_package,
     is_trusted,
+    list_all_trusted,
     store_result,
 )
 from daemon.models import PillarScore, ScanResponse
+
+_TOKEN = "a" * 64  # deterministic test token (64 hex chars, valid length)
 
 
 def _ps(score: float = 0.0) -> PillarScore:
@@ -147,7 +156,7 @@ async def test_clear_expired_only_removes_stale(db):
 # ── add_trusted / is_trusted ──────────────────────────────────────────────────
 
 async def test_add_trusted_and_is_trusted(db):
-    await add_trusted("react")
+    await add_trusted("react", _TOKEN)
     assert await is_trusted("react") is True
 
 
@@ -157,15 +166,100 @@ async def test_is_trusted_unknown_package(db):
 
 async def test_add_trusted_is_idempotent(db):
     """Adding the same package twice must not raise."""
-    await add_trusted("lodash")
-    await add_trusted("lodash")
+    await add_trusted("lodash", _TOKEN)
+    await add_trusted("lodash", _TOKEN)
     assert await is_trusted("lodash") is True
 
 
 async def test_trust_does_not_bleed_between_packages(db):
     """Trusting one package must not affect unrelated packages."""
-    await add_trusted("react")
+    await add_trusted("react", _TOKEN)
     assert await is_trusted("lodash") is False
+
+
+# ── check_trust — HMAC integrity ─────────────────────────────────────────────
+
+async def test_check_trust_verified_for_api_added_row(db):
+    """A row added via add_trusted must return VERIFIED on check_trust."""
+    await add_trusted("react", _TOKEN)
+    result = await check_trust("react", _TOKEN)
+    assert result.status == TRUST_STATUS_VERIFIED
+    assert result.flags == []
+
+
+async def test_check_trust_unknown_for_absent_package(db):
+    result = await check_trust("ghost-pkg", _TOKEN)
+    assert result.status == TRUST_STATUS_UNKNOWN
+
+
+async def test_check_trust_tampered_when_mac_altered(db, tmp_path):
+    """Directly editing the stored MAC must trigger TAMPERED status."""
+    await add_trusted("lodash", _TOKEN)
+    # Corrupt the MAC directly in SQLite.
+    async with aiosqlite.connect(db) as conn:
+        await conn.execute(
+            "UPDATE trust_cache SET trust_list_mac = ? WHERE package_name = ?",
+            ("deadbeef" * 8, "lodash"),  # 64 chars of garbage
+        )
+        await conn.commit()
+    result = await check_trust("lodash", _TOKEN)
+    assert result.status == TRUST_STATUS_TAMPERED
+    assert "trust_tamper_detected" in result.flags
+
+
+async def test_check_trust_tampered_when_package_name_changed(db):
+    """A row copied and renamed (package_name changed) must also TAMPER."""
+    await add_trusted("safe-pkg", _TOKEN)
+    # Copy the row under a different name — the MAC won't match.
+    async with aiosqlite.connect(db) as conn:
+        row = await (await conn.execute(
+            "SELECT added_at, source, trust_list_mac FROM trust_cache WHERE package_name='safe-pkg'"
+        )).fetchone()
+        await conn.execute(
+            "INSERT INTO trust_cache (package_name, added_at, source, trust_list_mac, mac_status) "
+            "VALUES (?, ?, ?, ?, 'ok')",
+            ("evil-pkg", row[0], row[1], row[2]),
+        )
+        await conn.commit()
+    result = await check_trust("evil-pkg", _TOKEN)
+    assert result.status == TRUST_STATUS_TAMPERED
+
+
+async def test_check_trust_legacy_for_pre_mac_row(db):
+    """Rows with mac_status='legacy_no_mac' (pre-v3) must return LEGACY."""
+    # Simulate a pre-v3 row: exists but has no MAC.
+    async with aiosqlite.connect(db) as conn:
+        import time as _time
+        await conn.execute(
+            "INSERT INTO trust_cache (package_name, added_at, source, trust_list_mac, mac_status) "
+            "VALUES (?, ?, 'api', NULL, 'legacy_no_mac')",
+            ("old-trusted", _time.time()),
+        )
+        await conn.commit()
+    result = await check_trust("old-trusted", _TOKEN)
+    assert result.status == TRUST_STATUS_LEGACY
+    assert "trust_legacy_no_mac" in result.flags
+
+
+async def test_list_all_trusted_returns_all_rows(db):
+    await add_trusted("react", _TOKEN)
+    await add_trusted("lodash", _TOKEN)
+    rows = await list_all_trusted(_TOKEN)
+    names = {r["package_name"] for r in rows}
+    assert names == {"react", "lodash"}
+    assert all(r["verification"] == TRUST_STATUS_VERIFIED for r in rows)
+
+
+async def test_list_all_trusted_reports_tampered_row(db):
+    await add_trusted("react", _TOKEN)
+    async with aiosqlite.connect(db) as conn:
+        await conn.execute(
+            "UPDATE trust_cache SET trust_list_mac = ? WHERE package_name = ?",
+            ("00" * 32, "react"),
+        )
+        await conn.commit()
+    rows = await list_all_trusted(_TOKEN)
+    assert rows[0]["verification"] == TRUST_STATUS_TAMPERED
 
 
 # ── invalidate_package ────────────────────────────────────────────────────────

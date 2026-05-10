@@ -61,6 +61,13 @@ class ScanResponse(BaseModel):
         default=None,
         description="Shield file-scan stats: files_scanned, flags, skipped (or None when no scan ran)",
     )
+    trust_flags: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Trust-integrity signals: 'trust_tamper_detected' when a trust-list row HMAC "
+            "mismatches, 'trust_legacy_no_mac' when the row predates integrity protection."
+        ),
+    )
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
