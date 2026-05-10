@@ -104,7 +104,7 @@ function _readCidasConfig() {
  * after every ALLOW verdict). Returns the cache entry when it is a valid,
  * unexpired ALLOW; null otherwise. Used only when the daemon is unreachable.
  */
-function _checkOfflineCache(packageName) {
+function _checkOfflineCache(packageName, version) {
   const cachePath = path.join(os.homedir(), ".cidas", "offline-cache.json");
   let cache;
   try {
@@ -112,7 +112,9 @@ function _checkOfflineCache(packageName) {
   } catch {
     return null;
   }
-  const entry = cache && cache[packageName];
+  // Key format matches the daemon's record_allow: "name@version" (or "name@latest").
+  const cacheKey = `${packageName}@${version || "latest"}`;
+  const entry = cache && cache[cacheKey];
   if (!entry || entry.verdict !== "ALLOW") return null;
 
   const ts = Date.parse(entry.timestamp);
@@ -283,7 +285,7 @@ function _main() {
         result = await _scan(name, version);
       } catch (err) {
         // Daemon unreachable — try the offline cache before failing open.
-        const cached = _checkOfflineCache(name);
+        const cached = _checkOfflineCache(name, version);
         if (cached) {
           // Known-good package within TTL; proceed silently.
           continue;

@@ -2,10 +2,11 @@
 
 Endpoints
 ---------
-GET  /health   — liveness probe, no auth
-POST /scan     — screen an npm package (main entry point)
-POST /trust    — add a package to the local trust bypass list
-DELETE /cache  — purge expired cache entries
+GET  /health            — liveness probe, no auth
+POST /scan              — screen an npm package (main entry point)
+POST /trust             — add a package to the local trust bypass list
+DELETE /cache           — purge expired cache entries
+POST /cache/invalidate  — emergency per-package cache invalidation (auth required)
 """
 from __future__ import annotations
 
@@ -18,7 +19,14 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from .auth import require_token
 from .config import get_settings
-from .database import add_trusted, clear_expired, get_cached_result, is_trusted, store_result
+from .database import (
+    add_trusted,
+    clear_expired,
+    get_cached_result,
+    invalidate_package,
+    is_trusted,
+    store_result,
+)
 from .models import HealthResponse, PackageScanRequest, PillarScore, ScanResponse
 from .pillars.aggregator import Aggregator
 from .pillars.contextify import Contextify
@@ -51,7 +59,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
     if await is_trusted(req.package_name):
         log.info("trust bypass for %s", req.package_name)
         trusted_score = PillarScore(score=0.0, confidence=1.0, flags=["trusted"], metadata={})
-        await record_allow(req.package_name)
+        await record_allow(req.package_name, req.version)
         return ScanResponse(
             package_name=req.package_name,
             version=req.version,
@@ -100,7 +108,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
     if decision == "ALLOW":
         # Mirror to offline-cache.json so the npm shim can serve known-good
         # packages silently when the daemon is unreachable.
-        await record_allow(req.package_name)
+        await record_allow(req.package_name, req.version)
     log.info("result: decision=%s score=%.1f package=%s", decision, risk_score, req.package_name)
     return response
 
@@ -122,6 +130,37 @@ async def cache_delete() -> dict:
     removed = await clear_expired()
     log.info("cache purge: removed %d expired entries", removed)
     return {"purged": removed}
+
+
+@router.post("/cache/invalidate", dependencies=[Depends(require_token)])
+async def cache_invalidate(body: dict) -> dict:
+    """Emergency per-package cache invalidation.
+
+    Body fields
+    -----------
+    package_name : str  — the npm package name (required)
+    version      : str  — the specific version to evict, or ``"*"`` to evict
+                          every cached version of the package (required)
+
+    Returns ``{"invalidated": <count>}`` with the number of rows removed.
+    A security team can call this immediately after a malicious-package
+    disclosure to force a fresh scan on the next install attempt.
+    """
+    package_name = body.get("package_name", "")
+    version = body.get("version", "")
+    if not package_name:
+        raise HTTPException(status_code=422, detail="package_name is required")
+    if not version:
+        raise HTTPException(
+            status_code=422,
+            detail='version is required; use "*" to invalidate all versions',
+        )
+    removed = await invalidate_package(package_name, version)
+    log.info(
+        "cache invalidate: package=%s version=%s removed=%d",
+        package_name, version, removed,
+    )
+    return {"invalidated": removed, "package_name": package_name, "version": version}
 
 
 @router.get("/audit")

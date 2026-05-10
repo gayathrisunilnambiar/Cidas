@@ -39,6 +39,7 @@ def mock_db():
         patch("daemon.router.store_result", new=AsyncMock()),
         patch("daemon.router.add_trusted", new=AsyncMock()),
         patch("daemon.router.clear_expired", new=AsyncMock(return_value=3)),
+        patch("daemon.router.invalidate_package", new=AsyncMock(return_value=1)),
         patch("daemon.router.record_allow", new=AsyncMock()),
     ):
         yield
@@ -198,7 +199,7 @@ async def test_allow_verdict_writes_offline_cache(async_client, mock_db, mock_pi
             "package_name": "lodash",
             "project_path": "/tmp/project",
         })
-    rec_mock.assert_called_once_with("lodash")
+    rec_mock.assert_called_once_with("lodash", None)
 
 
 async def test_warn_verdict_does_NOT_write_offline_cache(async_client, mock_db):
@@ -240,7 +241,7 @@ async def test_trust_bypass_writes_offline_cache(async_client, mock_db):
         await async_client.post("/api/v1/scan", json={
             "package_name": "internal-lib", "project_path": "/tmp/project",
         })
-    rec_mock.assert_called_once_with("internal-lib")
+    rec_mock.assert_called_once_with("internal-lib", None)
 
 
 # ── POST /trust ───────────────────────────────────────────────────────────────
@@ -355,3 +356,63 @@ async def test_audit_skips_malformed_lines(async_client, tmp_path):
 
     body = response.json()
     assert body["total"] == 2  # malformed line and empty line skipped
+
+
+# ── POST /cache/invalidate ────────────────────────────────────────────────────
+
+async def test_cache_invalidate_specific_version(async_client, mock_db):
+    """Invalidating a specific version removes exactly that entry."""
+    with patch("daemon.router.invalidate_package", new=AsyncMock(return_value=1)) as inv_mock:
+        response = await async_client.post(
+            "/api/v1/cache/invalidate",
+            json={"package_name": "lodash", "version": "4.17.21"},
+            headers={"Authorization": "Bearer ignored-in-test"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["invalidated"] == 1
+    assert body["package_name"] == "lodash"
+    assert body["version"] == "4.17.21"
+    inv_mock.assert_called_once_with("lodash", "4.17.21")
+
+
+async def test_cache_invalidate_wildcard_all_versions(async_client, mock_db):
+    """version='*' must be forwarded verbatim to invalidate_package."""
+    with patch("daemon.router.invalidate_package", new=AsyncMock(return_value=3)) as inv_mock:
+        response = await async_client.post(
+            "/api/v1/cache/invalidate",
+            json={"package_name": "lodash", "version": "*"},
+        )
+    assert response.status_code == 200
+    assert response.json()["invalidated"] == 3
+    inv_mock.assert_called_once_with("lodash", "*")
+
+
+async def test_cache_invalidate_missing_package_name_returns_422(async_client, mock_db):
+    response = await async_client.post(
+        "/api/v1/cache/invalidate", json={"version": "1.0.0"}
+    )
+    assert response.status_code == 422
+
+
+async def test_cache_invalidate_missing_version_returns_422(async_client, mock_db):
+    response = await async_client.post(
+        "/api/v1/cache/invalidate", json={"package_name": "lodash"}
+    )
+    assert response.status_code == 422
+
+
+# ── Version propagation in scan ───────────────────────────────────────────────
+
+async def test_scan_with_explicit_version_mirrors_to_offline_cache(
+    async_client, mock_db, mock_pillars_low
+):
+    """An ALLOW for name@version must record the version in the offline-cache call."""
+    with patch("daemon.router.record_allow", new=AsyncMock()) as rec_mock:
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "lodash",
+            "version": "4.17.21",
+            "project_path": "/tmp/project",
+        })
+    assert response.status_code == 200
+    rec_mock.assert_called_once_with("lodash", "4.17.21")

@@ -73,17 +73,27 @@ def _write_sync(path: Path, data: dict) -> None:
         raise
 
 
-async def record_allow(package_name: str, ttl_hours: int = DEFAULT_TTL_HOURS) -> None:
+async def record_allow(
+    package_name: str,
+    version: str | None = None,
+    ttl_hours: int = DEFAULT_TTL_HOURS,
+) -> None:
     """Append/update an ALLOW entry in the offline cache.
+
+    The cache key is ``name@version`` (``"latest"`` when *version* is None),
+    matching the SQLite cache key format so the two caches stay in sync.
 
     Failures are logged but never raised — a write error must not break the
     scan path. WARN / BLOCK results should not call this.
     """
+    cache_key = f"{package_name}@{version or 'latest'}"
+
     def _do() -> None:
         path = _path()
         cache = _read_sync(path)
-        cache[package_name] = {
+        cache[cache_key] = {
             "package_name": package_name,
+            "version":      version or "latest",
             "verdict":      "ALLOW",
             "timestamp":    datetime.now(timezone.utc).isoformat(),
             "ttl_hours":    ttl_hours,
@@ -91,6 +101,6 @@ async def record_allow(package_name: str, ttl_hours: int = DEFAULT_TTL_HOURS) ->
         try:
             _write_sync(path, cache)
         except OSError as e:
-            log.warning("offline-cache write failed for %s: %s", package_name, e)
+            log.warning("offline-cache write failed for %s: %s", cache_key, e)
 
     await asyncio.to_thread(_do)

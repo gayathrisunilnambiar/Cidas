@@ -21,6 +21,10 @@ log = get_logger(__name__)
 
 _DEFAULT_TTL = 3600  # 1 hour
 
+# Bump this whenever the cache key format or table schema changes.
+# init_db() runs any pending migrations automatically.
+_SCHEMA_VERSION = 2
+
 _CREATE_SCAN_CACHE = """
 CREATE TABLE IF NOT EXISTS scan_cache (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,19 +48,62 @@ CREATE TABLE IF NOT EXISTS trust_cache (
 );
 """
 
+_CREATE_SCHEMA_VERSION = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    id         INTEGER PRIMARY KEY,
+    version    INTEGER NOT NULL,
+    applied_at REAL    NOT NULL
+);
+"""
+
 
 def _pkg_key(name: str, version: str | None) -> str:
     return f"{name}@{version or 'latest'}"
 
 
+async def _get_schema_version(db: aiosqlite.Connection) -> int:
+    async with db.execute("SELECT MAX(version) FROM schema_version") as cur:
+        row = await cur.fetchone()
+    return row[0] if (row and row[0] is not None) else 0
+
+
 async def init_db() -> None:
-    """Create tables if they do not exist."""
+    """Create tables and run pending schema migrations.
+
+    Migration history
+    -----------------
+    v1 → v2 (current):  cache keys changed from bare ``package_name`` to
+        ``name@version``.  Any pre-v2 rows (no ``@`` in ``package_key``)
+        are stale by definition — their version is unknown so they cannot
+        be served safely.  We purge them rather than attempting an upgrade.
+    """
     settings = get_settings()
     async with aiosqlite.connect(settings.sqlite_db_path) as db:
         await db.execute(_CREATE_SCAN_CACHE)
         await db.execute(_CREATE_TRUST_CACHE)
+        await db.execute(_CREATE_SCHEMA_VERSION)
         await db.commit()
-    log.info("SQLite cache initialised at %s", settings.sqlite_db_path)
+
+        current = await _get_schema_version(db)
+
+        if current < 2:
+            # Purge rows that were written without a version segment.
+            cursor = await db.execute(
+                "DELETE FROM scan_cache WHERE package_key NOT LIKE '%@%'"
+            )
+            purged = cursor.rowcount
+            await db.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (_SCHEMA_VERSION, time.time()),
+            )
+            await db.commit()
+            if purged:
+                log.info(
+                    "schema migration v%d: purged %d stale scan_cache rows",
+                    _SCHEMA_VERSION, purged,
+                )
+
+    log.info("SQLite cache ready (schema v%d) at %s", _SCHEMA_VERSION, settings.sqlite_db_path)
 
 
 async def get_cached_result(name: str, version: str | None) -> ScanResponse | None:
@@ -164,3 +211,30 @@ async def is_trusted(package_name: str) -> bool:
             "SELECT 1 FROM trust_cache WHERE package_name = ?", (package_name,)
         ) as cursor:
             return await cursor.fetchone() is not None
+
+
+async def invalidate_package(name: str, version: str) -> int:
+    """Remove scan-cache entries for *name* at *version*.
+
+    Pass ``version="*"`` to purge every cached version of the package —
+    useful for emergency security-team invalidations where the exact
+    affected version is unknown.
+
+    Returns the number of rows deleted.
+    """
+    settings = get_settings()
+    async with aiosqlite.connect(settings.sqlite_db_path) as db:
+        if version == "*":
+            # Match any key that starts with "name@" (exact prefix, not GLOB
+            # expansion) so "evil-pkg" doesn't accidentally match "evil-pkg-lite".
+            cursor = await db.execute(
+                "DELETE FROM scan_cache WHERE package_key LIKE ?",
+                (f"{name}@%",),
+            )
+        else:
+            cursor = await db.execute(
+                "DELETE FROM scan_cache WHERE package_key = ?",
+                (_pkg_key(name, version),),
+            )
+        await db.commit()
+        return cursor.rowcount
