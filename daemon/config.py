@@ -6,7 +6,9 @@ to avoid re-loading the .env file on every access.
 """
 from __future__ import annotations
 
+import json
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -58,3 +60,23 @@ def get_settings() -> Settings:
     the process.  Call ``get_settings.cache_clear()`` in tests to reset.
     """
     return Settings()
+
+
+def get_admin_config() -> dict:
+    """Read ~/.cidas/config.json and return the parsed object.
+
+    Returns an empty dict when the file does not exist or contains invalid JSON.
+    This file is controlled by the system administrator (not env vars) and is
+    used for settings that must survive across dev-environment resets, such as
+    ``bypass_disabled: true`` for CI enforcement.
+
+    Supported keys
+    --------------
+    bypass_disabled : bool
+        When true the npm shim refuses CIDAS_BYPASS=1 and exits with code 1.
+    """
+    config_path = Path.home() / ".cidas" / "config.json"
+    try:
+        return json.loads(config_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}

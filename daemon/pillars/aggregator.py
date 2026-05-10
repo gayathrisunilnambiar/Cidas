@@ -38,6 +38,10 @@ class Aggregator:
         )
         score = round(min(score, 100.0), 2)
 
+        # A nonexistent AI-suggested package is unambiguously hallucinated — force BLOCK.
+        if "package_not_found" in sentinel.flags and sentinel.metadata.get("ai_suggested"):
+            score = max(score, float(settings.block_threshold))
+
         explanation = self._build_explanation(score, contextify, sentinel, shield, settings)
         return score, explanation
 

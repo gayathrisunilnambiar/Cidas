@@ -10,7 +10,9 @@ DELETE /cache  — purge expired cache entries
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 
@@ -111,3 +113,29 @@ async def cache_delete() -> dict:
     removed = await clear_expired()
     log.info("cache purge: removed %d expired entries", removed)
     return {"purged": removed}
+
+
+@router.get("/audit")
+async def audit_log() -> dict:
+    """Return the last 100 bypass events from ~/.cidas/audit.log (read-only)."""
+    audit_path = Path.home() / ".cidas" / "audit.log"
+
+    def _read() -> list:
+        try:
+            lines = audit_path.read_text().splitlines()
+        except FileNotFoundError:
+            return []
+        events = []
+        for line in lines[-100:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                log.warning("audit: skipping malformed line: %.80s", line)
+        return events
+
+    events = await asyncio.to_thread(_read)
+    log.debug("audit: returned %d bypass events", len(events))
+    return {"events": events, "total": len(events)}

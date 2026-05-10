@@ -63,7 +63,7 @@ class Sentinel:
             is_typo, similar_to = self.check_name_similarity(package_name)
             if is_typo:
                 return PillarScore(
-                    score=40.0,
+                    score=100.0,
                     confidence=0.8,
                     flags=["typosquat_detected"],
                     metadata={"similar_to": similar_to, "ai_suggested": False},

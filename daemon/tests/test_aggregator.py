@@ -53,6 +53,18 @@ def test_any_pillar_above_block_threshold_blocks(aggregator: Aggregator, setting
     assert aggregator.get_decision(risk, settings) == "BLOCK"
 
 
+def test_hallucinated_package_overrides_to_block(aggregator: Aggregator, settings) -> None:
+    """A nonexistent AI-suggested package must always resolve to BLOCK."""
+    sen = PillarScore(
+        score=70.0, confidence=0.85,
+        flags=["package_not_found"],
+        metadata={"ai_suggested": True},
+    )
+    risk, _ = aggregator.aggregate(_ps(15), sen, _ps(0), settings)
+    assert aggregator.get_decision(risk, settings) == "BLOCK"
+    assert risk >= settings.block_threshold
+
+
 def test_explanation_contains_flags(aggregator: Aggregator, settings) -> None:
     """The explanation string must mention signal flags when they are present."""
     ctx = _ps(20, flags=["unfamiliar_in_mature_project"])

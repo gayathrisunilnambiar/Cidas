@@ -209,3 +209,94 @@ async def test_cache_delete_returns_purge_count(async_client, mock_db):
     body = response.json()
     assert "purged" in body
     assert isinstance(body["purged"], int)
+
+
+# ── GET /audit ────────────────────────────────────────────────────────────────
+
+async def test_audit_returns_empty_when_log_absent(async_client, tmp_path):
+    """Endpoint returns empty list when audit.log does not exist."""
+    with patch("daemon.router.Path") as mock_path_cls:
+        mock_path_cls.home.return_value = tmp_path
+        mock_path_cls.return_value = tmp_path / ".cidas" / "audit.log"
+        # Use a real non-existent path
+        import pathlib
+        with patch("daemon.router.Path", new=pathlib.Path):
+            fake_home = tmp_path  # audit.log doesn't exist under tmp_path
+            with patch.object(pathlib.Path, "home", return_value=fake_home):
+                response = await async_client.get("/api/v1/audit")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["events"] == []
+    assert body["total"] == 0
+
+
+async def test_audit_returns_parsed_events(async_client, tmp_path):
+    """Endpoint parses newline-delimited JSON lines from audit.log."""
+    import json as _json
+    import pathlib
+
+    cidas_dir = tmp_path / ".cidas"
+    cidas_dir.mkdir()
+    audit_log = cidas_dir / "audit.log"
+    events = [
+        {"timestamp": "2026-05-10T10:00:00Z", "package_names": ["lodash"],
+         "bypass_reason": "env_var", "user": "alice", "cwd": "/project"},
+        {"timestamp": "2026-05-10T10:05:00Z", "package_names": ["react", "axios"],
+         "bypass_reason": "env_var", "user": "bob", "cwd": "/other"},
+    ]
+    audit_log.write_text("\n".join(_json.dumps(e) for e in events) + "\n")
+
+    with patch.object(pathlib.Path, "home", return_value=tmp_path):
+        response = await async_client.get("/api/v1/audit")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    assert body["events"][0]["user"] == "alice"
+    assert body["events"][1]["package_names"] == ["react", "axios"]
+
+
+async def test_audit_returns_at_most_100_events(async_client, tmp_path):
+    """Endpoint caps results at 100 even when audit.log has more entries."""
+    import json as _json
+    import pathlib
+
+    cidas_dir = tmp_path / ".cidas"
+    cidas_dir.mkdir()
+    audit_log = cidas_dir / "audit.log"
+    lines = [
+        _json.dumps({"timestamp": f"2026-05-10T{i:05d}Z", "package_names": ["pkg"],
+                     "bypass_reason": "env_var", "user": "u", "cwd": "/"})
+        for i in range(150)
+    ]
+    audit_log.write_text("\n".join(lines) + "\n")
+
+    with patch.object(pathlib.Path, "home", return_value=tmp_path):
+        response = await async_client.get("/api/v1/audit")
+
+    body = response.json()
+    assert body["total"] == 100  # capped at last 100
+
+
+async def test_audit_skips_malformed_lines(async_client, tmp_path):
+    """Malformed lines in audit.log are silently skipped."""
+    import json as _json
+    import pathlib
+
+    cidas_dir = tmp_path / ".cidas"
+    cidas_dir.mkdir()
+    audit_log = cidas_dir / "audit.log"
+    audit_log.write_text(
+        _json.dumps({"timestamp": "2026-05-10T00:00:00Z", "package_names": ["lodash"],
+                     "bypass_reason": "env_var", "user": "u", "cwd": "/"}) + "\n"
+        "this is not json\n"
+        "\n"  # empty line
+        + _json.dumps({"timestamp": "2026-05-10T00:01:00Z", "package_names": ["react"],
+                       "bypass_reason": "env_var", "user": "u", "cwd": "/"}) + "\n"
+    )
+
+    with patch.object(pathlib.Path, "home", return_value=tmp_path):
+        response = await async_client.get("/api/v1/audit")
+
+    body = response.json()
+    assert body["total"] == 2  # malformed line and empty line skipped
