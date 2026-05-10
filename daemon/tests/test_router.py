@@ -47,6 +47,8 @@ def mock_db():
         patch("daemon.router.invalidate_package", new=AsyncMock(return_value=1)),
         patch("daemon.router.list_all_trusted", new=AsyncMock(return_value=[])),
         patch("daemon.router.record_allow", new=AsyncMock()),
+        patch("daemon.router.audit_log.append", new=AsyncMock()),
+        patch("daemon.router.audit_log.read_records", new=AsyncMock(return_value=[])),
     ):
         yield
 
@@ -275,93 +277,44 @@ async def test_cache_delete_returns_purge_count(async_client, mock_db):
 
 # ── GET /audit ────────────────────────────────────────────────────────────────
 
-async def test_audit_returns_empty_when_log_absent(async_client, tmp_path):
-    """Endpoint returns empty list when audit.log does not exist."""
-    with patch("daemon.router.Path") as mock_path_cls:
-        mock_path_cls.home.return_value = tmp_path
-        mock_path_cls.return_value = tmp_path / ".cidas" / "audit.log"
-        # Use a real non-existent path
-        import pathlib
-        with patch("daemon.router.Path", new=pathlib.Path):
-            fake_home = tmp_path  # audit.log doesn't exist under tmp_path
-            with patch.object(pathlib.Path, "home", return_value=fake_home):
-                response = await async_client.get("/api/v1/audit")
+async def test_audit_returns_empty_when_log_absent(async_client):
+    """Endpoint returns empty list when no records match."""
+    with patch("daemon.router.audit_log.read_records", new=AsyncMock(return_value=[])):
+        response = await async_client.get("/api/v1/audit")
     assert response.status_code == 200
     body = response.json()
     assert body["events"] == []
     assert body["total"] == 0
 
 
-async def test_audit_returns_parsed_events(async_client, tmp_path):
-    """Endpoint parses newline-delimited JSON lines from audit.log."""
-    import json as _json
-    import pathlib
-
-    cidas_dir = tmp_path / ".cidas"
-    cidas_dir.mkdir()
-    audit_log = cidas_dir / "audit.log"
+async def test_audit_returns_parsed_events(async_client):
+    """Endpoint returns records from audit_log.read_records."""
     events = [
-        {"timestamp": "2026-05-10T10:00:00Z", "package_names": ["lodash"],
-         "bypass_reason": "env_var", "user": "alice", "cwd": "/project"},
-        {"timestamp": "2026-05-10T10:05:00Z", "package_names": ["react", "axios"],
-         "bypass_reason": "env_var", "user": "bob", "cwd": "/other"},
+        {"ts": "2026-05-10T10:00:00+00:00", "package": "lodash@4", "verdict": "ALLOW",
+         "score": 5.0, "signals": [], "ai_suggested": False, "project_path": "/p", "cached": False},
+        {"ts": "2026-05-10T10:05:00+00:00", "package": "axios@1", "verdict": "WARN",
+         "score": 45.0, "signals": [], "ai_suggested": False, "project_path": "/p", "cached": False},
     ]
-    audit_log.write_text("\n".join(_json.dumps(e) for e in events) + "\n")
-
-    with patch.object(pathlib.Path, "home", return_value=tmp_path):
+    with patch("daemon.router.audit_log.read_records", new=AsyncMock(return_value=events)):
         response = await async_client.get("/api/v1/audit")
-
     assert response.status_code == 200
     body = response.json()
     assert body["total"] == 2
-    assert body["events"][0]["user"] == "alice"
-    assert body["events"][1]["package_names"] == ["react", "axios"]
+    assert body["events"][0]["package"] == "lodash@4"
+    assert body["events"][1]["verdict"] == "WARN"
 
 
-async def test_audit_returns_at_most_100_events(async_client, tmp_path):
-    """Endpoint caps results at 100 even when audit.log has more entries."""
-    import json as _json
-    import pathlib
-
-    cidas_dir = tmp_path / ".cidas"
-    cidas_dir.mkdir()
-    audit_log = cidas_dir / "audit.log"
-    lines = [
-        _json.dumps({"timestamp": f"2026-05-10T{i:05d}Z", "package_names": ["pkg"],
-                     "bypass_reason": "env_var", "user": "u", "cwd": "/"})
-        for i in range(150)
-    ]
-    audit_log.write_text("\n".join(lines) + "\n")
-
-    with patch.object(pathlib.Path, "home", return_value=tmp_path):
-        response = await async_client.get("/api/v1/audit")
-
-    body = response.json()
-    assert body["total"] == 100  # capped at last 100
+async def test_audit_passes_query_params_to_read_records(async_client):
+    """Query parameters are forwarded to audit_log.read_records correctly."""
+    with patch("daemon.router.audit_log.read_records", new=AsyncMock(return_value=[])) as mock_rr:
+        await async_client.get("/api/v1/audit?verdict=BLOCK&package=lodash&last=50")
+    mock_rr.assert_awaited_once_with(last=50, verdict="BLOCK", package="lodash", since=None)
 
 
-async def test_audit_skips_malformed_lines(async_client, tmp_path):
-    """Malformed lines in audit.log are silently skipped."""
-    import json as _json
-    import pathlib
-
-    cidas_dir = tmp_path / ".cidas"
-    cidas_dir.mkdir()
-    audit_log = cidas_dir / "audit.log"
-    audit_log.write_text(
-        _json.dumps({"timestamp": "2026-05-10T00:00:00Z", "package_names": ["lodash"],
-                     "bypass_reason": "env_var", "user": "u", "cwd": "/"}) + "\n"
-        "this is not json\n"
-        "\n"  # empty line
-        + _json.dumps({"timestamp": "2026-05-10T00:01:00Z", "package_names": ["react"],
-                       "bypass_reason": "env_var", "user": "u", "cwd": "/"}) + "\n"
-    )
-
-    with patch.object(pathlib.Path, "home", return_value=tmp_path):
-        response = await async_client.get("/api/v1/audit")
-
-    body = response.json()
-    assert body["total"] == 2  # malformed line and empty line skipped
+async def test_audit_invalid_verdict_returns_422(async_client):
+    """An unrecognised verdict value must be rejected with 422."""
+    response = await async_client.get("/api/v1/audit?verdict=MAYBE")
+    assert response.status_code == 422
 
 
 # ── POST /cache/invalidate ────────────────────────────────────────────────────

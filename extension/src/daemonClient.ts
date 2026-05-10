@@ -176,4 +176,24 @@ export class DaemonClient {
       throw new Error(`Cache clear failed: HTTP ${resp.status}`);
     }
   }
+
+  /**
+   * Record a user "Proceed Anyway" override in the daemon audit log.
+   * Failures are swallowed — a logging error must not interrupt the install.
+   */
+  async reportOverride(packageName: string, version?: string | null, verdictWas = "WARN"): Promise<void> {
+    try {
+      await fetch(`${_daemonUrl(this.port)}/audit/override`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ..._authHeader() },
+        body: JSON.stringify({
+          package_name: packageName,
+          version: version ?? null,
+          verdict_was: verdictWas,
+        }),
+      });
+    } catch {
+      // best-effort — never surface to user
+    }
+  }
 }

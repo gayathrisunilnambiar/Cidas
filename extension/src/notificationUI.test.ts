@@ -74,6 +74,32 @@ describe("showWarnNotification", () => {
     const result = await showWarnNotification(makeResponse(Decision.WARN));
     expect(result).toBe(false);
   });
+
+  it("calls onProceed callback when user chooses Proceed Anyway", async () => {
+    vi.mocked(vscode.window.showWarningMessage).mockResolvedValue("Proceed Anyway" as any);
+    const onProceed = vi.fn().mockResolvedValue(undefined);
+    const result = await showWarnNotification(makeResponse(Decision.WARN), onProceed);
+    expect(result).toBe(true);
+    expect(onProceed).toHaveBeenCalledOnce();
+  });
+
+  it("calls onProceed callback after Show Details + Proceed", async () => {
+    vi.mocked(vscode.window.showWarningMessage)
+      .mockResolvedValueOnce("Show Details" as any)
+      .mockResolvedValueOnce("Proceed Anyway" as any);
+    const onProceed = vi.fn().mockResolvedValue(undefined);
+    const result = await showWarnNotification(makeResponse(Decision.WARN), onProceed);
+    expect(result).toBe(true);
+    expect(onProceed).toHaveBeenCalledOnce();
+  });
+
+  it("does not call onProceed when user cancels", async () => {
+    vi.mocked(vscode.window.showWarningMessage).mockResolvedValue(undefined);
+    const onProceed = vi.fn().mockResolvedValue(undefined);
+    const result = await showWarnNotification(makeResponse(Decision.WARN), onProceed);
+    expect(result).toBe(false);
+    expect(onProceed).not.toHaveBeenCalled();
+  });
 });
 
 describe("showBlockNotification", () => {

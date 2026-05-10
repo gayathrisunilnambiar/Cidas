@@ -2,21 +2,24 @@
 
 Endpoints
 ---------
-GET  /health            — liveness probe, no auth
-POST /scan              — screen an npm package (main entry point)
-POST /trust             — add a package to the local trust bypass list
-GET  /trust/verify      — audit all trust-list HMACs (auth required)
-DELETE /cache           — purge expired cache entries
-POST /cache/invalidate  — emergency per-package cache invalidation (auth required)
+GET  /health                — liveness probe, no auth
+POST /scan                  — screen an npm package (main entry point)
+POST /trust                 — add a package to the local trust bypass list
+GET  /trust/verify          — audit all trust-list HMACs (auth required)
+DELETE /cache               — purge expired cache entries
+POST /cache/invalidate      — emergency per-package cache invalidation (auth required)
+GET  /audit                 — query structured scan audit log (auth required)
+POST /audit/override        — record a user "Proceed Anyway" override event
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from .auth import get_or_create_token, require_token
 from .config import get_settings
@@ -37,6 +40,7 @@ from .pillars.aggregator import Aggregator
 from .pillars.contextify import Contextify
 from .pillars.sentinel import Sentinel
 from .pillars.shield import Shield
+from .utils import audit_log
 from .utils.logger import get_logger
 from .utils.offline_cache import record_allow
 
@@ -44,9 +48,45 @@ log = get_logger(__name__)
 router = APIRouter()
 
 _contextify = Contextify()
-_sentinel = Sentinel()
-_shield = Shield()
+_sentinel   = Sentinel()
+_shield     = Shield()
 _aggregator = Aggregator()
+
+
+def _collect_signals(response: ScanResponse) -> list[str]:
+    """Deduplicated list of all flags across all pillars + trust_flags."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for flag in (
+        response.contextify.flags
+        + response.sentinel.flags
+        + response.shield.flags
+        + response.trust_flags
+    ):
+        if flag not in seen:
+            seen.add(flag)
+            out.append(flag)
+    return out
+
+
+async def _audit_scan(
+    req: PackageScanRequest,
+    response: ScanResponse,
+    *,
+    cached: bool,
+) -> None:
+    """Append a structured scan record to the audit log (fire-and-forget)."""
+    record = {
+        "ts":           datetime.now(timezone.utc).isoformat(),
+        "package":      f"{req.package_name}@{req.version or 'latest'}",
+        "verdict":      response.decision,
+        "score":        response.risk_score,
+        "signals":      _collect_signals(response),
+        "ai_suggested": req.ai_suggested,
+        "project_path": req.project_path,
+        "cached":       cached,
+    }
+    await audit_log.append(record)
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -68,7 +108,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
         log.info("trust bypass (verified) for %s", req.package_name)
         trusted_score = PillarScore(score=0.0, confidence=1.0, flags=["trusted"], metadata={})
         await record_allow(req.package_name, req.version)
-        return ScanResponse(
+        response = ScanResponse(
             package_name=req.package_name,
             version=req.version,
             decision="ALLOW",
@@ -79,6 +119,8 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
             explanation=f"'{req.package_name}' is in the local trust list (HMAC verified).",
             latency_ms=(time.perf_counter() - t0) * 1000,
         )
+        await _audit_scan(req, response, cached=False)
+        return response
 
     if trust_result.status == TRUST_STATUS_LEGACY:
         # Pre-MAC rows: trusted but unverified — return WARN so users know
@@ -87,7 +129,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
         legacy_score = PillarScore(
             score=0.0, confidence=0.5, flags=["trust_legacy_no_mac"], metadata={}
         )
-        return ScanResponse(
+        response = ScanResponse(
             package_name=req.package_name,
             version=req.version,
             decision="WARN",
@@ -102,6 +144,8 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
             latency_ms=(time.perf_counter() - t0) * 1000,
             trust_flags=trust_result.flags,
         )
+        await _audit_scan(req, response, cached=False)
+        return response
 
     # TAMPERED: log.critical was emitted inside check_trust; fall through to
     # a full pillar scan and attach the flag so the VS Code panel can alert.
@@ -112,6 +156,9 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
     if cached:
         log.debug("cache hit: %s", req.package_name)
         cached.latency_ms = (time.perf_counter() - t0) * 1000
+        if tamper_flags:
+            cached.trust_flags = tamper_flags
+        await _audit_scan(req, cached, cached=True)
         return cached
 
     # Run all three pillars concurrently
@@ -145,6 +192,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
         # Mirror to offline-cache.json so the npm shim can serve known-good
         # packages silently when the daemon is unreachable.
         await record_allow(req.package_name, req.version)
+    await _audit_scan(req, response, cached=False)
     log.info("result: decision=%s score=%.1f package=%s", decision, risk_score, req.package_name)
     return response
 
@@ -229,27 +277,51 @@ async def cache_invalidate(body: dict) -> dict:
     return {"invalidated": removed, "package_name": package_name, "version": version}
 
 
-@router.get("/audit")
-async def audit_log() -> dict:
-    """Return the last 100 bypass events from ~/.cidas/audit.log (read-only)."""
-    audit_path = Path.home() / ".cidas" / "audit.log"
+@router.get("/audit", dependencies=[Depends(require_token)])
+async def audit_query(
+    last:    int            = Query(default=100, ge=1, le=1000, description="Maximum records to return"),
+    verdict: Optional[str]  = Query(default=None, description="Filter by verdict: ALLOW, WARN, or BLOCK"),
+    package: Optional[str]  = Query(default=None, description="Filter by package name (without version)"),
+    since:   Optional[str]  = Query(default=None, description="Return only records newer than this ISO-8601 timestamp"),
+) -> dict:
+    """Return structured scan records from the audit log.
 
-    def _read() -> list:
-        try:
-            lines = audit_path.read_text().splitlines()
-        except FileNotFoundError:
-            return []
-        events = []
-        for line in lines[-100:]:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                log.warning("audit: skipping malformed line: %.80s", line)
-        return events
-
-    events = await asyncio.to_thread(_read)
-    log.debug("audit: returned %d bypass events", len(events))
+    Supports filtering by verdict, package name, and timestamp.  The newest
+    matching records (up to *last*, max 1 000) are returned, oldest first.
+    Auth required — the log contains project paths and package names.
+    """
+    if verdict and verdict not in ("ALLOW", "WARN", "BLOCK"):
+        raise HTTPException(status_code=422, detail="verdict must be ALLOW, WARN, or BLOCK")
+    events = await audit_log.read_records(last=last, verdict=verdict, package=package, since=since)
+    log.debug("audit: returned %d records (filters: verdict=%s package=%s since=%s)", len(events), verdict, package, since)
     return {"events": events, "total": len(events)}
+
+
+@router.post("/audit/override", dependencies=[Depends(require_token)])
+async def audit_override(body: dict) -> dict:
+    """Record a user 'Proceed Anyway' override event in the audit log.
+
+    Called by the VS Code extension when the user proceeds past a WARN
+    or BLOCK dialog.  The package name and version are required so the
+    event can be correlated with the preceding scan record.
+
+    Body fields
+    -----------
+    package_name : str            — npm package name (required)
+    version      : str | null     — specific version, or null/absent for latest
+    verdict_was  : str            — the verdict the user overrode (default "WARN")
+    """
+    package_name = body.get("package_name", "")
+    if not package_name:
+        raise HTTPException(status_code=422, detail="package_name is required")
+    version     = body.get("version") or None
+    verdict_was = body.get("verdict_was", "WARN")
+    record = {
+        "ts":          datetime.now(timezone.utc).isoformat(),
+        "event":       "user_override",
+        "package":     f"{package_name}@{version or 'latest'}",
+        "verdict_was": verdict_was,
+    }
+    await audit_log.append(record)
+    log.info("audit: user_override for %s (verdict_was=%s)", record["package"], verdict_was)
+    return {"logged": True, "package": record["package"]}

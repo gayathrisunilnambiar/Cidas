@@ -82,16 +82,18 @@ def mock_db_for_auth():
     from daemon.models import PillarScore
     low = PillarScore(score=0.0, confidence=0.9, flags=[], metadata={})
     with (
-        patch("daemon.router.check_trust",       new=AsyncMock(return_value=_UNKNOWN_TRUST)),
-        patch("daemon.router.get_cached_result", new=AsyncMock(return_value=None)),
-        patch("daemon.router.store_result",      new=AsyncMock()),
-        patch("daemon.router.add_trusted",       new=AsyncMock()),
-        patch("daemon.router.clear_expired",     new=AsyncMock(return_value=0)),
-        patch("daemon.router.list_all_trusted",  new=AsyncMock(return_value=[])),
-        patch("daemon.router.record_allow",      new=AsyncMock()),
-        patch("daemon.router._contextify.score", new=AsyncMock(return_value=low)),
-        patch("daemon.router._sentinel.score",   new=AsyncMock(return_value=low)),
-        patch("daemon.router._shield.score",     new=AsyncMock(return_value=low)),
+        patch("daemon.router.check_trust",        new=AsyncMock(return_value=_UNKNOWN_TRUST)),
+        patch("daemon.router.get_cached_result",  new=AsyncMock(return_value=None)),
+        patch("daemon.router.store_result",       new=AsyncMock()),
+        patch("daemon.router.add_trusted",        new=AsyncMock()),
+        patch("daemon.router.clear_expired",      new=AsyncMock(return_value=0)),
+        patch("daemon.router.list_all_trusted",   new=AsyncMock(return_value=[])),
+        patch("daemon.router.record_allow",       new=AsyncMock()),
+        patch("daemon.router.audit_log.append",   new=AsyncMock()),
+        patch("daemon.router.audit_log.read_records", new=AsyncMock(return_value=[])),
+        patch("daemon.router._contextify.score",  new=AsyncMock(return_value=low)),
+        patch("daemon.router._sentinel.score",    new=AsyncMock(return_value=low)),
+        patch("daemon.router._shield.score",      new=AsyncMock(return_value=low)),
     ):
         yield
 
@@ -110,9 +112,17 @@ async def test_health_does_not_require_token(client, token_file):
     assert resp.status_code == 200
 
 
-async def test_audit_does_not_require_token(client, token_file):
+async def test_audit_requires_token(client, token_file):
     auth.get_or_create_token()
     resp = await client.get("/api/v1/audit")
+    assert resp.status_code == 401
+
+
+async def test_audit_with_valid_token_returns_200(client, token_file, mock_db_for_auth, tmp_path, monkeypatch):
+    import daemon.utils.audit_log as _al
+    monkeypatch.setattr(_al, "_DEFAULT_PATH", tmp_path / "audit.log")
+    token = auth.get_or_create_token()
+    resp = await client.get("/api/v1/audit", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
 
 

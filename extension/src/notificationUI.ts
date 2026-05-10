@@ -12,7 +12,10 @@ export function showAllowNotification(packageName: string): void {
   vscode.window.setStatusBarMessage(`$(check) CIDAS: '${packageName}' passed security screening`, 4000);
 }
 
-export async function showWarnNotification(response: ScanResponse): Promise<boolean> {
+export async function showWarnNotification(
+  response: ScanResponse,
+  onProceed?: () => Promise<void>,
+): Promise<boolean> {
   const choice = await vscode.window.showWarningMessage(
     `CIDAS: '${response.package_name}' has a moderate risk score (${response.risk_score.toFixed(0)}/100). ${response.explanation}`,
     { modal: false },
@@ -27,9 +30,17 @@ export async function showWarnNotification(response: ScanResponse): Promise<bool
       _PROCEED,
       _CANCEL,
     );
-    return second === _PROCEED;
+    if (second === _PROCEED) {
+      await onProceed?.();
+      return true;
+    }
+    return false;
   }
-  return choice === _PROCEED;
+  if (choice === _PROCEED) {
+    await onProceed?.();
+    return true;
+  }
+  return false;
 }
 
 export async function showBlockNotification(response: ScanResponse): Promise<boolean> {
