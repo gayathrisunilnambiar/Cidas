@@ -39,6 +39,7 @@ def mock_db():
         patch("daemon.router.store_result", new=AsyncMock()),
         patch("daemon.router.add_trusted", new=AsyncMock()),
         patch("daemon.router.clear_expired", new=AsyncMock(return_value=3)),
+        patch("daemon.router.record_allow", new=AsyncMock()),
     ):
         yield
 
@@ -186,6 +187,60 @@ async def test_scan_result_is_stored(async_client, mock_db, mock_pillars_low):
             "project_path": "/tmp/project",
         })
     store_mock.assert_called_once()
+
+
+# ── Offline cache mirroring ──────────────────────────────────────────────────
+
+async def test_allow_verdict_writes_offline_cache(async_client, mock_db, mock_pillars_low):
+    """An ALLOW verdict must mirror to the offline cache for shim use."""
+    with patch("daemon.router.record_allow", new=AsyncMock()) as rec_mock:
+        await async_client.post("/api/v1/scan", json={
+            "package_name": "lodash",
+            "project_path": "/tmp/project",
+        })
+    rec_mock.assert_called_once_with("lodash")
+
+
+async def test_warn_verdict_does_NOT_write_offline_cache(async_client, mock_db):
+    """WARN must not enter the offline cache — silent install would be unsafe."""
+    with (
+        patch("daemon.router._contextify.score", new=AsyncMock(return_value=_ps(0.0))),
+        patch("daemon.router._sentinel.score",   new=AsyncMock(return_value=_ps(60.0))),
+        patch("daemon.router._shield.score",     new=AsyncMock(return_value=_ps(40.0))),
+        patch("daemon.router.record_allow",      new=AsyncMock()) as rec_mock,
+    ):
+        await async_client.post("/api/v1/scan", json={
+            "package_name": "suspicious-pkg", "project_path": "/tmp/project",
+        })
+    rec_mock.assert_not_called()
+
+
+async def test_block_verdict_does_NOT_write_offline_cache(async_client, mock_db):
+    """BLOCK must not enter the offline cache."""
+    high = _ps(100.0, flags=["package_not_found"])
+    with (
+        patch("daemon.router._contextify.score", new=AsyncMock(return_value=_ps(0.0))),
+        patch("daemon.router._sentinel.score",   new=AsyncMock(return_value=high)),
+        patch("daemon.router._shield.score",     new=AsyncMock(return_value=high)),
+        patch("daemon.router.record_allow",      new=AsyncMock()) as rec_mock,
+    ):
+        await async_client.post("/api/v1/scan", json={
+            "package_name": "evil-pkg", "project_path": "/tmp/project",
+            "ai_suggested": True,
+        })
+    rec_mock.assert_not_called()
+
+
+async def test_trust_bypass_writes_offline_cache(async_client, mock_db):
+    """A trusted ALLOW must also persist to the offline cache."""
+    with (
+        patch("daemon.router.is_trusted", new=AsyncMock(return_value=True)),
+        patch("daemon.router.record_allow", new=AsyncMock()) as rec_mock,
+    ):
+        await async_client.post("/api/v1/scan", json={
+            "package_name": "internal-lib", "project_path": "/tmp/project",
+        })
+    rec_mock.assert_called_once_with("internal-lib")
 
 
 # ── POST /trust ───────────────────────────────────────────────────────────────

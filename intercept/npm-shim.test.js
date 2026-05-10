@@ -15,9 +15,10 @@ const fs   = require("fs");
 const os   = require("os");
 const path = require("path");
 
-const CIDAS_DIR  = path.join(os.homedir(), ".cidas");
-const CONFIG_PATH = path.join(CIDAS_DIR, "config.json");
-const AUDIT_PATH  = path.join(CIDAS_DIR, "audit.log");
+const CIDAS_DIR    = path.join(os.homedir(), ".cidas");
+const CONFIG_PATH  = path.join(CIDAS_DIR, "config.json");
+const AUDIT_PATH   = path.join(CIDAS_DIR, "audit.log");
+const OFFLINE_PATH = path.join(CIDAS_DIR, "offline-cache.json");
 
 // Keep a reference to the real fs implementations for passthrough
 const _realReadFileSync = fs.readFileSync.bind(fs);
@@ -262,5 +263,76 @@ describe("normal scan path (no bypass)", () => {
     jest.spyOn(http, "request").mockReturnValue(mockReq);
 
     return expect(shim._scan("lodash", null)).rejects.toThrow("ECONNREFUSED");
+  });
+});
+
+// ── _checkOfflineCache ────────────────────────────────────────────────────────
+
+describe("_checkOfflineCache", () => {
+  /** Helper: stub readFileSync so the offline-cache file returns the given object. */
+  function stubCache(obj) {
+    readFileSyncSpy.mockImplementation((filePath, opts) => {
+      if (filePath === OFFLINE_PATH) return JSON.stringify(obj);
+      if (filePath === CONFIG_PATH)
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return _realReadFileSync(filePath, opts);
+    });
+  }
+
+  it("returns null when offline-cache.json is absent", () => {
+    expect(shim._checkOfflineCache("lodash")).toBeNull();
+  });
+
+  it("returns null when the package is not in the cache", () => {
+    stubCache({ react: { verdict: "ALLOW", timestamp: new Date().toISOString(), ttl_hours: 24 } });
+    expect(shim._checkOfflineCache("lodash")).toBeNull();
+  });
+
+  it("returns the entry for a fresh ALLOW within TTL", () => {
+    const now = new Date().toISOString();
+    stubCache({ lodash: { package_name: "lodash", verdict: "ALLOW", timestamp: now, ttl_hours: 24 } });
+    const entry = shim._checkOfflineCache("lodash");
+    expect(entry).not.toBeNull();
+    expect(entry.verdict).toBe("ALLOW");
+    expect(entry.package_name).toBe("lodash");
+  });
+
+  it("returns null when the cached entry has expired", () => {
+    const fortyEightHoursAgo = new Date(Date.now() - 48 * 3_600_000).toISOString();
+    stubCache({
+      lodash: { verdict: "ALLOW", timestamp: fortyEightHoursAgo, ttl_hours: 24 },
+    });
+    expect(shim._checkOfflineCache("lodash")).toBeNull();
+  });
+
+  it("returns null when the cached verdict is not ALLOW", () => {
+    stubCache({
+      lodash: { verdict: "WARN", timestamp: new Date().toISOString(), ttl_hours: 24 },
+    });
+    expect(shim._checkOfflineCache("lodash")).toBeNull();
+  });
+
+  it("returns null when the cache file contains invalid JSON", () => {
+    readFileSyncSpy.mockImplementation((filePath, opts) => {
+      if (filePath === OFFLINE_PATH) return "garbage{not-json";
+      if (filePath === CONFIG_PATH)
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return _realReadFileSync(filePath, opts);
+    });
+    expect(shim._checkOfflineCache("lodash")).toBeNull();
+  });
+
+  it("returns null when timestamp cannot be parsed", () => {
+    stubCache({
+      lodash: { verdict: "ALLOW", timestamp: "not-a-date", ttl_hours: 24 },
+    });
+    expect(shim._checkOfflineCache("lodash")).toBeNull();
+  });
+
+  it("returns null when ttl_hours is missing or non-numeric", () => {
+    stubCache({
+      lodash: { verdict: "ALLOW", timestamp: new Date().toISOString() },
+    });
+    expect(shim._checkOfflineCache("lodash")).toBeNull();
   });
 });

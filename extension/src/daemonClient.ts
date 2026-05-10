@@ -31,6 +31,12 @@ function _safeAllow(packageName: string, reason: string): ScanResponse {
 export class DaemonClient {
   private readonly port: number;
 
+  // Tracks the most recently observed daemon reachability so consumers
+  // (e.g. a status-bar indicator) can react without re-probing.
+  private _offline = false;
+  private readonly _stateListeners: Array<(online: boolean) => void> = [];
+  private _pollingTimer: ReturnType<typeof setInterval> | undefined;
+
   constructor(port: number) {
     this.port = port;
   }
@@ -47,9 +53,11 @@ export class DaemonClient {
         const text = await resp.text().catch(() => String(resp.status));
         throw new Error(`HTTP ${resp.status}: ${text}`);
       }
+      this._setOffline(false);
       return (await resp.json()) as ScanResponse;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      this._setOffline(true);
       vscode.window.showWarningMessage(`CIDAS: daemon unreachable during scan — ${msg}`);
       return _safeAllow(request.package_name, msg);
     }
@@ -57,11 +65,64 @@ export class DaemonClient {
 
   /** Returns true when the daemon responds to the health endpoint. */
   async health(): Promise<boolean> {
+    let alive = false;
     try {
       const resp = await fetch(`${_daemonUrl(this.port)}/health`);
-      return resp.ok;
+      alive = resp.ok;
     } catch {
-      return false;
+      alive = false;
+    }
+    this._setOffline(!alive);
+    return alive;
+  }
+
+  /** Returns true when the most recent probe found the daemon unreachable. */
+  isOffline(): boolean {
+    return this._offline;
+  }
+
+  /**
+   * Subscribe to daemon reachability changes. The listener fires when the
+   * online/offline state flips — not on every probe — so the listener can
+   * map directly to a UI state transition.
+   */
+  onStatusChange(listener: (online: boolean) => void): vscode.Disposable {
+    this._stateListeners.push(listener);
+    return {
+      dispose: () => {
+        const idx = this._stateListeners.indexOf(listener);
+        if (idx >= 0) this._stateListeners.splice(idx, 1);
+      },
+    };
+  }
+
+  /**
+   * Start polling /health at ``intervalMs`` cadence. Returns a Disposable
+   * that stops the polling. An immediate probe runs on call so the first
+   * status update happens promptly.
+   */
+  startHealthPolling(intervalMs: number = 30_000): vscode.Disposable {
+    if (this._pollingTimer) {
+      clearInterval(this._pollingTimer);
+    }
+    // Fire-and-forget the first probe so the indicator updates immediately.
+    void this.health();
+    this._pollingTimer = setInterval(() => { void this.health(); }, intervalMs);
+    return {
+      dispose: () => {
+        if (this._pollingTimer) {
+          clearInterval(this._pollingTimer);
+          this._pollingTimer = undefined;
+        }
+      },
+    };
+  }
+
+  private _setOffline(offline: boolean): void {
+    if (offline === this._offline) return;
+    this._offline = offline;
+    for (const listener of this._stateListeners) {
+      try { listener(!offline); } catch { /* listener errors must not propagate */ }
     }
   }
 

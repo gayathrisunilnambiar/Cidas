@@ -159,4 +159,120 @@ describe("DaemonClient", () => {
     vi.stubGlobal("fetch", mockFetchOk({}, 500));
     await expect(client.clearCache()).rejects.toThrow("500");
   });
+
+  // ── isOffline / onStatusChange ──────────────────────────────────────────────
+
+  it("isOffline() defaults to false before any probe", () => {
+    expect(client.isOffline()).toBe(false);
+  });
+
+  it("isOffline() flips to true after a failed scan", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("ECONNREFUSED")));
+    await client.scan({ package_name: "lodash", project_path: "/tmp" });
+    expect(client.isOffline()).toBe(true);
+  });
+
+  it("isOffline() returns to false on a successful scan", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("ECONNREFUSED")));
+    await client.scan({ package_name: "lodash", project_path: "/tmp" });
+    expect(client.isOffline()).toBe(true);
+
+    vi.stubGlobal("fetch", mockFetchOk(makeScanResponse(Decision.ALLOW)));
+    await client.scan({ package_name: "lodash", project_path: "/tmp" });
+    expect(client.isOffline()).toBe(false);
+  });
+
+  it("isOffline() reflects health() outcome", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("nope")));
+    await client.health();
+    expect(client.isOffline()).toBe(true);
+
+    vi.stubGlobal("fetch", mockFetchOk({}, 200));
+    await client.health();
+    expect(client.isOffline()).toBe(false);
+  });
+
+  it("onStatusChange listener fires with online=false when daemon goes down", async () => {
+    const listener = vi.fn();
+    client.onStatusChange(listener);
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("nope")));
+    await client.health();
+    expect(listener).toHaveBeenCalledWith(false);
+  });
+
+  it("onStatusChange listener fires with online=true when daemon recovers", async () => {
+    const listener = vi.fn();
+    // Force initial offline state
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("nope")));
+    await client.health();
+    client.onStatusChange(listener);
+
+    vi.stubGlobal("fetch", mockFetchOk({}, 200));
+    await client.health();
+    expect(listener).toHaveBeenCalledWith(true);
+  });
+
+  it("onStatusChange listener does NOT fire when state stays the same", async () => {
+    const listener = vi.fn();
+    client.onStatusChange(listener);
+    // Two successful probes in a row — no flip, no notification.
+    vi.stubGlobal("fetch", mockFetchOk({}, 200));
+    await client.health();
+    await client.health();
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("onStatusChange returns a Disposable that unsubscribes the listener", async () => {
+    const listener = vi.fn();
+    const sub = client.onStatusChange(listener);
+    sub.dispose();
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("nope")));
+    await client.health();
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("a throwing listener does not break notification of other listeners", async () => {
+    const bad  = vi.fn(() => { throw new Error("boom"); });
+    const good = vi.fn();
+    client.onStatusChange(bad);
+    client.onStatusChange(good);
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("nope")));
+    await client.health();
+    expect(good).toHaveBeenCalledWith(false);
+  });
+
+  // ── startHealthPolling ──────────────────────────────────────────────────────
+
+  it("startHealthPolling probes immediately and on every interval tick", async () => {
+    vi.useFakeTimers();
+    const fetchMock = mockFetchOk({}, 200);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const sub = client.startHealthPolling(30_000);
+    // Yield microtasks so the immediate probe completes
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    sub.dispose();
+    vi.useRealTimers();
+  });
+
+  it("startHealthPolling Disposable stops further probes", async () => {
+    vi.useFakeTimers();
+    const fetchMock = mockFetchOk({}, 200);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const sub = client.startHealthPolling(30_000);
+    await vi.advanceTimersByTimeAsync(0);
+    sub.dispose();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // only the immediate probe ran
+    vi.useRealTimers();
+  });
 });

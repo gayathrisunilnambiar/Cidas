@@ -14,6 +14,11 @@ const _RESET_DELAY_MS = 5_000;
 
 export class StatusBarManager implements vscode.Disposable {
   private readonly item: vscode.StatusBarItem;
+  // Independent persistent indicator that surfaces when the daemon is
+  // unreachable. Kept separate from `item` because that one auto-resets
+  // and cycles through scan states; the offline warning must stay visible
+  // until the daemon recovers.
+  private readonly offlineItem: vscode.StatusBarItem;
   private resetTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor() {
@@ -21,6 +26,27 @@ export class StatusBarManager implements vscode.Disposable {
     this.item.command = "cidas.openDashboard";
     this.setState("idle");
     this.item.show();
+
+    this.offlineItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -101);
+    this.offlineItem.text = "$(warning) CIDAS offline — installs unprotected";
+    this.offlineItem.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
+    this.offlineItem.tooltip =
+      "The CIDAS daemon is unreachable. New npm installs are not being scanned. " +
+      "Start the daemon: bash scripts/start-daemon.sh";
+    this.offlineItem.command = "cidas.openDashboard";
+    // Hidden until the daemon is observed to be offline.
+  }
+
+  /**
+   * Show / hide the persistent offline indicator. Idempotent — safe to call
+   * on every health probe even when the state has not changed.
+   */
+  setDaemonOnline(online: boolean): void {
+    if (online) {
+      this.offlineItem.hide();
+    } else {
+      this.offlineItem.show();
+    }
   }
 
   setState(state: StatusState, tooltip?: string): void {
@@ -71,5 +97,6 @@ export class StatusBarManager implements vscode.Disposable {
       clearTimeout(this.resetTimer);
     }
     this.item.dispose();
+    this.offlineItem.dispose();
   }
 }

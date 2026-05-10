@@ -24,6 +24,7 @@ from .pillars.contextify import Contextify
 from .pillars.sentinel import Sentinel
 from .pillars.shield import Shield
 from .utils.logger import get_logger
+from .utils.offline_cache import record_allow
 
 log = get_logger(__name__)
 router = APIRouter()
@@ -49,6 +50,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
     if await is_trusted(req.package_name):
         log.info("trust bypass for %s", req.package_name)
         trusted_score = PillarScore(score=0.0, confidence=1.0, flags=["trusted"], metadata={})
+        await record_allow(req.package_name)
         return ScanResponse(
             package_name=req.package_name,
             version=req.version,
@@ -92,6 +94,10 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
     )
 
     await store_result(response)
+    if decision == "ALLOW":
+        # Mirror to offline-cache.json so the npm shim can serve known-good
+        # packages silently when the daemon is unreachable.
+        await record_allow(req.package_name)
     log.info("result: decision=%s score=%.1f package=%s", decision, risk_score, req.package_name)
     return response
 

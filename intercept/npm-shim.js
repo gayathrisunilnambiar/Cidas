@@ -57,6 +57,31 @@ function _readCidasConfig() {
 }
 
 /**
+ * Look up a package in ~/.cidas/offline-cache.json (written by the daemon
+ * after every ALLOW verdict). Returns the cache entry when it is a valid,
+ * unexpired ALLOW; null otherwise. Used only when the daemon is unreachable.
+ */
+function _checkOfflineCache(packageName) {
+  const cachePath = path.join(os.homedir(), ".cidas", "offline-cache.json");
+  let cache;
+  try {
+    cache = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+  } catch {
+    return null;
+  }
+  const entry = cache && cache[packageName];
+  if (!entry || entry.verdict !== "ALLOW") return null;
+
+  const ts = Date.parse(entry.timestamp);
+  if (!Number.isFinite(ts)) return null;
+  const ageHours = (Date.now() - ts) / 3_600_000;
+  const ttlHours = Number(entry.ttl_hours);
+  if (!Number.isFinite(ttlHours) || ageHours > ttlHours) return null;
+
+  return entry;
+}
+
+/**
  * Append one structured JSON line to ~/.cidas/audit.log.
  * Creates the directory if it does not exist; silently swallows write errors
  * so a log failure never blocks an install.
@@ -187,8 +212,15 @@ function _main() {
       try {
         result = await _scan(name, version);
       } catch (err) {
+        // Daemon unreachable — try the offline cache before failing open.
+        const cached = _checkOfflineCache(name);
+        if (cached) {
+          // Known-good package within TTL; proceed silently.
+          continue;
+        }
         process.stderr.write(
-          `\x1b[33m[CIDAS]\x1b[0m Daemon unreachable (${err.message}) — proceeding without scan.\n`
+          `\x1b[33m[CIDAS WARNING]\x1b[0m ⚠  Daemon offline AND no cached verdict for \x1b[1m${pkg}\x1b[0m. ` +
+          `Proceeding without security check — verify this package manually before using it.\n`
         );
         continue;
       }
@@ -221,4 +253,10 @@ if (require.main === module) {
   _main();
 }
 
-module.exports = { _readCidasConfig, _writeAuditLog, _handleBypass, _scan };
+module.exports = {
+  _readCidasConfig,
+  _writeAuditLog,
+  _handleBypass,
+  _checkOfflineCache,
+  _scan,
+};

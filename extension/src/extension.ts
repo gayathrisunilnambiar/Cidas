@@ -28,6 +28,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   _interceptor.activate(context);
   context.subscriptions.push(_statusBar, _sentinel, _interceptor);
 
+  // Reflect daemon reachability changes in the persistent offline indicator.
+  context.subscriptions.push(
+    _client.onStatusChange((online) => _statusBar.setDaemonOnline(online)),
+    _client.startHealthPolling(30_000),
+  );
+
   // Probe daemon health asynchronously on startup
   _checkDaemonHealth();
 

@@ -2,24 +2,33 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { StatusBarManager } from "./statusBar";
 import * as vscode from "vscode";
 
+function _makeItem(): ReturnType<typeof vscode.window.createStatusBarItem> {
+  return {
+    text: "",
+    tooltip: "",
+    backgroundColor: undefined,
+    command: "",
+    show: vi.fn(),
+    hide: vi.fn(),
+    dispose: vi.fn(),
+  } as any;
+}
+
 describe("StatusBarManager", () => {
   let manager: StatusBarManager;
   let mockItem: ReturnType<typeof vscode.window.createStatusBarItem>;
+  let offlineItem: ReturnType<typeof vscode.window.createStatusBarItem>;
 
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
-    // Capture the StatusBarItem instance created inside the constructor
-    mockItem = {
-      text: "",
-      tooltip: "",
-      backgroundColor: undefined,
-      command: "",
-      show: vi.fn(),
-      hide: vi.fn(),
-      dispose: vi.fn(),
-    };
-    vi.mocked(vscode.window.createStatusBarItem).mockReturnValue(mockItem);
+    // Two distinct items: the main scan-state item and the persistent
+    // daemon-offline indicator. createStatusBarItem returns each in order.
+    mockItem    = _makeItem();
+    offlineItem = _makeItem();
+    vi.mocked(vscode.window.createStatusBarItem)
+      .mockReturnValueOnce(mockItem)
+      .mockReturnValueOnce(offlineItem);
     manager = new StatusBarManager();
   });
 
@@ -30,9 +39,11 @@ describe("StatusBarManager", () => {
 
   // ── constructor ──────────────────────────────────────────────────────────────
 
-  it("creates and shows the status bar item on construction", () => {
-    expect(vscode.window.createStatusBarItem).toHaveBeenCalledOnce();
+  it("creates two status bar items (main + offline indicator)", () => {
+    expect(vscode.window.createStatusBarItem).toHaveBeenCalledTimes(2);
+    // The main item is shown immediately; the offline item starts hidden.
     expect(mockItem.show).toHaveBeenCalledOnce();
+    expect(offlineItem.show).not.toHaveBeenCalled();
   });
 
   it("starts in idle state", () => {
@@ -117,11 +128,53 @@ describe("StatusBarManager", () => {
     expect(mockItem.text).toContain("offline");
   });
 
+  // ── setDaemonOnline ──────────────────────────────────────────────────────────
+
+  it("offline indicator is hidden by default", () => {
+    expect(offlineItem.show).not.toHaveBeenCalled();
+  });
+
+  it("setDaemonOnline(false) shows the offline indicator", () => {
+    manager.setDaemonOnline(false);
+    expect(offlineItem.show).toHaveBeenCalledOnce();
+    expect(offlineItem.hide).not.toHaveBeenCalled();
+  });
+
+  it("setDaemonOnline(true) hides the offline indicator", () => {
+    manager.setDaemonOnline(false);
+    manager.setDaemonOnline(true);
+    expect(offlineItem.hide).toHaveBeenCalledOnce();
+  });
+
+  it("offline indicator uses error background and includes the unprotected text", () => {
+    expect(offlineItem.backgroundColor).toBeInstanceOf(vscode.ThemeColor);
+    expect((offlineItem.backgroundColor as vscode.ThemeColor).id).toContain("error");
+    expect(offlineItem.text).toContain("CIDAS offline");
+    expect(offlineItem.text).toContain("unprotected");
+  });
+
+  it("offline indicator does not auto-reset (persistent state)", () => {
+    manager.setDaemonOnline(false);
+    vi.advanceTimersByTime(60_000);
+    // Still shown; never hidden by a timer.
+    expect(offlineItem.hide).not.toHaveBeenCalled();
+  });
+
+  it("offline indicator survives a transient state change on the main item", () => {
+    manager.setDaemonOnline(false);
+    manager.setState("scanning");
+    manager.setState("warned");
+    vi.advanceTimersByTime(10_000);
+    // Main item cycled, offline indicator remains shown.
+    expect(offlineItem.hide).not.toHaveBeenCalled();
+  });
+
   // ── dispose ──────────────────────────────────────────────────────────────────
 
-  it("dispose calls item.dispose()", () => {
+  it("dispose calls dispose on both status bar items", () => {
     manager.dispose();
     expect(mockItem.dispose).toHaveBeenCalledOnce();
+    expect(offlineItem.dispose).toHaveBeenCalledOnce();
   });
 
   it("dispose clears pending reset timer", () => {
