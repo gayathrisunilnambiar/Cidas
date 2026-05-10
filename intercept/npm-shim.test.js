@@ -11,14 +11,23 @@
  * constants (BYPASS, REAL_NPM) are re-evaluated fresh per test.
  */
 
-const fs   = require("fs");
-const os   = require("os");
-const path = require("path");
+const crypto = require("crypto");
+const fs     = require("fs");
+const os     = require("os");
+const path   = require("path");
+
+// Pre-compute the real SHA-256 of npm-shim.js once (used in integrity tests).
+const SHIM_PATH     = path.join(__dirname, "npm-shim.js");
+const REAL_SHIM_HASH = crypto
+  .createHash("sha256")
+  .update(fs.readFileSync(SHIM_PATH))
+  .digest("hex");
 
 const CIDAS_DIR    = path.join(os.homedir(), ".cidas");
 const CONFIG_PATH  = path.join(CIDAS_DIR, "config.json");
 const AUDIT_PATH   = path.join(CIDAS_DIR, "audit.log");
 const OFFLINE_PATH = path.join(CIDAS_DIR, "offline-cache.json");
+const HASH_PATH    = path.join(CIDAS_DIR, "shim.sha256");
 
 // Keep a reference to the real fs implementations for passthrough
 const _realReadFileSync = fs.readFileSync.bind(fs);
@@ -47,9 +56,12 @@ beforeEach(() => {
   mkdirSyncSpy      = jest.spyOn(fs, "mkdirSync").mockImplementation(() => {});
   stderrSpy         = jest.spyOn(process.stderr, "write").mockImplementation(() => {});
 
-  // Default: config file absent → _readCidasConfig returns {}
+  // Default: config absent, hash file absent (integrity check warns + proceeds).
   readFileSyncSpy = jest.spyOn(fs, "readFileSync").mockImplementation((filePath, opts) => {
     if (filePath === CONFIG_PATH) {
+      throw Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" });
+    }
+    if (filePath === HASH_PATH) {
       throw Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" });
     }
     return _realReadFileSync(filePath, opts);
@@ -334,5 +346,80 @@ describe("_checkOfflineCache", () => {
       lodash: { verdict: "ALLOW", timestamp: new Date().toISOString() },
     });
     expect(shim._checkOfflineCache("lodash")).toBeNull();
+  });
+});
+
+// ── Integrity check (IIFE at module load) ─────────────────────────────────────
+//
+// The integrity check is an IIFE that fires during require('./npm-shim').
+// We control which hash is returned from readFileSync for HASH_PATH and then
+// call loadShim() to trigger the check.  Because process.exit is mocked in
+// beforeEach, a failed check sets exitSpy without actually terminating the
+// process, letting assertions run normally.
+
+describe("integrity check — hash file absent (first run)", () => {
+  it("prints a yellow warning to stderr", () => {
+    // The default beforeEach mock already throws ENOENT for HASH_PATH.
+    // shim was loaded in beforeEach — stderr should contain the warning.
+    const output = stderrSpy.mock.calls.map((c) => c[0]).join("");
+    expect(output).toContain("Shim hash file not found");
+  });
+
+  it("does NOT call process.exit", () => {
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("integrity check — hash matches", () => {
+  beforeEach(() => {
+    // Return the real hash for HASH_PATH; let __filename read through normally.
+    readFileSyncSpy.mockImplementation((filePath, opts) => {
+      if (filePath === HASH_PATH)
+        return `${REAL_SHIM_HASH}  ${SHIM_PATH}\n`;
+      if (filePath === CONFIG_PATH)
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return _realReadFileSync(filePath, opts);
+    });
+    jest.resetModules();
+    shim = loadShim();
+  });
+
+  it("does NOT call process.exit", () => {
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+
+  it("does NOT print an integrity error to stderr", () => {
+    const output = stderrSpy.mock.calls.map((c) => c[0]).join("");
+    expect(output).not.toContain("integrity check FAILED");
+  });
+});
+
+describe("integrity check — hash mismatch (tampered shim)", () => {
+  beforeEach(() => {
+    readFileSyncSpy.mockImplementation((filePath, opts) => {
+      if (filePath === HASH_PATH)
+        // Deliberately wrong hash
+        return `${"00".repeat(32)}  ${SHIM_PATH}\n`;
+      if (filePath === CONFIG_PATH)
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return _realReadFileSync(filePath, opts);
+    });
+    jest.resetModules();
+    shim = loadShim();
+  });
+
+  it("calls process.exit(1)", () => {
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it("prints a red error message to stderr", () => {
+    const output = stderrSpy.mock.calls.map((c) => c[0]).join("");
+    expect(output).toContain("integrity check FAILED");
+  });
+
+  it("includes expected and actual hashes in the error output", () => {
+    const output = stderrSpy.mock.calls.map((c) => c[0]).join("");
+    expect(output).toContain("00".repeat(32)); // expected (the fake)
+    expect(output).toContain(REAL_SHIM_HASH);  // actual (the real)
   });
 });

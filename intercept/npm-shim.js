@@ -22,6 +22,47 @@
  */
 "use strict";
 
+// Self-integrity check — runs synchronously before any other logic.
+// Compares the SHA-256 of this file against ~/.cidas/shim.sha256 (written by
+// sign-shim.sh at install time). Exits 1 on mismatch; warns and continues
+// when the hash file is absent (first-run / CI environments).
+(function _integrityCheck() {
+  const _crypto = require("crypto");
+  const _fs0    = require("fs");
+  const _path0  = require("path");
+  const _os0    = require("os");
+
+  const hashFile = process.env.CIDAS_HASH_FILE ||
+    _path0.join(_os0.homedir(), ".cidas", "shim.sha256");
+
+  let expected;
+  try {
+    // sha256sum / shasum format: "<hex>  <path>" — take the first token
+    expected = _fs0.readFileSync(hashFile, "utf8").trim().split(/\s+/)[0];
+  } catch {
+    process.stderr.write(
+      "\x1b[33m[CIDAS]\x1b[0m Shim hash file not found — run sign-shim.sh to " +
+      "enable integrity verification. Proceeding without check.\n"
+    );
+    return;
+  }
+
+  const actual = _crypto
+    .createHash("sha256")
+    .update(_fs0.readFileSync(__filename))
+    .digest("hex");
+
+  if (actual !== expected) {
+    process.stderr.write(
+      "\x1b[31m[CIDAS] Shim integrity check FAILED — the shim file may have been " +
+      "tampered with. Aborting to protect your system.\x1b[0m\n" +
+      `  Expected: ${expected}\n` +
+      `  Actual:   ${actual}\n`
+    );
+    process.exit(1);
+  }
+})();
+
 const { spawnSync } = require("child_process");
 const http  = require("http");
 const https = require("https");

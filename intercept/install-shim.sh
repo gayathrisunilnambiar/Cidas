@@ -58,3 +58,6 @@ if ! grep -qF "CIDAS npm shim" "${SHELL_RC}" 2>/dev/null; then
 fi
 
 echo "[CIDAS] Done. Open a new terminal (or: source ${SHELL_RC}) for changes to take effect."
+
+# Sign the installed shim so the self-integrity check has a reference hash.
+bash "${SCRIPT_DIR}/sign-shim.sh" "${SHIM_DEST}"
