@@ -63,7 +63,11 @@ cidas/
 | npm | 9+ |
 | VS Code | 1.89+ |
 
-> **Windows users:** run all `bash` commands inside **Git Bash** or **WSL2**.
+> **Windows users:** run all `bash` commands inside **WSL 2** (not WSL 1 — WSL 1 cannot invoke `node.exe` correctly). To check: `wsl --list --verbose`. To upgrade: `wsl --set-version Ubuntu-22.04 2`.
+
+> **WSL npm PATH:** after installing Node.js inside WSL, the Windows npm at `/mnt/c//npm` may still shadow the native one. Fix with `export PATH=/usr/bin:$PATH` or add it permanently to `~/.bashrc`.
+
+> **First scan is slow:** on first run the daemon downloads the `all-MiniLM-L6-v2` embedding model (~90 MB) from HuggingFace. Expect 1–3 minutes before the first response. All subsequent scans are fast. To avoid HuggingFace rate-limit warnings, set `HF_TOKEN` in your `.env` (optional).
 
 ---
 
@@ -120,18 +124,22 @@ feature works end-to-end. Run from the repo root.
 
 ```bash
 source daemon/.venv/bin/activate
-bash scripts/start-daemon.sh
+bash scripts/start-daemon.sh      # waits until /api/v1/health responds (up to 30 s)
 export TOKEN=$(cat ~/.cidas/daemon.token)
 ```
+
+> The script now polls `/api/v1/health` and prints `[CIDAS] Daemon is ready.` before returning — no need to sleep or retry manually.
 
 ### 1. Smoke test — three verdicts
 
 ```bash
-# ALLOW — popular package
+# ALLOW/WARN — popular package (verdict depends on project context)
 curl -s -X POST http://127.0.0.1:7355/api/v1/scan \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"package_name":"lodash","project_path":"'"$PWD"'"}' | python3 -m json.tool
-# Expect: decision = ALLOW, risk_score near 0
+# Expect: decision = ALLOW or WARN, risk_score ≤ 15
+# Note: if the project has no JS dependencies, contextify flags lodash as
+# "unfamiliar_in_mature_project" (score ~9) → WARN. This is correct behaviour.
 
 # WARN — typosquat
 curl -s -X POST http://127.0.0.1:7355/api/v1/scan \
@@ -186,12 +194,12 @@ curl -s http://127.0.0.1:7355/api/v1/trust/verify \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 # Expect: tampered = 0
 
-# Tamper test: edit the SQLite trust row directly
-sqlite3 .cidas_cache.db \
-  "UPDATE trust_cache SET trust_list_mac='deadbeef' WHERE package_name='my-internal-lib';"
+# Tamper test: corrupt the SQLite trust row directly
+# (sqlite3 CLI may not be installed; use the Python one-liner instead)
+python3 -c "import sqlite3; c=sqlite3.connect('.cidas_cache.db'); c.execute(\"UPDATE trust_cache SET trust_list_mac='deadbeef' WHERE package_name='my-internal-lib'\"); c.commit(); c.close()"
 curl -s http://127.0.0.1:7355/api/v1/trust/verify \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
-# Expect: tampered = 1, daemon log shows CRITICAL line
+# Expect: tampered = 1, tampered_packages = ["my-internal-lib"]
 ```
 
 ### 4. Project policy (`.cidas/policy.json`)
@@ -217,7 +225,8 @@ curl -s "http://127.0.0.1:7355/api/v1/policy?project_path=/tmp/proj" \
 curl -s -X POST http://127.0.0.1:7355/api/v1/scan \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"package_name":"bad-pkg","project_path":"/tmp/proj"}' | python3 -m json.tool
-# Expect: BLOCK, flag "policy_block", policy_file set, requires_confirmation = true
+# Expect: BLOCK, flag "policy_block", policy_file set, requires_confirmation = false
+# Note: warn_requires_confirmation applies to WARN verdicts only; BLOCK always exits immediately.
 
 # trust_list bypasses pillars
 curl -s -X POST http://127.0.0.1:7355/api/v1/scan \
@@ -276,6 +285,9 @@ curl -s -X POST http://127.0.0.1:7355/api/v1/cache/invalidate \
 ```
 
 ### 7. npm shim
+
+> **WSL only:** ensure the native npm is on your PATH before testing the shim.
+> Run `which npm` — if it shows `/mnt/c//npm` (Windows), run `export PATH=/usr/bin:$PATH` first.
 
 ```bash
 mkdir -p /tmp/shim-test && cd /tmp/shim-test && npm init -y

@@ -42,6 +42,22 @@ echo "[CIDAS] Starting daemon on ${HOST}:${PORT} …"
   --log-level "${LOG_LEVEL:-info}" \
   --app-dir "${PROJECT_ROOT}" &
 
-echo $! > "${PID_FILE}"
-echo "[CIDAS] Daemon PID $! written to ${PID_FILE}"
+DAEMON_PID=$!
+echo "${DAEMON_PID}" > "${PID_FILE}"
+echo "[CIDAS] Daemon PID ${DAEMON_PID} written to ${PID_FILE}"
+
+# Wait until the health endpoint responds (up to 30 s)
+echo "[CIDAS] Waiting for daemon to be ready…"
+for i in $(seq 1 30); do
+  if curl -sf "http://${HOST}:${PORT}/api/v1/health" >/dev/null 2>&1; then
+    echo "[CIDAS] Daemon is ready."
+    break
+  fi
+  if ! kill -0 "${DAEMON_PID}" 2>/dev/null; then
+    echo "[CIDAS] Daemon process exited unexpectedly." >&2
+    exit 1
+  fi
+  sleep 1
+done
+
 echo "[CIDAS] Swagger UI → http://${HOST}:${PORT}/docs"

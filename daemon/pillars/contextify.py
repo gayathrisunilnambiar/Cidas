@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from pathlib import Path
 
@@ -96,12 +97,18 @@ class Contextify:
 
         # TODO(phase-2): full tree-sitter AST traversal for import graphs
         files_scanned = 0
-        for ext in _EXTENSIONS:
-            for path in root.rglob(f"*{ext}"):
-                if "node_modules" in path.parts or files_scanned >= _MAX_FILES:
+        done = False
+        for dirpath, dirs, files in os.walk(str(root)):
+            # Prune node_modules before descending — avoids crawling thousands of files
+            dirs[:] = [d for d in dirs if d != "node_modules"]
+            for name in files:
+                if files_scanned >= _MAX_FILES:
+                    done = True
                     break
+                if not any(name.endswith(ext) for ext in _EXTENSIONS):
+                    continue
                 try:
-                    source = path.read_text(encoding="utf-8", errors="ignore")
+                    source = Path(dirpath, name).read_text(encoding="utf-8", errors="ignore")
                     for match in _IMPORT_RE.finditer(source):
                         spec = match.group(1)
                         if not spec.startswith("."):
@@ -109,6 +116,8 @@ class Contextify:
                     files_scanned += 1
                 except OSError:
                     continue
+            if done:
+                break
 
         return list(domains)
 
