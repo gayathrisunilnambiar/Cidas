@@ -22,10 +22,13 @@ fi
 mkdir -p "$(dirname "${HASH_FILE}")"
 
 # sha256sum is standard on Linux; shasum ships with macOS.
+# We strip carriage returns first so this script produces the same hash as
+# the shim's own self-check (which normalises CRLF→LF in JS). On a normal
+# LF-only file this is a no-op.
 if command -v sha256sum &>/dev/null; then
-  HASH="$(sha256sum "${SHIM_SRC}" | awk '{print $1}')"
+  HASH="$(tr -d '\r' < "${SHIM_SRC}" | sha256sum | awk '{print $1}')"
 else
-  HASH="$(shasum -a 256 "${SHIM_SRC}" | awk '{print $1}')"
+  HASH="$(tr -d '\r' < "${SHIM_SRC}" | shasum -a 256 | awk '{print $1}')"
 fi
 
 printf '%s  %s\n' "${HASH}" "${SHIM_SRC}" > "${HASH_FILE}"

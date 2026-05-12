@@ -17,10 +17,13 @@ const os     = require("os");
 const path   = require("path");
 
 // Pre-compute the real SHA-256 of npm-shim.js once (used in integrity tests).
+// Hash must mirror the shim's _computeSelfHash: read as UTF-8, normalise
+// CRLF→LF, then hash. On a normal LF-only checkout the normalisation is a
+// no-op and the hash matches the previous byte-level digest.
 const SHIM_PATH     = path.join(__dirname, "npm-shim.js");
 const REAL_SHIM_HASH = crypto
   .createHash("sha256")
-  .update(fs.readFileSync(SHIM_PATH))
+  .update(fs.readFileSync(SHIM_PATH, "utf8").replace(/\r\n/g, "\n"), "utf8")
   .digest("hex");
 
 const CIDAS_DIR    = path.join(os.homedir(), ".cidas");

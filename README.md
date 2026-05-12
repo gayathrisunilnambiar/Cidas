@@ -40,13 +40,17 @@ cidas/
 │       ├── statusBar.ts    Colour-coded status bar manager
 │       ├── notificationUI.ts  Warn/block/allow dialogs & webview panel
 │       └── extension.ts    Activation & command registration
-├── intercept/              npm shim
+├── intercept/              npm shim (cross-platform)
 │   ├── npm-shim.js         Transparent npm wrapper with SHA-256 self-check
-│   ├── install-shim.sh     PATH injection installer
-│   ├── sign-shim.sh        Regenerates ~/.cidas/shim.sha256
-│   └── uninstall-shim.sh   Shim removal
+│   ├── install-shim.sh     macOS/Linux installer
+│   ├── install-shim.ps1    Windows installer (user-scope PATH + npm.cmd wrapper)
+│   ├── uninstall-shim.sh   macOS/Linux removal
+│   ├── uninstall-shim.ps1  Windows removal
+│   └── sign-shim.sh        Regenerates ~/.cidas/shim.sha256 on macOS/Linux
+│                           (on Windows use `node npm-shim.js --sign`)
 ├── scripts/
-│   ├── start-daemon.sh     Daemon launcher with venv bootstrap
+│   ├── start-daemon.sh     Daemon launcher with venv bootstrap (macOS/Linux)
+│   ├── start-daemon.ps1    Daemon launcher (Windows)
 │   └── run-tests.sh        Combined pytest + vitest runner
 └── .cidas/
     └── policy.schema.json  JSON Schema for project policy files
@@ -62,16 +66,13 @@ cidas/
 | Node.js | 18+ |
 | npm | 9+ |
 | VS Code | 1.89+ |
-
-> **Windows users:** run all `bash` commands inside **WSL 2** (not WSL 1 — WSL 1 cannot invoke `node.exe` correctly). To check: `wsl --list --verbose`. To upgrade: `wsl --set-version Ubuntu-22.04 2`.
-
-> **WSL npm PATH:** after installing Node.js inside WSL, the Windows npm at `/mnt/c//npm` may still shadow the native one. Fix with `export PATH=/usr/bin:$PATH` or add it permanently to `~/.bashrc`.
+| PowerShell (Windows only) | 5.1+ or PowerShell Core 7+ |
 
 > **First scan is slow:** on first run the daemon downloads the `all-MiniLM-L6-v2` embedding model (~90 MB) from HuggingFace. Expect 1–3 minutes before the first response. All subsequent scans are fast. To avoid HuggingFace rate-limit warnings, set `HF_TOKEN` in your `.env` (optional).
 
 ---
 
-## Clone & install
+## Clone & install — macOS / Linux
 
 ```bash
 git clone <repo-url> cidas
@@ -93,6 +94,43 @@ which npm                                   # → ~/.cidas/npm
 ```
 
 To remove: `bash intercept/uninstall-shim.sh && kill $(cat .cidas.pid)`.
+
+---
+
+## Clone & install — Windows (native PowerShell)
+
+Use the `.ps1` scripts instead of the `.sh` ones. WSL 2 is no longer required — the daemon, shim, and PowerShell installers all run natively.
+
+If you've never run a local PowerShell script before, you may need to relax the execution policy for the current user once:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+Then:
+
+```powershell
+git clone <repo-url> cidas
+cd cidas
+
+# 1. Daemon
+Copy-Item .env.example .env
+.\scripts\start-daemon.ps1                  # creates daemon\.venv, installs deps, starts on :7355
+Invoke-WebRequest http://127.0.0.1:7355/api/v1/health | Select-Object -Expand Content
+
+# 2. VS Code extension
+cd extension ; npm install ; npm run compile ; cd ..
+# In VS Code: open the cidas folder, press F5 to launch the extension host.
+
+# 3. npm shim
+.\intercept\install-shim.ps1
+# Open a new PowerShell window so the new user PATH takes effect, then:
+where.exe npm                               # → $env:USERPROFILE\.cidas\npm.cmd
+```
+
+To remove: `.\intercept\uninstall-shim.ps1 ; Stop-Process -Id (Get-Content .cidas.pid)`.
+
+> **WSL users:** if you prefer the bash flow inside WSL 2, follow the macOS/Linux instructions above. Make sure the native Linux `npm` resolves before the Windows one (`which npm` should not show `/mnt/c/...`); fix with `export PATH=/usr/bin:$PATH` in `~/.bashrc` if needed. WSL 1 is **not** supported — it cannot invoke `node.exe` correctly.
 
 ---
 

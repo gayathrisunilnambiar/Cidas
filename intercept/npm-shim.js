@@ -29,12 +29,50 @@
  */
 "use strict";
 
+const IS_WIN = process.platform === "win32";
+
+/**
+ * Compute the canonical self-hash of this file.
+ *
+ * Reads as UTF-8 and normalises CRLF → LF before hashing so a single shim
+ * file produces the same SHA-256 regardless of how git checked it out
+ * (autocrlf=true on Windows would otherwise change the hash). Used by both
+ * the self-integrity check and the `--sign` subcommand below.
+ */
+function _computeSelfHash(filePath) {
+  const _crypto = require("crypto");
+  const _fs = require("fs");
+  const text = _fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n");
+  return _crypto.createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+// `--sign` subcommand — write the current SHA-256 of this file to
+// ~/.cidas/shim.sha256 and exit. Must run *before* the integrity check
+// because resigning a deliberately-updated shim has to be possible even
+// when the previously-stored hash no longer matches.
+if (process.argv[2] === "--sign") {
+  const _fs = require("fs");
+  const _path = require("path");
+  const _os = require("os");
+
+  const hash = _computeSelfHash(__filename);
+  const cidasDir = _path.join(_os.homedir(), ".cidas");
+  try { _fs.mkdirSync(cidasDir, { recursive: true }); } catch { /**/ }
+  const hashFile = process.env.CIDAS_HASH_FILE || _path.join(cidasDir, "shim.sha256");
+  _fs.writeFileSync(hashFile, `${hash}  ${__filename}\n`);
+  // chmod is a no-op on Windows; wrap so a permissions failure on a non-POSIX
+  // FS doesn't kill the sign step.
+  try { _fs.chmodSync(hashFile, 0o600); } catch { /**/ }
+  process.stdout.write(`[CIDAS] Shim signed: ${hashFile}\n[CIDAS] SHA-256: ${hash}\n`);
+  process.exit(0);
+}
+
 // Self-integrity check — runs synchronously before any other logic.
 // Compares the SHA-256 of this file against ~/.cidas/shim.sha256 (written by
-// sign-shim.sh at install time). Exits 1 on mismatch; warns and continues
-// when the hash file is absent (first-run / CI environments).
+// sign-shim.sh / sign-shim.ps1 / `node npm-shim.js --sign` at install time).
+// Exits 1 on mismatch; warns and continues when the hash file is absent
+// (first-run / CI environments).
 (function _integrityCheck() {
-  const _crypto = require("crypto");
   const _fs0    = require("fs");
   const _path0  = require("path");
   const _os0    = require("os");
@@ -48,16 +86,14 @@
     expected = _fs0.readFileSync(hashFile, "utf8").trim().split(/\s+/)[0];
   } catch {
     process.stderr.write(
-      "\x1b[33m[CIDAS]\x1b[0m Shim hash file not found — run sign-shim.sh to " +
-      "enable integrity verification. Proceeding without check.\n"
+      "\x1b[33m[CIDAS]\x1b[0m Shim hash file not found — run sign-shim.sh " +
+      "(or `node npm-shim.js --sign` on Windows) to enable integrity " +
+      "verification. Proceeding without check.\n"
     );
     return;
   }
 
-  const actual = _crypto
-    .createHash("sha256")
-    .update(_fs0.readFileSync(__filename))
-    .digest("hex");
+  const actual = _computeSelfHash(__filename);
 
   if (actual !== expected) {
     process.stderr.write(
@@ -86,14 +122,28 @@ const TOKEN_PATH = process.env.CIDAS_TOKEN_FILE ||
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function _findRealNpm() {
+  // On Windows, npm ships as npm.cmd (sometimes npm.exe). The saved path
+  // is written by install-shim.{sh,ps1}; if it happens to lack an extension
+  // (older Linux installs being copied to a Windows machine, etc.) we tack
+  // .cmd on so spawnSync can find it.
   const saved = path.join(os.homedir(), ".cidas", "real-npm");
-  try { return fs.readFileSync(saved, "utf8").trim(); } catch { /**/ }
+  try {
+    let p = fs.readFileSync(saved, "utf8").trim();
+    if (IS_WIN && p && !/\.(cmd|exe|bat|ps1)$/i.test(p)) p += ".cmd";
+    if (p) return p;
+  } catch { /**/ }
+
+  // Fall back to scanning PATH. On Windows we probe known launcher names
+  // in the order Node's own resolver does; on POSIX, just 'npm'.
+  const candidateNames = IS_WIN ? ["npm.cmd", "npm.exe", "npm"] : ["npm"];
   const shimDir = path.dirname(process.argv[1]);
   for (const dir of (process.env.PATH || "").split(path.delimiter).filter((d) => d !== shimDir)) {
-    const cand = path.join(dir, "npm");
-    try { fs.accessSync(cand, fs.constants.X_OK); return cand; } catch { /**/ }
+    for (const name of candidateNames) {
+      const cand = path.join(dir, name);
+      try { fs.accessSync(cand, fs.constants.F_OK); return cand; } catch { /**/ }
+    }
   }
-  return "npm";
+  return IS_WIN ? "npm.cmd" : "npm";
 }
 
 /** Read ~/.cidas/config.json; returns {} when the file is absent or invalid JSON. */
@@ -234,7 +284,11 @@ function _scan(name, version) {
 }
 
 function _passthrough() {
-  const result = spawnSync(REAL_NPM, args, { stdio: "inherit" });
+  // shell:true is required on Windows so cmd.exe can interpret npm.cmd /
+  // npm.bat — without it, Node's CreateProcess call rejects the .cmd file
+  // with ENOENT. On POSIX shell:false keeps the original argv plumbing
+  // (no extra shell, no quoting surprises).
+  const result = spawnSync(REAL_NPM, args, { stdio: "inherit", shell: IS_WIN });
   process.exit(result.status ?? 0);
 }
 
