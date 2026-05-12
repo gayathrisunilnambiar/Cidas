@@ -8,6 +8,7 @@ which the calling pillar should treat as a high-risk signal.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import httpx
@@ -92,6 +93,36 @@ async def download_tarball(url: str, dest_path: str) -> bool:
     except (httpx.TimeoutException, httpx.NetworkError, OSError) as exc:
         log.warning("tarball download failed for %s: %s", url, exc)
         return False
+
+
+_EXACT_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+")
+
+
+async def get_direct_dependencies(name: str, version: str | None) -> dict[str, str]:
+    """Return the direct dependencies declared in name@version's package manifest.
+
+    *version* may be an exact semver (``"1.2.3"``) or a semver range
+    (``"^1.0.0"``).  Ranges and ``None`` are resolved to the package's current
+    ``dist-tags.latest`` version.  Returns an empty dict on any error so callers
+    can degrade gracefully without special-casing failures.
+    """
+    meta = await get_package_metadata(name)
+    if meta is None:
+        return {}
+    dist_tags: dict = meta.get("dist-tags", {})
+    versions: dict = meta.get("versions", {})
+
+    # Use the requested version only when it's an exact semver present in the registry.
+    cleaned = (version or "").lstrip("v=")
+    if _EXACT_VERSION_RE.match(cleaned) and cleaned in versions:
+        resolved = cleaned
+    else:
+        resolved = dist_tags.get("latest") or ""
+    if not resolved or resolved not in versions:
+        return {}
+
+    manifest = versions[resolved]
+    return dict(manifest.get("dependencies", {}) or {})
 
 
 async def get_package_tarball_info(name: str, version: str | None) -> dict[str, Any] | None:

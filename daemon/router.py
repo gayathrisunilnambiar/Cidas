@@ -36,12 +36,19 @@ from .database import (
     list_all_trusted,
     store_result,
 )
-from .models import HealthResponse, PackageScanRequest, PillarScore, ScanResponse
+from .models import (
+    HealthResponse,
+    PackageScanRequest,
+    PillarScore,
+    ScanResponse,
+    TransitiveDependencyResult,
+)
 from .pillars.aggregator import Aggregator
 from .pillars.contextify import Contextify
 from .pillars.sentinel import Sentinel
 from .pillars.shield import Shield
 from .utils import audit_log, policy
+from .utils.transitive import resolve_transitive
 from .utils.logger import get_logger
 from .utils.offline_cache import record_allow
 
@@ -52,6 +59,49 @@ _contextify = Contextify()
 _sentinel   = Sentinel()
 _shield     = Shield()
 _aggregator = Aggregator()
+
+# Sentinel score at or above this value in a transitive dep triggers
+# transitive_risk_detected on the parent scan response.
+_TRANSITIVE_WARN_THRESHOLD = 50.0
+
+
+async def _append_transitive(req: PackageScanRequest, response: ScanResponse) -> ScanResponse:
+    """Resolve transitive deps and run Sentinel on each; mutates *response* in place."""
+    try:
+        deps = await resolve_transitive(req.package_name, req.version or "latest")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("transitive resolution failed for %s: %s", req.package_name, exc)
+        return response
+
+    # Dedup by name before hitting the registry — same package at different depths
+    # gets one Sentinel call, recorded at its shallowest depth.
+    seen_names: dict[str, dict] = {}
+    for dep in deps:
+        if dep["name"] not in seen_names or dep["depth"] < seen_names[dep["name"]]["depth"]:
+            seen_names[dep["name"]] = dep
+
+    async def _score_one(dep: dict) -> TransitiveDependencyResult | None:
+        try:
+            sen = await _sentinel.score(dep["name"], req.ai_suggested)
+            return TransitiveDependencyResult(
+                name=dep["name"],
+                version=dep["version"],
+                depth=dep["depth"],
+                sentinel_score=sen.score,
+                flags=sen.flags,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("sentinel failed for transitive dep %s: %s", dep["name"], exc)
+            return None
+
+    results_raw = await asyncio.gather(*[_score_one(d) for d in seen_names.values()])
+    risks = [r for r in results_raw if r is not None]
+
+    response.transitive_risks = risks
+    response.transitive_risk_detected = any(
+        r.sentinel_score >= _TRANSITIVE_WARN_THRESHOLD for r in risks
+    )
+    return response
 
 
 def _collect_signals(response: ScanResponse) -> list[str]:
@@ -222,6 +272,8 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
             cached.trust_flags = tamper_flags
         cached.policy_file = policy_file_str
         cached.requires_confirmation = requires_confirmation
+        if req.scan_transitive:
+            cached = await _append_transitive(req, cached)
         await _audit_scan(req, cached, cached=True)
         return cached
 
@@ -281,6 +333,12 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
         # Mirror to offline-cache.json so the npm shim can serve known-good
         # packages silently when the daemon is unreachable.
         await record_allow(req.package_name, req.version)
+
+    # Transitive scan runs after store_result so the cache always holds the
+    # base result; transitive data is always computed fresh per request.
+    if req.scan_transitive:
+        response = await _append_transitive(req, response)
+
     await _audit_scan(req, response, cached=False)
     log.info("result: decision=%s score=%.1f package=%s", decision, risk_score, req.package_name)
     return response

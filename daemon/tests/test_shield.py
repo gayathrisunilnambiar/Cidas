@@ -67,6 +67,110 @@ async def test_score_returns_pillar_score(shield: Shield) -> None:
     assert result.confidence > 0
 
 
+# ── AST-level scan tests ──────────────────────────────────────────────────────
+#
+# These exercise ast_scan_one_file directly. They depend on
+# tree-sitter-javascript being installed; if it isn't, ast_scan_one_file
+# returns [("parse_failed", 0.0)] and the assertions below would fail —
+# so we skip the whole block in that case rather than producing confusing
+# failures unrelated to the change being tested.
+
+_ts_js_available: bool
+try:
+    import tree_sitter_javascript  # noqa: F401
+    _ts_js_available = True
+except ImportError:
+    _ts_js_available = False
+
+needs_ts = pytest.mark.skipif(
+    not _ts_js_available, reason="tree-sitter-javascript not installed",
+)
+
+
+@needs_ts
+def test_ast_detects_dot_notation_process_env(shield: Shield) -> None:
+    """process.env.SECRET — the easy case the AST must catch."""
+    hits = dict(shield.ast_scan_one_file("const t = process.env.SECRET_TOKEN;"))
+    assert "ast_process_env" in hits
+    assert "parse_failed" not in hits
+
+
+@needs_ts
+def test_ast_detects_bracket_notation_process_env(shield: Shield) -> None:
+    """process['env']['SECRET'] bypasses the dot-only regex but not the AST."""
+    hits = dict(shield.ast_scan_one_file("const t = process['env']['SECRET'];"))
+    assert "ast_process_env" in hits
+
+
+@needs_ts
+def test_ast_detects_computed_key_process_env(shield: Shield) -> None:
+    """process.env[varName] — the regex's UPPER-case literal can't match."""
+    src = "const k = 'TOKEN'; const v = process.env[k];"
+    hits = dict(shield.ast_scan_one_file(src))
+    assert "ast_process_env" in hits
+
+
+@needs_ts
+def test_ast_detects_split_require(shield: Shield) -> None:
+    """require( newline 'dns' newline ) still resolves to a require('dns') call."""
+    src = "const dns = require(\n  'dns'\n);"
+    hits = dict(shield.ast_scan_one_file(src))
+    assert "ast_dangerous_require" in hits
+
+
+@needs_ts
+def test_ast_detects_eval_and_fetch(shield: Shield) -> None:
+    """Sanity: eval and fetch both trip the AST."""
+    hits = dict(shield.ast_scan_one_file(
+        "eval('1+1'); fetch('https://x.example');",
+    ))
+    assert "ast_eval_or_function" in hits
+    assert "ast_network_call" in hits
+
+
+@needs_ts
+def test_ast_detects_buffer_base64(shield: Shield) -> None:
+    hits = dict(shield.ast_scan_one_file("Buffer.from(payload, 'base64');"))
+    assert "ast_base64_decode" in hits
+
+
+def test_ast_minified_garbage_falls_back(shield: Shield, monkeypatch) -> None:
+    """Source the parser can't make sense of must yield parse_failed, not crash.
+
+    We force this by stubbing the parser to one that returns an ERROR root,
+    which lets the test run regardless of whether tree-sitter-javascript is
+    installed locally.
+    """
+    from daemon.pillars import shield as shield_mod
+
+    class _FakeNode:
+        type = "ERROR"
+        children: list = []
+        text = b""
+
+        def child_by_field_name(self, _):
+            return None
+
+    class _FakeTree:
+        root_node = _FakeNode()
+
+    class _FakeParser:
+        def parse(self, _):
+            return _FakeTree()
+
+    monkeypatch.setattr(shield_mod, "_get_js_parser", lambda: _FakeParser())
+    hits = dict(shield.ast_scan_one_file("!!!minified garbage!!!"))
+    assert "parse_failed" in hits
+
+
+def test_ast_missing_binding_falls_back(shield: Shield, monkeypatch) -> None:
+    """If tree-sitter-javascript isn't installed, ast_scan returns parse_failed."""
+    from daemon.pillars import shield as shield_mod
+    monkeypatch.setattr(shield_mod, "_get_js_parser", lambda: None)
+    hits = dict(shield.ast_scan_one_file("process.env.SECRET"))
+    assert hits == {"parse_failed": 0.0}
+
+
 @pytest.mark.asyncio
 async def test_env_exfil_pattern_detected(shield: Shield) -> None:
     """A script that exfiltrates environment variables should be flagged."""

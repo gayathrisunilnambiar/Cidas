@@ -84,6 +84,181 @@ _REQUIRE_TIME_SCORES: dict[str, float] = {
     "hex_density":           25.0,
 }
 
+# ── AST analysis ──────────────────────────────────────────────────────────────
+#
+# Regex catches the easy cases; the AST pass catches obfuscation that's
+# trivial to write but expensive to encode as regex: bracket-notation
+# property access, computed keys, destructuring, `const e = eval`, and so
+# on. The parser is lazy-loaded so the module still imports when the
+# tree-sitter-javascript wheel isn't installed in the local environment.
+_AST_PATTERN_SCORES: dict[str, float] = {
+    "ast_process_env":        35.0,
+    "ast_network_call":       20.0,
+    "ast_eval_or_function":   25.0,
+    "ast_dangerous_require":  25.0,
+    "ast_base64_decode":      15.0,
+    "parse_failed":            0.0,
+}
+
+_AST_NETWORK_NAMES = {"fetch", "XMLHttpRequest"}
+_AST_NETWORK_METHODS = {"request"}  # http.request / https.request
+_AST_DANGEROUS_MODULES = {"dns", "child_process", "http", "https", "node-fetch"}
+_AST_NETWORK_MODULES = {"http", "https", "node-fetch"}
+
+_ts_parser = None         # lazy singleton tree_sitter.Parser
+_ts_load_failed = False   # set True once we've decided the binding is unusable
+
+
+def _get_js_parser():
+    """Return a cached tree-sitter JS Parser, or None if unavailable."""
+    global _ts_parser, _ts_load_failed
+    if _ts_parser is not None or _ts_load_failed:
+        return _ts_parser
+    try:
+        import tree_sitter_javascript  # type: ignore[import-not-found]
+        from tree_sitter import Language, Parser  # type: ignore[import-not-found]
+        _ts_parser = Parser(Language(tree_sitter_javascript.language()))
+    except Exception as exc:  # ImportError or binding mismatch
+        log.debug("tree-sitter-javascript unavailable: %s", exc)
+        _ts_load_failed = True
+        _ts_parser = None
+    return _ts_parser
+
+
+def _walk_ts(node):
+    """Pre-order generator over every node in a tree-sitter tree."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        yield n
+        stack.extend(reversed(n.children))
+
+
+def _node_text(node) -> str:
+    """Decode a node's source slice. Returns '' on decode failure."""
+    if node is None:
+        return ""
+    try:
+        return node.text.decode("utf-8", errors="ignore")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _is_identifier_named(node, name: str) -> bool:
+    return node is not None and node.type == "identifier" and _node_text(node) == name
+
+
+_JS_HEX_ESCAPE = re.compile(r"\\x([0-9a-fA-F]{2})")
+_JS_UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _decode_js_escapes(s: str) -> str:
+    """Best-effort decode of \\x.. and \\u.... escapes used to hide 'env' etc."""
+    s = _JS_HEX_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), s)
+    s = _JS_UNICODE_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), s)
+    return s
+
+
+def _is_process_env(node) -> bool:
+    """True if *node* evaluates to process.env (dot or bracket form)."""
+    if node is None:
+        return False
+    if node.type == "member_expression":
+        obj = node.child_by_field_name("object")
+        prop = node.child_by_field_name("property")
+        return _is_identifier_named(obj, "process") and prop is not None \
+            and prop.type == "property_identifier" and _node_text(prop) == "env"
+    if node.type == "subscript_expression":
+        obj = node.child_by_field_name("object")
+        idx = node.child_by_field_name("index")
+        if not _is_identifier_named(obj, "process") or idx is None:
+            return False
+        raw = _node_text(idx).strip("\"'`")
+        return raw == "env" or _decode_js_escapes(raw) == "env"
+    return False
+
+
+def _require_argument_module(node) -> str | None:
+    """If *node* is ``require('x')``, return ``'x'`` (escapes decoded). Else None."""
+    if node is None or node.type != "call_expression":
+        return None
+    fn = node.child_by_field_name("function")
+    if not _is_identifier_named(fn, "require"):
+        return None
+    args = node.child_by_field_name("arguments")
+    if args is None:
+        return None
+    for child in args.children:
+        if child.type == "string":
+            return _decode_js_escapes(_node_text(child).strip("\"'`"))
+        if child.type == "template_string":
+            inner = _node_text(child).strip("`")
+            if "${" in inner:
+                return None
+            return _decode_js_escapes(inner)
+    return None
+
+
+def _classify_node(node) -> str | None:  # noqa: PLR0911
+    """Return an AST-pattern label for *node*, or None if it matches nothing."""
+    t = node.type
+
+    # (a) process.env access — dot, bracket, computed key
+    if t in ("member_expression", "subscript_expression"):
+        obj = node.child_by_field_name("object")
+        if _is_process_env(obj) or _is_process_env(node):
+            return "ast_process_env"
+
+    # destructuring: const { env } = process / const { X } = process.env
+    if t == "variable_declarator":
+        init = node.child_by_field_name("value")
+        name = node.child_by_field_name("name")
+        if name is not None and name.type == "object_pattern" and init is not None:
+            if _is_identifier_named(init, "process"):
+                if "env" in _node_text(name):
+                    return "ast_process_env"
+            if _is_process_env(init):
+                return "ast_process_env"
+
+    # (b) network calls, (c) eval/new Function, (d) dangerous require, (e) base64
+    if t == "call_expression":
+        fn = node.child_by_field_name("function")
+        if _is_identifier_named(fn, "eval"):
+            return "ast_eval_or_function"
+        if _is_identifier_named(fn, "atob"):
+            return "ast_base64_decode"
+        if fn is not None and fn.type == "identifier" and _node_text(fn) in _AST_NETWORK_NAMES:
+            return "ast_network_call"
+        mod = _require_argument_module(node)
+        if mod is not None:
+            if mod in _AST_NETWORK_MODULES:
+                return "ast_network_call"
+            if mod in _AST_DANGEROUS_MODULES:
+                return "ast_dangerous_require"
+        if fn is not None and fn.type == "member_expression":
+            prop = fn.child_by_field_name("property")
+            obj = fn.child_by_field_name("object")
+            prop_name = _node_text(prop)
+            obj_name = _node_text(obj)
+            if obj_name in ("http", "https") and prop_name in _AST_NETWORK_METHODS:
+                return "ast_network_call"
+            if obj_name == "Buffer" and prop_name == "from":
+                args = node.child_by_field_name("arguments")
+                if args is not None:
+                    str_args = [c for c in args.children if c.type == "string"]
+                    if str_args and "base64" in _node_text(str_args[-1]):
+                        return "ast_base64_decode"
+
+    if t == "new_expression":
+        ctor = node.child_by_field_name("constructor")
+        ctor_name = _node_text(ctor)
+        if ctor_name == "Function":
+            return "ast_eval_or_function"
+        if ctor_name == "XMLHttpRequest":
+            return "ast_network_call"
+
+    return None
+
 # ── Prompt injection patterns in README/description ───────────────────────────
 _INJECTION_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"ignore (?:previous|all prior) instructions", re.IGNORECASE),
@@ -209,10 +384,12 @@ class Shield:
 
     def _scan_extracted_dir(self, root: str) -> tuple[float, list[str], int]:
         """Walk *root*, scan up to _FILE_SCAN_MAX_FILES .js files."""
-        total = 0.0
+        regex_total = 0.0
+        ast_total = 0.0
         # Use a set so a pattern hitting in three different files only adds
         # its weight once — otherwise legitimate vendored bundles dominate.
-        seen: set[str] = set()
+        regex_seen: set[str] = set()
+        ast_seen: set[str] = set()
         scanned = 0
         for dirpath, _dirs, files in os.walk(root):
             for name in files:
@@ -229,14 +406,24 @@ class Shield:
                     continue
 
                 for label, score in self._scan_one_file(text):
-                    if label not in seen:
-                        seen.add(label)
-                        total += score
+                    if label not in regex_seen:
+                        regex_seen.add(label)
+                        regex_total += score
+
+                for label, score in self.ast_scan_one_file(text):
+                    if label not in ast_seen:
+                        ast_seen.add(label)
+                        ast_total += score
                 scanned += 1
             if scanned >= _FILE_SCAN_MAX_FILES:
                 break
 
-        return min(total, 100.0), sorted(seen), scanned
+        regex_score = min(regex_total, 100.0)
+        ast_score = min(ast_total, 100.0)
+        # final_shield_file_score = (regex_score * 0.5) + (ast_score * 0.5)
+        combined = min(regex_score * 0.5 + ast_score * 0.5, 100.0)
+        flags = sorted(regex_seen | ast_seen)
+        return combined, flags, scanned
 
     @staticmethod
     def _scan_one_file(text: str) -> list[tuple[str, float]]:
@@ -266,6 +453,39 @@ class Shield:
                 hits.append(("hex_density", _REQUIRE_TIME_SCORES["hex_density"]))
 
         return hits
+
+    @staticmethod
+    def ast_scan_one_file(text: str) -> list[tuple[str, float]]:
+        """Parse *text* as JavaScript and return (label, weight) AST findings.
+
+        Returns ``[("parse_failed", 0.0)]`` if the parser is unavailable or
+        the source can't be parsed at all — the caller treats this as a
+        fall-back-to-regex signal. A zero-weight flag still surfaces in the
+        flag list so downstream consumers know AST coverage was lost.
+        """
+        parser = _get_js_parser()
+        if parser is None:
+            return [("parse_failed", _AST_PATTERN_SCORES["parse_failed"])]
+
+        try:
+            tree = parser.parse(bytes(text, "utf-8"))
+        except Exception as exc:  # noqa: BLE001 — defensive: parser is C-backed
+            log.debug("tree-sitter parse raised: %s", exc)
+            return [("parse_failed", _AST_PATTERN_SCORES["parse_failed"])]
+
+        root = tree.root_node
+        # tree-sitter still produces a (partial) tree with `ERROR` nodes for
+        # minified-beyond-parseable input. If the root itself is an error
+        # node, treat the file as unparseable.
+        if root is None or root.type == "ERROR":
+            return [("parse_failed", _AST_PATTERN_SCORES["parse_failed"])]
+
+        hits: dict[str, float] = {}
+        for node in _walk_ts(root):
+            label = _classify_node(node)
+            if label is not None and label not in hits:
+                hits[label] = _AST_PATTERN_SCORES[label]
+        return list(hits.items())
 
     async def fetch_install_scripts(self, package_name: str, metadata: dict) -> dict[str, str]:
         """Extract lifecycle scripts from the package metadata or tarball info."""
