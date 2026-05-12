@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from .auth import get_or_create_token
 from .config import get_settings
@@ -64,6 +66,9 @@ async def _timing_middleware(request: Request, call_next) -> Response:  # type: 
 
 
 app.include_router(router, prefix="/api/v1")
+
+_static_dir = Path(__file__).parent / "static"
+app.mount("/dashboard", StaticFiles(directory=str(_static_dir), html=True), name="dashboard")
 
 
 def start() -> None:
