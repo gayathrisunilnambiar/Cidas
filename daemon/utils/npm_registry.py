@@ -9,6 +9,7 @@ which the calling pillar should treat as a high-risk signal.
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -123,6 +124,61 @@ async def get_direct_dependencies(name: str, version: str | None) -> dict[str, s
 
     manifest = versions[resolved]
     return dict(manifest.get("dependencies", {}) or {})
+
+
+# Maximum number of recent versions returned by get_version_history.
+# Cap exists because some packages have hundreds of versions (e.g. react),
+# and diff analysis only ever needs the immediately-preceding entry.
+_MAX_HISTORY = 10
+
+
+async def get_version_history(name: str) -> list[dict[str, Any]]:
+    """Return ``[{"version": str, "published": datetime}]`` oldest-first.
+
+    Reads ``meta["time"]`` from the registry document and pairs each version
+    string with its publish timestamp. Capped at the **10 most recent**
+    versions to keep diff analysis bounded. Returns ``[]`` on registry miss
+    or when no parseable timestamps are present.
+    """
+    meta = await get_package_metadata(name)
+    if meta is None:
+        return []
+
+    times: dict = meta.get("time", {}) or {}
+    versions: dict = meta.get("versions", {}) or {}
+
+    history: list[dict[str, Any]] = []
+    for version, published_str in times.items():
+        # 'created'/'modified' are document-level meta-keys, not real versions.
+        if version in ("created", "modified"):
+            continue
+        # Skip orphaned timestamps that don't correspond to a real version.
+        if version not in versions:
+            continue
+        try:
+            published = datetime.fromisoformat(str(published_str).replace("Z", "+00:00"))
+        except (ValueError, AttributeError, TypeError):
+            continue
+        history.append({"version": version, "published": published})
+
+    history.sort(key=lambda d: d["published"])
+    return history[-_MAX_HISTORY:]
+
+
+async def get_previous_version(name: str, current_version: str) -> str | None:
+    """Return the version published immediately before *current_version*.
+
+    Returns ``None`` if *current_version* is the first release in the bounded
+    history window, isn't present in the registry, or the registry is
+    unreachable.
+    """
+    if not current_version:
+        return None
+    history = await get_version_history(name)
+    for i, entry in enumerate(history):
+        if entry["version"] == current_version:
+            return history[i - 1]["version"] if i > 0 else None
+    return None
 
 
 async def get_package_tarball_info(name: str, version: str | None) -> dict[str, Any] | None:

@@ -23,8 +23,9 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from ..config import get_admin_config
+from ..config import get_admin_config, get_settings
 from ..models import PillarScore
+from ..utils.llm_verifier import verify_with_llm
 from ..utils.logger import get_logger
 from ..utils.npm_registry import download_tarball, get_package_metadata, get_package_tarball_info
 
@@ -259,6 +260,22 @@ def _classify_node(node) -> str | None:  # noqa: PLR0911
 
     return None
 
+# ── LLM secondary verification ────────────────────────────────────────────────
+#
+# When the primary regex scan turns up *some* signal in the README, optionally
+# ask an Anthropic model whether the content is genuinely adversarial. The
+# threshold is chosen so a single 20-point regex hit alone is not enough —
+# the LLM only fires when there are at least two regex hits, keeping API
+# spend low and avoiding burning the budget on obviously-clean READMEs.
+_LLM_INVOKE_MIN_PRIMARY_SCORE: float = 20.0
+# Final injection score is a 40/60 weighted blend of the primary regex score
+# and the LLM-assessed score. The LLM is given the larger weight because the
+# regex is high-precision/low-recall (catches canonical phrasings, misses
+# paraphrases), while the LLM is the opposite — blending recovers both.
+_PRIMARY_INJECTION_WEIGHT: float = 0.4
+_LLM_INJECTION_WEIGHT:     float = 0.6
+
+
 # ── Prompt injection patterns in README/description ───────────────────────────
 _INJECTION_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"ignore (?:previous|all prior) instructions", re.IGNORECASE),
@@ -285,16 +302,34 @@ class Shield:
         script_score, script_flags = self.primary_scan(scripts, readme)
 
         # Injection detection in description and README
-        injection_score, injection_flags = self._scan_injection(description + "\n" + readme)
+        primary_injection_score, injection_flags = self._scan_injection(description + "\n" + readme)
 
         # File scan — downloads the tarball and statically inspects .js files.
         tarball_url = self._tarball_url_from_metadata(package_metadata)
         file_score, file_flags, file_summary = await self.scan_package_files(tarball_url)
 
-        # TODO(phase-2): uncomment when secondary_verification LLM is available
-        # secondary_score, secondary_flags = await self.secondary_verification(
-        #     (script_score, script_flags), package_metadata
-        # )
+        # Secondary LLM verification: only fires when (a) admin enabled it via
+        # llm_verification_enabled AND (b) the primary regex scan already
+        # produced enough signal to be worth the API call. The threshold of
+        # >20 means "at least two regex hits" — a single match is high-precision
+        # enough on its own and doesn't justify a second-pass network call.
+        settings = get_settings()
+        llm_flags: list[str] = []
+        llm_reasoning: str = ""
+        if settings.llm_verification_enabled and primary_injection_score > _LLM_INVOKE_MIN_PRIMARY_SCORE:
+            llm_result = await verify_with_llm(
+                package_name, readme, primary_injection_score, injection_flags,
+            )
+            llm_flags = list(llm_result.get("llm_flags") or [])
+            llm_reasoning = str(llm_result.get("reasoning") or "")
+            llm_score = float(llm_result.get("llm_score") or 0.0)
+            injection_score = min(
+                primary_injection_score * _PRIMARY_INJECTION_WEIGHT
+                + llm_score * _LLM_INJECTION_WEIGHT,
+                100.0,
+            )
+        else:
+            injection_score = primary_injection_score
 
         combined = min(
             script_score * 0.7
@@ -302,7 +337,47 @@ class Shield:
             + file_score * FILE_SCAN_WEIGHT,
             100.0,
         )
-        all_flags = script_flags + injection_flags + file_flags
+
+        # Differential analysis vs. the immediately preceding published version.
+        # Gated on having a current-version tarball URL: without it we can't
+        # scan the current release either, so a diff is meaningless. The
+        # diff_analyzer is lazy-imported to avoid the import cycle (it imports
+        # this module at load time to reuse the AST helpers).
+        diff_ran = False
+        diff_score = 0.0
+        diff_flags: list[str] = []
+        diff_new_imports: list[str] = []
+        diff_new_network: bool = False
+        if tarball_url:
+            current_v = (package_metadata.get("dist-tags") or {}).get("latest")
+            if current_v:
+                try:
+                    from ..utils.diff_analyzer import diff_package_versions
+                    from ..utils.npm_registry import get_previous_version
+                    prev_v = await get_previous_version(package_name, current_v)
+                    if prev_v:
+                        diff_result = await diff_package_versions(
+                            package_name, current_v, prev_v,
+                        )
+                        diff_ran = True
+                        diff_score = float(diff_result.get("diff_score") or 0.0)
+                        diff_flags = list(diff_result.get("diff_flags") or [])
+                        diff_new_imports = list(diff_result.get("new_imports") or [])
+                        diff_new_network = bool(diff_result.get("new_network_calls"))
+                except Exception as exc:  # noqa: BLE001 — diff is advisory only
+                    log.debug("diff analysis skipped for %s: %s", package_name, exc)
+
+        # Blend: existing shield carries 0.75, diff carries 0.25 — but only
+        # when we actually ran a diff. First releases and registry misses
+        # leave the score unchanged; we don't penalise packages for the
+        # diff being unavailable. A clean successful diff (diff_score=0)
+        # *does* trim the score by 25%, which is intentional: it discounts
+        # the file-scan signal slightly when capability-stable across
+        # versions, on the principle that "no behavioural change since the
+        # last release" is itself weak evidence of benign-ness.
+        if diff_ran:
+            combined = min(combined * 0.75 + diff_score * 0.25, 100.0)
+        all_flags = script_flags + injection_flags + file_flags + llm_flags + diff_flags
 
         return PillarScore(
             score=combined,
@@ -311,10 +386,15 @@ class Shield:
             metadata={
                 "script_score": script_score,
                 "injection_score": injection_score,
+                "primary_injection_score": primary_injection_score,
                 "file_score": file_score,
                 "hooks_found": list(scripts.keys()),
                 "tarball_url": tarball_url,
                 "file_scan_summary": file_summary,
+                "llm_reasoning": llm_reasoning,
+                "diff_score": diff_score,
+                "new_imports": diff_new_imports,
+                "new_network_calls": diff_new_network,
             },
         )
 

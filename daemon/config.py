@@ -55,6 +55,17 @@ class Settings(BaseSettings):
     # ── NPM registry ──────────────────────────────────────────────────────
     npm_registry_url: str = "https://registry.npmjs.org"
 
+    # ── LLM secondary verification ────────────────────────────────────────
+    # Optional second-pass check that asks a local Ollama model to evaluate
+    # README text the regex flagged as possibly adversarial. Off by default
+    # because it requires Ollama to be installed and running on the host.
+    # No API key needed — calls are local. The Shield pillar reads these
+    # via get_settings() at score() time, so changing the env vars and
+    # restarting the daemon is enough — no code change required to enable.
+    llm_verification_enabled: bool = False
+    ollama_host: str = "http://localhost:11434"
+    ollama_model: str = "phi3:mini"
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
