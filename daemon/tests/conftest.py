@@ -67,6 +67,17 @@ def mock_npm_registry():
 
 
 @pytest.fixture
+def auth_headers() -> dict[str, str]:
+    """Authorization header for endpoints that require a bearer token.
+
+    The async_client fixture already bypasses token validation for most tests,
+    but passing this header keeps request shapes realistic and lets auth-specific
+    tests (test_auth.py) use the same fixture without hardcoding strings.
+    """
+    return {"Authorization": "Bearer test-token"}
+
+
+@pytest.fixture
 def sample_project_path(tmp_path):
     """A minimal project with package.json and one JS file with imports."""
     pkg = tmp_path / "package.json"

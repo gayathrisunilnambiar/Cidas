@@ -23,8 +23,17 @@ cidas/
 │   │   ├── offline_cache.py name@version offline-allow cache
 │   │   ├── npm_registry.py Registry lookups + tarball download
 │   │   ├── embeddings.py   Sentence embedding helpers
+│   │   ├── diff_analyzer.py Cross-version diff: new imports, env access, network calls
+│   │   ├── llm_verifier.py Optional Ollama second-pass for README/script text
+│   │   ├── transitive.py   Recursive npm dependency resolution
 │   │   └── logger.py       Structured logging
-│   ├── tests/              185 pytest tests
+│   ├── eval/               Benchmark harness (no daemon code changes needed)
+│   │   ├── build_corpus.py Generates the four labelled JSONL corpora
+│   │   ├── evaluate.py     Posts corpora to live daemon; computes precision/recall/F1
+│   │   ├── ablation.py     8-combination pillar weight study; ASCII + Markdown tables
+│   │   ├── corpus/         39 malicious / 50 typosquat / 23 hallucinated / 50 benign
+│   │   └── results/        JSON + Markdown output from evaluation runs
+│   ├── tests/              289 pytest tests (279 passing, 6 skipped, 4 pre-existing failures)
 │   ├── auth.py             Bearer token generation & verification
 │   ├── cli.py              `python -m daemon.cli audit ...`
 │   ├── config.py           Pydantic settings from .env
@@ -137,7 +146,7 @@ To remove: `.\intercept\uninstall-shim.ps1 ; Stop-Process -Id (Get-Content .cida
 ## Run automated tests
 
 ```bash
-# Daemon (185 tests)
+# Daemon (289 tests)
 source daemon/.venv/bin/activate
 pytest daemon/tests/ -v --cov=daemon --cov-report=term-missing
 
