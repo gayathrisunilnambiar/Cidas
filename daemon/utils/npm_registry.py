@@ -49,6 +49,10 @@ async def get_package_metadata(name: str, version: str | None = None) -> dict[st
 
     If *version* is given, returns the version-specific package.json dict;
     otherwise returns the full registry document for *name*.
+
+    In both cases a top-level ``unpackedSize`` key (int, bytes) is injected
+    from ``dist.unpackedSize`` of the resolved version.  Defaults to 0 when
+    the field is absent or the registry omits it.
     """
     settings = get_settings()
     url = f"{settings.npm_registry_url}/{name}"
@@ -56,8 +60,46 @@ async def get_package_metadata(name: str, version: str | None = None) -> dict[st
     if meta is None:
         return None
     if version:
-        return meta.get("versions", {}).get(version)
+        manifest = meta.get("versions", {}).get(version)
+        if manifest is None:
+            return None
+        dist = manifest.get("dist") or {}
+        manifest["unpackedSize"] = int(dist.get("unpackedSize") or 0)
+        return manifest
+    # Full registry document: inject unpackedSize from the latest version.
+    latest = (meta.get("dist-tags") or {}).get("latest")
+    if latest:
+        dist = ((meta.get("versions") or {}).get(latest) or {}).get("dist") or {}
+        meta["unpackedSize"] = int(dist.get("unpackedSize") or 0)
+    else:
+        meta["unpackedSize"] = 0
     return meta
+
+
+async def get_package_size(name: str, version: str = "latest") -> int:
+    """Return ``dist.unpackedSize`` (bytes) for *name* at *version*.
+
+    *version* may be an exact semver, a semver range, or ``"latest"``.
+    Ranges and ``"latest"`` resolve to ``dist-tags.latest``.
+    Returns 0 on any error — 404, timeout, or missing field.
+    """
+    try:
+        meta = await get_package_metadata(name)
+        if meta is None:
+            return 0
+        dist_tags: dict = meta.get("dist-tags") or {}
+        versions: dict = meta.get("versions") or {}
+        cleaned = (version or "").lstrip("v=^~")
+        if _EXACT_VERSION_RE.match(cleaned) and cleaned in versions:
+            resolved = cleaned
+        else:
+            resolved = dist_tags.get("latest") or ""
+        if not resolved or resolved not in versions:
+            return 0
+        dist = (versions[resolved].get("dist") or {})
+        return int(dist.get("unpackedSize") or 0)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 async def get_download_count(name: str) -> int:

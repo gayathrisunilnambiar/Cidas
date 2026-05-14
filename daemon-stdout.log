@@ -54,3 +54,5 @@ INFO:     127.0.0.1:60098 - "POST /api/v1/scan HTTP/1.1" 200 OK
 {"ts": "2026-05-14T21:39:19", "level": "INFO", "logger": "httpx", "msg": "HTTP Request: GET https://registry.npmjs.org/fake-aiiii \"HTTP/1.1 404 Not Found\""}
 {"ts": "2026-05-14T21:39:19", "level": "INFO", "logger": "daemon.router", "msg": "result: decision=BLOCK score=80.0 package=fake-aiiii"}
 INFO:     127.0.0.1:58721 - "POST /api/v1/scan HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51097 - "GET /docs HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51097 - "GET /openapi.json HTTP/1.1" 200 OK
