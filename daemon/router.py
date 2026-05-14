@@ -37,6 +37,7 @@ from .database import (
     store_result,
 )
 from .models import (
+    DirectDependency,
     HealthResponse,
     PackageScanRequest,
     PillarScore,
@@ -48,6 +49,7 @@ from .pillars.contextify import Contextify
 from .pillars.sentinel import Sentinel
 from .pillars.shield import Shield
 from .utils import audit_log, policy
+from .utils.npm_registry import get_direct_dependencies
 from .utils.transitive import resolve_transitive
 from .utils.logger import get_logger
 from .utils.offline_cache import record_allow
@@ -65,6 +67,18 @@ _aggregator = Aggregator()
 _TRANSITIVE_WARN_THRESHOLD = 50.0
 
 
+async def _append_direct_deps(req: PackageScanRequest, response: ScanResponse) -> ScanResponse:
+    """Fetch direct dependencies from the registry and attach to *response*."""
+    try:
+        raw = await get_direct_dependencies(req.package_name, req.version)
+        response.direct_dependencies = [
+            DirectDependency(name=n, version_range=v) for n, v in raw.items()
+        ]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("direct dep fetch failed for %s: %s", req.package_name, exc)
+    return response
+
+
 async def _append_transitive(req: PackageScanRequest, response: ScanResponse) -> ScanResponse:
     """Resolve transitive deps and run Sentinel on each; mutates *response* in place."""
     try:
@@ -75,10 +89,15 @@ async def _append_transitive(req: PackageScanRequest, response: ScanResponse) ->
 
     # Dedup by name before hitting the registry — same package at different depths
     # gets one Sentinel call, recorded at its shallowest depth.
+    # Cap at 30 unique packages so large trees (e.g. express ~200 deps) don't
+    # blow past the shim timeout; prioritise shallow (direct) deps first.
+    _TRANSITIVE_CAP = 30
     seen_names: dict[str, dict] = {}
-    for dep in deps:
-        if dep["name"] not in seen_names or dep["depth"] < seen_names[dep["name"]]["depth"]:
+    for dep in sorted(deps, key=lambda d: d["depth"]):
+        if dep["name"] not in seen_names:
             seen_names[dep["name"]] = dep
+        if len(seen_names) >= _TRANSITIVE_CAP:
+            break
 
     async def _score_one(dep: dict) -> TransitiveDependencyResult | None:
         try:
@@ -272,6 +291,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
             cached.trust_flags = tamper_flags
         cached.policy_file = policy_file_str
         cached.requires_confirmation = requires_confirmation
+        cached = await _append_direct_deps(req, cached)
         if req.scan_transitive:
             cached = await _append_transitive(req, cached)
         await _audit_scan(req, cached, cached=True)
@@ -325,7 +345,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
         file_scan_summary=shi_score.metadata.get("file_scan_summary"),
         trust_flags=tamper_flags,
         policy_file=policy_file_str,
-            requires_confirmation=requires_confirmation,
+        requires_confirmation=requires_confirmation,
     )
 
     await store_result(response)
@@ -334,8 +354,9 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
         # packages silently when the daemon is unreachable.
         await record_allow(req.package_name, req.version)
 
-    # Transitive scan runs after store_result so the cache always holds the
-    # base result; transitive data is always computed fresh per request.
+    # Direct deps and transitive scan run after store_result so the cache
+    # always holds the base result; both are computed fresh per request.
+    response = await _append_direct_deps(req, response)
     if req.scan_transitive:
         response = await _append_transitive(req, response)
 

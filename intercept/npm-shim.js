@@ -252,6 +252,7 @@ function _scan(name, version) {
       project_path: process.cwd(),
       ai_suggested: false,
       requesting_tool: "npm-shim",
+      scan_transitive: true,
     });
     const lib    = url.protocol === "https:" ? https : http;
     const token  = _readDaemonToken();
@@ -266,7 +267,7 @@ function _scan(name, version) {
       path: url.pathname,
       method: "POST",
       headers,
-      timeout: 10_000,
+      timeout: 60_000,
     };
     const req = lib.request(options, (res) => {
       let data = "";
@@ -277,7 +278,7 @@ function _scan(name, version) {
       });
     });
     req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("Daemon request timed out after 10 s")); });
+    req.on("timeout", () => { req.destroy(); reject(new Error("Daemon request timed out after 60 s")); });
     req.write(body);
     req.end();
   });
@@ -417,6 +418,33 @@ function _main() {
         }
       } else {
         process.stdout.write(`\x1b[32m[CIDAS ALLOW]\x1b[0m ${explanation}\n`);
+      }
+
+      // Show direct dependencies
+      const directDeps = result.direct_dependencies || [];
+      if (directDeps.length > 0) {
+        process.stdout.write(
+          `\x1b[36m[CIDAS]\x1b[0m \x1b[1m${name}\x1b[0m requires ${directDeps.length} direct dependenc${directDeps.length === 1 ? "y" : "ies"}:\n`
+        );
+        for (const dep of directDeps) {
+          process.stdout.write(`  \x1b[2m+\x1b[0m ${dep.name}  \x1b[2m${dep.version_range}\x1b[0m\n`);
+        }
+      }
+
+      // Warn about risky transitive dependencies
+      const riskyTransitive = (result.transitive_risks || []).filter(
+        (r) => r.sentinel_score >= 50
+      );
+      if (riskyTransitive.length > 0) {
+        process.stderr.write(
+          `\x1b[33m[CIDAS]\x1b[0m \x1b[1m${riskyTransitive.length}\x1b[0m transitive dependenc${riskyTransitive.length === 1 ? "y" : "ies"} flagged as risky:\n`
+        );
+        for (const dep of riskyTransitive) {
+          const flagStr = dep.flags.length ? `  [${dep.flags.join(", ")}]` : "";
+          process.stderr.write(
+            `  \x1b[33m!\x1b[0m ${dep.name}@${dep.version}  depth=${dep.depth}  score=${dep.sentinel_score}${flagStr}\n`
+          );
+        }
       }
     }
 

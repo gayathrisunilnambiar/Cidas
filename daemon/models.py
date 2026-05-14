@@ -45,6 +45,13 @@ class PillarScore(BaseModel):
 
 # ── Transitive dep result ─────────────────────────────────────────────────────
 
+class DirectDependency(BaseModel):
+    """A single direct dependency declared in the package's package.json."""
+
+    name: str
+    version_range: str = Field(..., description="Version range as declared (e.g. '^1.2.3')")
+
+
 class TransitiveDependencyResult(BaseModel):
     """Sentinel screening result for a single transitive dependency."""
 
@@ -67,6 +74,10 @@ class ScanResponse(BaseModel):
     contextify: PillarScore
     sentinel: PillarScore
     shield: PillarScore
+    direct_dependencies: list[DirectDependency] = Field(
+        default_factory=list,
+        description="Direct dependencies declared in the package's package.json",
+    )
     alternatives: list[str] = Field(default_factory=list, description="Safer package suggestions")
     explanation: str = Field(default="", description="Human-readable summary of the decision")
     latency_ms: float = Field(default=0.0, description="Total scan duration in milliseconds")
