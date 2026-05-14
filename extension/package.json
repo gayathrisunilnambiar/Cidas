@@ -7,6 +7,7 @@
   "engines": { "vscode": "^1.89.0" },
   "categories": ["Other", "Linters"],
   "activationEvents": ["onStartupFinished"],
+  "enabledApiProposals": ["terminalDataWriteEvent"],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [

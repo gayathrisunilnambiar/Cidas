@@ -58,21 +58,53 @@ class Sentinel:
     """Pillar 2: detect AI hallucinations and typosquats via registry signals."""
 
     async def score(self, package_name: str, ai_suggested: bool) -> PillarScore:
-        """Return a PillarScore; short-circuits for human-typed packages."""
-        if not ai_suggested:
-            is_typo, similar_to = self.check_name_similarity(package_name)
+        """Return a PillarScore; always checks registry existence."""
+        # Always check if package exists - this catches hallucinated/fake packages
+        exists, registry_signals = await self.check_registry_existence(package_name)
+        is_typo, similar_to = self.check_name_similarity(package_name)
+
+        # If package doesn't exist, always flag it regardless of ai_suggested
+        if not exists:
+            score = 85.0  # High risk for non-existent packages
+            flags = ["package_not_found"]
             if is_typo:
-                return PillarScore(
-                    score=100.0,
-                    confidence=0.8,
-                    flags=["typosquat_detected"],
-                    metadata={"similar_to": similar_to, "ai_suggested": False},
-                )
+                flags.append("typosquat_detected")
+                score = 95.0
             return PillarScore(
-                score=0.0,
+                score=score,
+                confidence=0.95,
+                flags=flags,
+                metadata={"similar_to": similar_to, "ai_suggested": ai_suggested, "exists": False},
+            )
+
+        # Package exists - check for typosquats
+        if is_typo:
+            return PillarScore(
+                score=100.0,
+                confidence=0.8,
+                flags=["typosquat_detected"],
+                metadata={"similar_to": similar_to, "ai_suggested": ai_suggested, "exists": True},
+            )
+
+        # For non-AI suggested packages that exist and aren't typosquats, do basic checks
+        if not ai_suggested:
+            flags = []
+            score = 0.0
+            monthly_dl = registry_signals.get("monthly_downloads", 0)
+            if monthly_dl == 0:
+                flags.append("zero_downloads")
+                score += 20.0
+            elif monthly_dl < 100:
+                flags.append("very_low_downloads")
+                score += 10.0
+            if not registry_signals.get("has_repository"):
+                flags.append("no_repository")
+                score += 10.0
+            return PillarScore(
+                score=score,
                 confidence=0.9,
-                flags=[],
-                metadata={"ai_suggested": False, "hallucination_check": "skipped"},
+                flags=flags,
+                metadata={"ai_suggested": False, "exists": True, **registry_signals},
             )
 
         # Full hallucination-risk analysis for AI-suggested packages

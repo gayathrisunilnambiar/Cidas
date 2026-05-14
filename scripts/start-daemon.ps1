@@ -32,7 +32,7 @@ if (Test-Path -LiteralPath $EnvFile) {
         $val = $parts[1].Trim().Trim('"').Trim("'")
         [Environment]::SetEnvironmentVariable($key, $val, "Process")
     }
-    Write-Host "[CIDAS] Loaded $EnvFile"
+    Write-Host "`[CIDAS`] Loaded $EnvFile"
 }
 
 # Cheap port-occupancy check via .NET — avoids depending on lsof/Get-NetTCPConnection
@@ -45,39 +45,39 @@ function Test-PortListening([string]$bindHost, [int]$port) {
         $ok = $iar.AsyncWaitHandle.WaitOne(200)
         if ($ok -and $client.Connected) { $client.Close(); return $true }
         $client.Close()
-    } catch { /* fallthrough */ }
+    } catch { }
     return $false
 }
 
 if (Test-PortListening $Host_ ([int]$Port)) {
-    Write-Host "[CIDAS] Daemon already running on port $Port."
+    Write-Host "`[CIDAS`] Daemon already running on port $Port."
     exit 0
 }
 
 # Create venv if absent.
 if (-not (Test-Path -LiteralPath $VenvDir)) {
-    Write-Host "[CIDAS] Creating Python virtual environment in $VenvDir..."
+    Write-Host "`[CIDAS`] Creating Python virtual environment in $VenvDir..."
     & python -m venv $VenvDir
     if ($LASTEXITCODE -ne 0) {
-        Write-Error "[CIDAS] python -m venv failed (exit $LASTEXITCODE). Is Python 3.10+ on PATH?"
+        Write-Error "`[CIDAS`] python -m venv failed (exit $LASTEXITCODE). Is Python 3.10+ on PATH?"
         exit 1
     }
     $venvPip = Join-Path $VenvDir "Scripts\pip.exe"
     & $venvPip install --quiet --upgrade pip
     & $venvPip install --quiet -e "$DaemonDir[dev]"
     if ($LASTEXITCODE -ne 0) {
-        Write-Error "[CIDAS] pip install failed (exit $LASTEXITCODE)."
+        Write-Error "`[CIDAS`] pip install failed (exit $LASTEXITCODE)."
         exit $LASTEXITCODE
     }
 }
 
 $VenvUvicorn = Join-Path $VenvDir "Scripts\uvicorn.exe"
 if (-not (Test-Path -LiteralPath $VenvUvicorn)) {
-    Write-Error "[CIDAS] uvicorn.exe missing at $VenvUvicorn — the venv may be corrupt. Delete $VenvDir and rerun."
+    Write-Error "`[CIDAS`] uvicorn.exe missing at $VenvUvicorn - the venv may be corrupt. Delete $VenvDir and rerun."
     exit 1
 }
 
-Write-Host "[CIDAS] Starting daemon on $($Host_):$Port ..."
+Write-Host "`[CIDAS`] Starting daemon on $($Host_):$Port ..."
 $proc = Start-Process -FilePath $VenvUvicorn `
     -ArgumentList @(
         "daemon.main:app",
@@ -90,28 +90,28 @@ $proc = Start-Process -FilePath $VenvUvicorn `
     -PassThru
 
 $proc.Id | Out-File -LiteralPath $PidFile -Encoding ASCII
-Write-Host "[CIDAS] Daemon PID $($proc.Id) written to $PidFile"
+Write-Host "`[CIDAS`] Daemon PID $($proc.Id) written to $PidFile"
 
 # Poll the health endpoint for up to 30 seconds, same as the bash version.
-Write-Host "[CIDAS] Waiting for daemon to be ready..."
+Write-Host "`[CIDAS`] Waiting for daemon to be ready..."
 $ready = $false
 for ($i = 0; $i -lt 30; $i++) {
     try {
         $resp = Invoke-WebRequest -Uri "http://$($Host_):$Port/api/v1/health" -UseBasicParsing -TimeoutSec 2
         if ($resp.StatusCode -eq 200) { $ready = $true; break }
-    } catch { /* not ready yet */ }
+    } catch { }
 
     if ($proc.HasExited) {
-        Write-Error "[CIDAS] Daemon process exited unexpectedly (code $($proc.ExitCode))."
+        Write-Error "`[CIDAS`] Daemon process exited unexpectedly (code $($proc.ExitCode))."
         exit 1
     }
     Start-Sleep -Seconds 1
 }
 
 if ($ready) {
-    Write-Host "[CIDAS] Daemon is ready."
+    Write-Host '[CIDAS] Daemon is ready.'
 } else {
-    Write-Warning "[CIDAS] Daemon did not respond to /api/v1/health within 30s — check logs."
+    Write-Warning '[CIDAS] Daemon did not respond to /api/v1/health within 30s - check logs.'
 }
 
-Write-Host "[CIDAS] Swagger UI -> http://$($Host_):$Port/docs"
+Write-Host "`[CIDAS`] Swagger UI -> http://$($Host_):$Port/docs"
