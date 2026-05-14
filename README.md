@@ -7,6 +7,42 @@ packages, and prompt injection in real time. Distribution is a transparent
 
 ---
 
+## How it works
+
+CIDAS intercepts `npm install` calls via a transparent shim and monitors `package.json` edits in VS Code, routing each candidate package to a local daemon that runs **three analysis pillars** concurrently. Results are cached in SQLite so repeat installs are instant. A per-project `.cidas/policy.json` file lets security leads encode block lists and trust overrides that travel with the repository.
+
+```
+npm install <pkg>  ──▶  npm-shim.js / VS Code extension
+                               │  POST /api/v1/scan
+                               ▼
+                   CIDAS Daemon  (localhost:7355)
+                   ├── Contextify  ── embedding similarity
+                   ├── Sentinel    ── registry reputation
+                   └── Shield      ── script & file scan
+                               │
+                     Aggregator ──▶ ALLOW / WARN / BLOCK
+```
+
+## Analysis pillars
+
+| Pillar | Weight | What it checks |
+|---|---|---|
+| **Contextify** | 30 % | Cosine similarity between candidate package description and existing project imports |
+| **Sentinel** | 35 % | Registry existence, package age, monthly downloads, Levenshtein typosquat distance |
+| **Shield** | 35 % | Lifecycle script patterns, tarball static file scan, README prompt-injection detection |
+
+## Decision thresholds
+
+Scores are weighted sums of the three pillar scores (0–100). The thresholds below match the defaults in `config.py` and can be overridden via `.env`.
+
+| Decision | Risk score | Behaviour |
+|---|---|---|
+| `ALLOW` | < 40 | Install proceeds silently |
+| `WARN` | 40–79 | Warning printed; install continues (confirmation prompt if policy requires it) |
+| `BLOCK` | ≥ 80 | Install aborted; `CIDAS_BYPASS=1` overrides (action is logged to audit log) |
+
+---
+
 ## Project structure
 
 ```
@@ -81,6 +117,30 @@ cidas/
 
 ---
 
+## Installation
+
+1. `git clone <repo-url> cidas && cd cidas`
+2. `cp .env.example .env`
+3. Start the daemon: `bash scripts/start-daemon.sh` (macOS/Linux) or `.\scripts\start-daemon.ps1` (Windows)
+4. Install the VS Code extension: `cd extension && npm install && npm run compile`, then press **F5** in VS Code.
+5. Install the shim: `bash intercept/install-shim.sh` (macOS/Linux) or `.\intercept\install-shim.ps1` (Windows)
+
+See the OS-specific sections below for full command sequences and verification steps.
+
+## Admin config
+
+`~/.cidas/config.json` provides machine-scoped settings that survive across environment resets. The file is read by both the daemon and the shim at startup.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `bypass_disabled` | bool | `false` | When `true`, prevents `CIDAS_BYPASS=1`; exits 1 so CI pipelines cannot be bypassed |
+| `package_file_scan` | bool | `true` | Set to `false` to skip tarball download/scan on slow or air-gapped networks |
+| `contextify_weight` | float | `0.30` | Per-machine override for the Contextify pillar weight (valid range 0.0–0.5) |
+
+For **Ollama**-powered secondary LLM verification, set `LLM_VERIFICATION_ENABLED=true` in `.env` and configure `OLLAMA_HOST` / `OLLAMA_MODEL` to point at your Ollama instance. No API key is required — all calls are local. See `.env.example` for defaults.
+
+---
+
 ## Clone & install — macOS / Linux
 
 ```bash
@@ -140,6 +200,17 @@ where.exe npm                               # → $env:USERPROFILE\.cidas\npm.cm
 To remove: `.\intercept\uninstall-shim.ps1 ; Stop-Process -Id (Get-Content .cidas.pid)`.
 
 > **WSL users:** if you prefer the bash flow inside WSL 2, follow the macOS/Linux instructions above. Make sure the native Linux `npm` resolves before the Windows one (`which npm` should not show `/mnt/c/...`); fix with `export PATH=/usr/bin:$PATH` in `~/.bashrc` if needed. WSL 1 is **not** supported — it cannot invoke `node.exe` correctly.
+
+---
+
+## Running tests
+
+```bash
+bash scripts/run-tests.sh     # all suites at once (daemon + extension + shim)
+# — or run each suite individually —
+pytest daemon/tests/          # Python daemon
+npx vitest run                # VS Code extension
+```
 
 ---
 

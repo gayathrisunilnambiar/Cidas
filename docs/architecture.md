@@ -87,6 +87,10 @@ risk_score = 0.15 × contextify + 0.40 × sentinel + 0.45 × shield
 - `40 ≤ risk_score < 80` → `WARN`
 - `risk_score ≥ 80`  → `BLOCK`
 
+### Policy Engine
+
+The Policy Engine resolves per-project security rules from `.cidas/policy.json`, walking ancestor directories (capped at ten levels) until a valid file is found. The **closest ancestor wins** — a policy at `/projects/myapp/.cidas/policy.json` takes precedence over one at `/projects/.cidas/policy.json`, enabling monorepo root baselines that individual packages can override. Rules are applied in three layers: **project policy → admin config (`~/.cidas/config.json`) → daemon defaults**, so a security lead can enforce stricter block lists without affecting other repositories on the same machine. `block_list` entries override the trust list, the SQLite cache, and all three pillar scores unconditionally; `trust_list` entries bypass all pillar analysis and are mirrored to the offline cache for shim use when the daemon is unreachable. See [docs/policy-engine.md](policy-engine.md) for the full JSON schema, merge algorithm, and formal novelty claim.
+
 ## Data flow — `npm install some-pkg`
 
 1. Shim intercepts, sends `POST /api/v1/scan {package_name: "some-pkg", project_path: …}`.

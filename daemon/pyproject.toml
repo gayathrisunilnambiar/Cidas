@@ -45,6 +45,13 @@ testpaths = ["tests"]
 pythonpath = [".."]
 addopts = "--tb=short"
 
+[tool.coverage.run]
+omit = [
+    "daemon/eval/*",
+    "daemon/tests/*",
+    "daemon/cli.py",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

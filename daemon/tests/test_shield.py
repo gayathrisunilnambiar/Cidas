@@ -338,3 +338,313 @@ async def test_llm_confirmed_injection_raises_final_score(shield: Shield) -> Non
     assert boosted.metadata["injection_score"] > baseline.metadata["injection_score"]
     assert "llm_injection_confirmed" in boosted.flags
     assert boosted.metadata["llm_reasoning"]  # non-empty
+
+
+# ── Internal helper unit tests ────────────────────────────────────────────────
+
+from daemon.pillars.shield import _node_text, _is_process_env  # noqa: E402
+
+
+def test_node_text_returns_empty_for_none() -> None:
+    """_node_text(None) returns '' without raising (line 141)."""
+    assert _node_text(None) == ""
+
+
+def test_node_text_returns_empty_on_decode_error() -> None:
+    """_node_text falls back to '' when .text.decode() raises (lines 144-145)."""
+    class _BadNode:
+        text = None  # .decode() raises AttributeError
+
+    assert _node_text(_BadNode()) == ""
+
+
+def test_is_process_env_returns_false_for_none() -> None:
+    """_is_process_env(None) returns False without raising (line 166)."""
+    assert _is_process_env(None) is False
+
+
+# ── Crypto-miner script pattern ───────────────────────────────────────────────
+
+def test_crypto_miner_pattern_detected(shield: Shield) -> None:
+    """Install script with miner strings triggers crypto_miner flag."""
+    scripts = {"preinstall": "node miner.js --algo cryptonight --pool stratum+tcp://pool.example.com:3333"}
+    score, flags = shield.primary_scan(scripts, readme="")
+    assert "crypto_miner" in flags
+    assert score > 0.0
+
+
+# ── secondary_verification stub ──────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_secondary_verification_stub_returns_zero(shield: Shield) -> None:
+    """secondary_verification returns (0.0, []) — covers the stub body (line 614)."""
+    result = await shield.secondary_verification((30.0, ["eval_usage"]), {"readme": "x"})
+    assert result == (0.0, [])
+
+
+# ── score() with package_metadata=None ───────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_score_fetches_metadata_when_none(shield: Shield) -> None:
+    """score() fetches metadata from registry when package_metadata=None (line 296)."""
+    with (
+        patch("daemon.pillars.shield.get_package_metadata",
+              new=AsyncMock(return_value={"readme": "", "description": ""})),
+        patch("daemon.pillars.shield.get_settings",
+              return_value=_settings_with_llm(enabled=False)),
+        patch.object(Shield, "scan_package_files",
+                     new=AsyncMock(return_value=(0.0, [], {"files_scanned": 0, "flags": 0, "skipped": None}))),
+    ):
+        result = await shield.score("no-meta-pkg", package_metadata=None)
+    assert isinstance(result, PillarScore)
+
+
+# ── No lifecycle scripts → zero script score ──────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_shield_score_with_no_install_scripts(shield: Shield) -> None:
+    """Package whose scripts dict has no lifecycle hooks contributes zero script score."""
+    meta = {
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {"1.0.0": {"scripts": {"test": "jest", "build": "webpack"}}},
+        "readme": "",
+        "description": "",
+    }
+    with patch("daemon.pillars.shield.get_settings",
+               return_value=_settings_with_llm(enabled=False)):
+        result = await shield.score("clean-scripts-pkg", package_metadata=meta)
+    assert result.metadata["script_score"] == 0.0
+
+
+# ── Diff analysis happy path ──────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_diff_analysis_blends_score(shield: Shield) -> None:
+    """Successful diff run blends 0.75*shield + 0.25*diff into combined score (lines 359-368, 379)."""
+    meta = {
+        "dist-tags": {"latest": "2.0.0"},
+        "versions": {
+            "2.0.0": {
+                "scripts": {},
+                "dist": {"tarball": "https://registry.example.com/pkg/-/pkg-2.0.0.tgz"},
+            }
+        },
+        "readme": "",
+        "description": "",
+    }
+    diff_result = {
+        "diff_score": 40.0,
+        "diff_flags": ["new_network_calls"],
+        "new_imports": ["axios"],
+        "new_network_calls": True,
+    }
+    with (
+        patch("daemon.pillars.shield.get_settings",
+              return_value=_settings_with_llm(enabled=False)),
+        patch("daemon.pillars.shield.get_admin_config", return_value={}),
+        patch.object(Shield, "scan_package_files",
+                     new=AsyncMock(return_value=(0.0, [], {"files_scanned": 0, "flags": 0, "skipped": None}))),
+        patch("daemon.utils.npm_registry.get_previous_version",
+              new=AsyncMock(return_value="1.0.0")),
+        patch("daemon.utils.diff_analyzer.diff_package_versions",
+              new=AsyncMock(return_value=diff_result)),
+    ):
+        result = await shield.score("some-pkg", package_metadata=meta)
+
+    assert "new_network_calls" in result.flags
+    assert result.metadata["diff_score"] == 40.0
+    assert result.metadata["new_imports"] == ["axios"]
+    assert result.metadata["new_network_calls"] is True
+
+
+# ── AST: destructuring env access (lines 218-222) ────────────────────────────
+
+@needs_ts
+def test_ast_destructuring_env_access(shield: Shield) -> None:
+    """const {env} = process triggers ast_process_env via destructuring (lines 218-221)."""
+    hits = dict(shield.ast_scan_one_file("const {env} = process;"))
+    assert "ast_process_env" in hits
+
+
+@needs_ts
+def test_ast_destructuring_process_env_access(shield: Shield) -> None:
+    """const {SECRET} = process.env triggers ast_process_env via _is_process_env(init) (line 222)."""
+    hits = dict(shield.ast_scan_one_file("const {SECRET} = process.env;"))
+    assert "ast_process_env" in hits
+
+
+# ── AST: new Function and new XMLHttpRequest (lines 254-259) ─────────────────
+
+@needs_ts
+def test_ast_new_function_detected(shield: Shield) -> None:
+    """new Function('return 1') triggers ast_eval_or_function (lines 254-257)."""
+    hits = dict(shield.ast_scan_one_file("const f = new Function('return 1');"))
+    assert "ast_eval_or_function" in hits
+
+
+@needs_ts
+def test_ast_new_xmlhttprequest_detected(shield: Shield) -> None:
+    """new XMLHttpRequest() triggers ast_network_call (lines 258-259)."""
+    hits = dict(shield.ast_scan_one_file("const xhr = new XMLHttpRequest();"))
+    assert "ast_network_call" in hits
+
+
+# ── AST: atob base64 (line 230) ───────────────────────────────────────────────
+
+@needs_ts
+def test_ast_base64_decode_detected(shield: Shield) -> None:
+    """atob(encoded) triggers ast_base64_decode (line 230)."""
+    hits = dict(shield.ast_scan_one_file("const s = atob(encoded);"))
+    assert "ast_base64_decode" in hits
+
+
+# ── AST: http.request network call (line 245) ────────────────────────────────
+
+@needs_ts
+def test_ast_http_request_network_call(shield: Shield) -> None:
+    """http.request({host:'x'}, cb) triggers ast_network_call (line 245)."""
+    src = "const http = require('http'); http.request({host: 'x'}, function(res) {});"
+    hits = dict(shield.ast_scan_one_file(src))
+    assert "ast_network_call" in hits
+
+
+# ── AST: parse() exception → parse_failed (lines 552-554) ────────────────────
+
+def test_parse_exception_returns_parse_failed(shield: Shield, monkeypatch) -> None:
+    """parser.parse() raising returns [('parse_failed', 0.0)] instead of crashing (lines 552-554)."""
+    from daemon.pillars import shield as shield_mod
+
+    class _ExplodingParser:
+        def parse(self, _src):
+            raise RuntimeError("simulated parser crash")
+
+    monkeypatch.setattr(shield_mod, "_get_js_parser", lambda: _ExplodingParser())
+    hits = dict(shield.ast_scan_one_file("anything"))
+    assert "parse_failed" in hits
+
+
+# ── Lines 122-125: _get_js_parser exception path (binding mismatch) ───────────
+
+def test_get_js_parser_exception_sets_load_failed(monkeypatch) -> None:
+    """Exception from tree_sitter_javascript.language() sets _ts_load_failed=True (lines 122-125)."""
+    import tree_sitter_javascript as _tjs
+    from daemon.pillars import shield as shield_mod
+
+    def _boom():
+        raise RuntimeError("binding mismatch")
+
+    monkeypatch.setattr(shield_mod, "_ts_parser", None)
+    monkeypatch.setattr(shield_mod, "_ts_load_failed", False)
+    monkeypatch.setattr(_tjs, "language", _boom)
+
+    result = shield_mod._get_js_parser()
+    assert result is None
+    assert shield_mod._ts_load_failed is True
+
+
+# ── Line 176: _is_process_env subscript_expression with non-process object ────
+
+def test_is_process_env_subscript_non_process_object() -> None:
+    """subscript_expression with a non-'process' object returns False (line 176)."""
+
+    class _N:
+        def __init__(self, typ: str, txt: bytes = b"") -> None:
+            self.type = typ
+            self.text = txt
+
+        def child_by_field_name(self, field: str):
+            if field == "object":
+                return _N("identifier", b"notprocess")
+            if field == "index":
+                return _N("string", b'"env"')
+            return None
+
+    assert _is_process_env(_N("subscript_expression")) is False
+
+
+# ── Line 185: _require_argument_module with None input ───────────────────────
+
+def test_require_argument_module_none_returns_none() -> None:
+    """_require_argument_module(None) hits the early guard and returns None (line 185)."""
+    from daemon.pillars.shield import _require_argument_module
+    assert _require_argument_module(None) is None
+
+
+# ── Line 191: _require_argument_module with None arguments field ──────────────
+
+def test_require_argument_module_none_args_returns_none() -> None:
+    """call_expression whose 'arguments' field is None returns None (line 191)."""
+    from daemon.pillars.shield import _require_argument_module
+
+    class _N:
+        def __init__(self, typ: str, txt: bytes = b"") -> None:
+            self.type = typ
+            self.text = txt
+
+        def child_by_field_name(self, _):
+            return None
+
+    class _RequireNode:
+        type = "call_expression"
+
+        def child_by_field_name(self, field: str):
+            if field == "function":
+                return _N("identifier", b"require")
+            return None  # arguments → None
+
+    assert _require_argument_module(_RequireNode()) is None
+
+
+# ── Lines 196-200: _require_argument_module template_string paths ─────────────
+
+@needs_ts
+def test_require_template_string_no_interpolation_flagged(shield: Shield) -> None:
+    """require(`dns`) resolves the literal to 'dns' → ast_dangerous_require (lines 196-197, 199)."""
+    hits = dict(shield.ast_scan_one_file("const d = require(`dns`);"))
+    assert "ast_dangerous_require" in hits
+
+
+@needs_ts
+def test_require_template_string_with_interpolation_not_flagged(shield: Shield) -> None:
+    """require(`${mod}`) has dynamic content → _require_argument_module returns None (lines 196-198)."""
+    hits = dict(shield.ast_scan_one_file("const d = require(`${mod}`);"))
+    assert "ast_dangerous_require" not in hits
+    assert "parse_failed" not in hits
+
+
+@needs_ts
+def test_require_non_string_arg_not_flagged(shield: Shield) -> None:
+    """require(someVar) has no string literal → _require_argument_module returns None (line 200)."""
+    hits = dict(shield.ast_scan_one_file("const d = require(someVar);"))
+    assert "ast_dangerous_require" not in hits
+    assert "parse_failed" not in hits
+
+
+# ── Lines 367-368: diff analysis exception is swallowed ──────────────────────
+
+@pytest.mark.asyncio
+async def test_diff_analysis_exception_swallowed(shield: Shield) -> None:
+    """Exception inside the diff try-block is caught; score() does not raise (lines 367-368)."""
+    meta = {
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {
+            "1.0.0": {
+                "scripts": {},
+                "dist": {"tarball": "https://registry.example.com/pkg/-/pkg-1.0.0.tgz"},
+            }
+        },
+        "readme": "",
+        "description": "",
+    }
+    with (
+        patch("daemon.pillars.shield.get_settings",
+              return_value=_settings_with_llm(enabled=False)),
+        patch("daemon.pillars.shield.get_admin_config", return_value={}),
+        patch.object(Shield, "scan_package_files",
+                     new=AsyncMock(return_value=(0.0, [], {"files_scanned": 0, "flags": 0, "skipped": None}))),
+        patch("daemon.utils.npm_registry.get_previous_version",
+              new=AsyncMock(side_effect=RuntimeError("network unreachable"))),
+    ):
+        result = await shield.score("some-pkg", package_metadata=meta)
+    assert isinstance(result, PillarScore)
+    assert result.metadata["diff_score"] == 0.0

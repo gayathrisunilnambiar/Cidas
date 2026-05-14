@@ -104,7 +104,7 @@ class Sentinel:
                 score=score,
                 confidence=0.9,
                 flags=flags,
-                metadata={"ai_suggested": False, "exists": True, **registry_signals},
+                metadata={"ai_suggested": False, "exists": True, "hallucination_check": "skipped", **registry_signals},
             )
 
         # Full hallucination-risk analysis for AI-suggested packages

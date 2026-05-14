@@ -305,7 +305,8 @@ describe("_checkOfflineCache", () => {
 
   it("returns the entry for a fresh ALLOW within TTL", () => {
     const now = new Date().toISOString();
-    stubCache({ lodash: { package_name: "lodash", verdict: "ALLOW", timestamp: now, ttl_hours: 24 } });
+    // Key format is "name@version" (or "name@latest") — mirrors daemon's record_allow.
+    stubCache({ "lodash@latest": { package_name: "lodash", verdict: "ALLOW", timestamp: now, ttl_hours: 24 } });
     const entry = shim._checkOfflineCache("lodash");
     expect(entry).not.toBeNull();
     expect(entry.verdict).toBe("ALLOW");

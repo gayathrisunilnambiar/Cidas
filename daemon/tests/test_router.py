@@ -470,3 +470,276 @@ async def test_trust_verify_reports_legacy_rows(async_client, mock_db):
     assert body["legacy_no_mac"] == 1
     assert body["tampered"] == 0
     assert body["verified"] == 1
+
+
+# ── _append_direct_deps — exception handler (lines 77-78) ────────────────────
+
+async def test_direct_deps_exception_logged_and_swallowed(async_client, mock_db, mock_pillars_low):
+    """RuntimeError from get_direct_dependencies is caught; scan still returns 200 with no deps."""
+    with patch("daemon.router.get_direct_dependencies", new=AsyncMock(side_effect=RuntimeError("registry down"))):
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "lodash",
+            "project_path": "/tmp/project",
+        })
+    assert response.status_code == 200
+    assert response.json()["direct_dependencies"] == []
+
+
+# ── Policy block_list / trust_list (lines 182-228) ───────────────────────────
+
+async def test_scan_policy_block_list_returns_block(async_client, mock_db):
+    """Package on project block_list must return BLOCK without calling any pillar."""
+    from pathlib import Path
+    policy_src = Path("/tmp/project/.cidas/policy.json")
+    with (
+        patch("daemon.router.policy.resolve", return_value=({"block_list": ["bad-pkg"]}, policy_src)),
+        patch("daemon.router._contextify.score", new=AsyncMock()) as ctx,
+    ):
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "bad-pkg",
+            "project_path": "/tmp/project",
+        })
+    assert response.status_code == 200
+    body = response.json()
+    assert body["decision"] == "BLOCK"
+    assert body["risk_score"] == 100.0
+    assert "policy_block" in body["contextify"]["flags"]
+    ctx.assert_not_called()
+
+
+async def test_scan_policy_trust_list_returns_allow(async_client, mock_db):
+    """Package on project trust_list must return ALLOW without calling any pillar."""
+    with (
+        patch("daemon.router.policy.resolve", return_value=({"trust_list": ["good-pkg"]}, None)),
+        patch("daemon.router._contextify.score", new=AsyncMock()) as ctx,
+    ):
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "good-pkg",
+            "project_path": "/tmp/project",
+        })
+    assert response.status_code == 200
+    body = response.json()
+    assert body["decision"] == "ALLOW"
+    assert body["risk_score"] == 0.0
+    assert "policy_trust" in body["contextify"]["flags"]
+    ctx.assert_not_called()
+
+
+# ── Cache hit — tamper flag injection (line 291) ──────────────────────────────
+
+async def test_cache_hit_with_tamper_flag_attached(async_client, mock_db):
+    """TAMPERED trust + cache hit: tamper_flags are injected into the cached response."""
+    from daemon.database import TrustCheckResult, TRUST_STATUS_TAMPERED
+    cached = _cached_response("some-pkg", "ALLOW")
+    tampered = TrustCheckResult(
+        status=TRUST_STATUS_TAMPERED,
+        package_name="some-pkg",
+        flags=["trust_tamper_detected"],
+    )
+    with (
+        patch("daemon.router.check_trust", new=AsyncMock(return_value=tampered)),
+        patch("daemon.router.get_cached_result", new=AsyncMock(return_value=cached)),
+        patch("daemon.router.get_direct_dependencies", new=AsyncMock(return_value={})),
+    ):
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "some-pkg",
+            "project_path": "/tmp/project",
+        })
+    assert response.status_code == 200
+    assert "trust_tamper_detected" in response.json()["trust_flags"]
+
+
+# ── Cache hit + scan_transitive (line 296) ───────────────────────────────────
+
+async def test_cache_hit_runs_transitive_when_requested(async_client, mock_db):
+    """Cache hit with scan_transitive=True still runs _append_transitive on the cached result."""
+    cached = _cached_response("cached-pkg", "ALLOW")
+    fake_deps = [{"name": "trans-dep", "version": "1.0.0", "depth": 1}]
+    low = _ps(0.0)
+    with (
+        patch("daemon.router.get_cached_result", new=AsyncMock(return_value=cached)),
+        patch("daemon.router.get_direct_dependencies", new=AsyncMock(return_value={})),
+        patch("daemon.router.resolve_transitive", new=AsyncMock(return_value=fake_deps)),
+        patch("daemon.router._sentinel.score", new=AsyncMock(return_value=low)),
+    ):
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "cached-pkg",
+            "project_path": "/tmp/project",
+            "scan_transitive": True,
+        })
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["transitive_risks"]) == 1
+    assert body["transitive_risks"][0]["name"] == "trans-dep"
+
+
+# ── _append_transitive full path (lines 84-123) ───────────────────────────────
+
+async def test_scan_transitive_deps_scored_and_returned(async_client, mock_db):
+    """scan_transitive=True triggers full transitive scan; risky dep detected in response."""
+    low = _ps(0.0)
+    risky = _ps(70.0, flags=["package_not_found"])
+    fake_deps = [
+        {"name": "evil-dep", "version": "1.0.0", "depth": 1},
+        {"name": "safe-dep", "version": "2.0.0", "depth": 2},
+    ]
+
+    async def _route_sentinel(name, *args, **kwargs):
+        return risky if name == "evil-dep" else low
+
+    with (
+        patch("daemon.router._contextify.score", new=AsyncMock(return_value=low)),
+        patch("daemon.router._sentinel.score", new=AsyncMock(side_effect=_route_sentinel)),
+        patch("daemon.router._shield.score", new=AsyncMock(return_value=low)),
+        patch("daemon.router.get_direct_dependencies", new=AsyncMock(return_value={})),
+        patch("daemon.router.resolve_transitive", new=AsyncMock(return_value=fake_deps)),
+    ):
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "some-pkg",
+            "project_path": "/tmp/project",
+            "scan_transitive": True,
+        })
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["transitive_risk_detected"] is True
+    evil = next(r for r in body["transitive_risks"] if r["name"] == "evil-dep")
+    assert evil["sentinel_score"] == 70.0
+
+
+async def test_transitive_resolve_exception_swallowed(async_client, mock_db, mock_pillars_low):
+    """RuntimeError from resolve_transitive is caught; scan still returns 200."""
+    with (
+        patch("daemon.router.get_direct_dependencies", new=AsyncMock(return_value={})),
+        patch("daemon.router.resolve_transitive", new=AsyncMock(side_effect=RuntimeError("timeout"))),
+    ):
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "some-pkg",
+            "project_path": "/tmp/project",
+            "scan_transitive": True,
+        })
+    assert response.status_code == 200
+    body = response.json()
+    assert body["transitive_risks"] is None or body["transitive_risks"] == []
+
+
+async def test_transitive_sentinel_exception_excludes_dep(async_client, mock_db):
+    """Sentinel raising for a transitive dep returns None from _score_one; dep excluded from risks."""
+    low = _ps(0.0)
+    fake_deps = [{"name": "broken-dep", "version": "1.0.0", "depth": 1}]
+
+    async def _route_sentinel(name, *args, **kwargs):
+        if name == "broken-dep":
+            raise RuntimeError("sentinel crash")
+        return low
+
+    with (
+        patch("daemon.router._contextify.score", new=AsyncMock(return_value=low)),
+        patch("daemon.router._sentinel.score", new=AsyncMock(side_effect=_route_sentinel)),
+        patch("daemon.router._shield.score", new=AsyncMock(return_value=low)),
+        patch("daemon.router.get_direct_dependencies", new=AsyncMock(return_value={})),
+        patch("daemon.router.resolve_transitive", new=AsyncMock(return_value=fake_deps)),
+    ):
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "some-pkg",
+            "project_path": "/tmp/project",
+            "scan_transitive": True,
+        })
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["transitive_risks"] == []
+    assert body["transitive_risk_detected"] is False
+
+
+# ── Policy penalties (lines 324-331) ─────────────────────────────────────────
+
+async def test_policy_low_downloads_penalty_applied(async_client, mock_db):
+    """min_monthly_downloads policy penalty adds 15 pts for AI-suggested with low DLs."""
+    sen = PillarScore(score=0.0, confidence=0.9, flags=[], metadata={"monthly_downloads": 50})
+    with (
+        patch("daemon.router.policy.resolve", return_value=({"min_monthly_downloads": 1000}, None)),
+        patch("daemon.router._contextify.score", new=AsyncMock(return_value=_ps(0.0))),
+        patch("daemon.router._sentinel.score", new=AsyncMock(return_value=sen)),
+        patch("daemon.router._shield.score", new=AsyncMock(return_value=_ps(0.0))),
+        patch("daemon.router.get_direct_dependencies", new=AsyncMock(return_value={})),
+    ):
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "new-ai-pkg",
+            "project_path": "/tmp/project",
+            "ai_suggested": True,
+        })
+    assert response.status_code == 200
+    body = response.json()
+    assert "policy_low_downloads" in body["sentinel"]["flags"]
+    assert body["risk_score"] >= 15.0
+
+
+async def test_policy_no_repository_penalty_applied(async_client, mock_db):
+    """require_repository_link policy penalty adds 10 pts when sentinel reports no repo."""
+    sen = PillarScore(score=0.0, confidence=0.9, flags=[], metadata={"has_repository": False})
+    with (
+        patch("daemon.router.policy.resolve", return_value=({"require_repository_link": True}, None)),
+        patch("daemon.router._contextify.score", new=AsyncMock(return_value=_ps(0.0))),
+        patch("daemon.router._sentinel.score", new=AsyncMock(return_value=sen)),
+        patch("daemon.router._shield.score", new=AsyncMock(return_value=_ps(0.0))),
+        patch("daemon.router.get_direct_dependencies", new=AsyncMock(return_value={})),
+    ):
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "no-repo-pkg",
+            "project_path": "/tmp/project",
+        })
+    assert response.status_code == 200
+    body = response.json()
+    assert "policy_no_repository" in body["sentinel"]["flags"]
+    assert body["risk_score"] >= 10.0
+
+
+# ── GET /policy (lines 478-479) ───────────────────────────────────────────────
+
+async def test_policy_endpoint_returns_resolved_policy(async_client):
+    """GET /api/v1/policy returns merged policy dict and source file path."""
+    from pathlib import Path
+    merged = {"warn_requires_confirmation": True, "block_list": ["evil-dep"]}
+    source = Path("/tmp/project/.cidas/policy.json")
+    with patch("daemon.router.policy.resolve", return_value=(merged, source)):
+        response = await async_client.get("/api/v1/policy?project_path=/tmp/project")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["project_path"] == "/tmp/project"
+    assert body["policy_file"] == str(source)
+    assert body["resolved"]["warn_requires_confirmation"] is True
+
+
+async def test_policy_endpoint_null_file_when_no_policy_found(async_client):
+    """GET /api/v1/policy returns policy_file=null when no .cidas/policy.json found."""
+    with patch("daemon.router.policy.resolve", return_value=({}, None)):
+        response = await async_client.get("/api/v1/policy?project_path=/tmp/noproject")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["policy_file"] is None
+    assert body["resolved"] == {}
+
+
+# ── POST /audit/override (lines 500-514) ─────────────────────────────────────
+
+async def test_audit_override_logs_and_returns_success(async_client, mock_db):
+    """POST /api/v1/audit/override records the override event and returns logged=True."""
+    response = await async_client.post("/api/v1/audit/override", json={
+        "package_name": "evil-pkg",
+        "version": "1.0.0",
+        "verdict_was": "BLOCK",
+    })
+    assert response.status_code == 200
+    body = response.json()
+    assert body["logged"] is True
+    assert body["package"] == "evil-pkg@1.0.0"
+    assert body["event"] == "user_override"
+
+
+async def test_audit_override_missing_package_name_returns_422(async_client, mock_db):
+    """POST /api/v1/audit/override without package_name must return 422."""
+    response = await async_client.post("/api/v1/audit/override", json={
+        "verdict_was": "WARN",
+    })
+    assert response.status_code == 422

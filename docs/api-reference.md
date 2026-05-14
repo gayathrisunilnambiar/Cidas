@@ -98,6 +98,103 @@ Purge all expired scan cache entries.
 
 ---
 
+## GET /audit
+
+Query structured scan records from the audit log.  Auth required (Bearer token).
+
+**Query parameters**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `verdict` | string | No | Filter by verdict: `ALLOW`, `WARN`, or `BLOCK` |
+| `package` | string | No | Filter by package name (without version) |
+| `since` | string | No | Return only records newer than this ISO-8601 timestamp |
+| `last` | integer | No | Maximum records to return (default `100`, max `1000`) |
+
+**Response 200**
+
+```json
+{
+  "events": [
+    {
+      "ts": "2026-05-14T10:00:00+00:00",
+      "package": "lodash@4.17.21",
+      "verdict": "ALLOW",
+      "score": 2.7,
+      "signals": [],
+      "ai_suggested": false,
+      "project_path": "/home/user/myapp",
+      "cached": false
+    }
+  ],
+  "total": 1
+}
+```
+
+**Response 422** — `verdict` is not one of `ALLOW`, `WARN`, `BLOCK`.
+
+**Example**
+
+```bash
+curl -s "http://127.0.0.1:7355/api/v1/audit?verdict=BLOCK&last=20" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+---
+
+## GET /policy
+
+Return the resolved project policy for a given path.  Auth required.
+
+**Query parameters**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `project_path` | string | **Yes** | Absolute path of the project to resolve policy for |
+
+**Response 200**
+
+```json
+{
+  "project_path": "/home/user/myapp",
+  "policy_file": "/home/user/myapp/.cidas/policy.json",
+  "resolved": {
+    "block_list": ["bad-pkg"],
+    "trust_list": [],
+    "warn_requires_confirmation": true
+  }
+}
+```
+
+`policy_file` is `null` when no `.cidas/policy.json` was found in any ancestor directory.
+
+---
+
+## POST /audit/override
+
+Record a user "Proceed Anyway" override event.  Called by the VS Code extension
+when a developer proceeds past a WARN or BLOCK dialog.
+
+**Request body**
+
+```json
+{
+  "package_name": "lodahs",
+  "version": "1.0.0",
+  "verdict_was": "WARN"
+}
+```
+
+**Response 200**
+
+```json
+{ "logged": true, "package": "lodahs@1.0.0", "event": "user_override" }
+```
+
+**Response 422** — `package_name` missing from body.
+
+---
+
 ## Timing header
 
 Every response includes `X-CIDAS-Latency-Ms` showing server-side processing

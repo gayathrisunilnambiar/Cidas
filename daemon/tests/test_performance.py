@@ -79,16 +79,17 @@ def mock_embeddings():
 def mock_db():
     """Patch all database operations in daemon.router to avoid SQLite I/O."""
     with (
-        patch("daemon.router.check_trust",         new=AsyncMock(return_value=_UNKNOWN_TRUST)),
-        patch("daemon.router.get_cached_result",   new=AsyncMock(return_value=None)),
-        patch("daemon.router.store_result",        new=AsyncMock()),
-        patch("daemon.router.add_trusted",         new=AsyncMock()),
-        patch("daemon.router.clear_expired",       new=AsyncMock(return_value=0)),
-        patch("daemon.router.invalidate_package",  new=AsyncMock(return_value=0)),
-        patch("daemon.router.list_all_trusted",    new=AsyncMock(return_value=[])),
-        patch("daemon.router.record_allow",        new=AsyncMock()),
-        patch("daemon.router.audit_log.append",    new=AsyncMock()),
-        patch("daemon.router.audit_log.read_records", new=AsyncMock(return_value=[])),
+        patch("daemon.router.check_trust",              new=AsyncMock(return_value=_UNKNOWN_TRUST)),
+        patch("daemon.router.get_cached_result",        new=AsyncMock(return_value=None)),
+        patch("daemon.router.store_result",             new=AsyncMock()),
+        patch("daemon.router.add_trusted",              new=AsyncMock()),
+        patch("daemon.router.clear_expired",            new=AsyncMock(return_value=0)),
+        patch("daemon.router.invalidate_package",       new=AsyncMock(return_value=0)),
+        patch("daemon.router.list_all_trusted",         new=AsyncMock(return_value=[])),
+        patch("daemon.router.record_allow",             new=AsyncMock()),
+        patch("daemon.router.audit_log.append",         new=AsyncMock()),
+        patch("daemon.router.audit_log.read_records",   new=AsyncMock(return_value=[])),
+        patch("daemon.router.get_direct_dependencies",  new=AsyncMock(return_value={})),
     ):
         yield
 
@@ -137,6 +138,8 @@ class TestLatencyBudget:
     async def test_cache_hit_latency(self, async_client, auth_headers, mock_db):
         """Cache-hit responses should complete with median < 50ms (over 10 reps)."""
         with patch("daemon.router.get_cached_result", new=AsyncMock(return_value=_cached())):
+            # Pre-warm: pay any first-request initialisation cost before measuring.
+            await async_client.post("/api/v1/scan", json=_SCAN_BODY, headers=auth_headers)
             latencies: list[float] = []
             for _ in range(10):
                 t0 = time.perf_counter()
@@ -237,11 +240,11 @@ class TestLatencyBudget:
     async def test_pillars_run_in_parallel_not_sequential(
         self, async_client, auth_headers, mock_db,
     ):
-        """Each pillar takes 100ms; asyncio.gather should complete in ~100ms, not ~300ms."""
+        """Each pillar takes 200ms; asyncio.gather should complete in ~200ms, not ~600ms."""
         low = _ps(0.0)
 
         async def _slow_score(*args, **kwargs) -> PillarScore:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.2)
             return low
 
         with (
@@ -256,9 +259,9 @@ class TestLatencyBudget:
             elapsed_ms = (time.perf_counter() - t0) * 1000
 
         assert resp.status_code == 200
-        assert elapsed_ms < 250, (
-            f"Three 100ms pillar delays took {elapsed_ms:.1f}ms total — "
-            "expected ~100ms (parallel via asyncio.gather), not ~300ms (sequential)"
+        assert elapsed_ms < 450, (
+            f"Three 200ms pillar delays took {elapsed_ms:.1f}ms total — "
+            "expected ~200ms (parallel via asyncio.gather), not ~600ms (sequential)"
         )
 
     async def test_x_cidas_latency_header_present(

@@ -21,19 +21,34 @@ $RealNpmFile = Join-Path $CidasDir "real-npm"
 Write-Host "[CIDAS] Installing npm shim..."
 
 # Locate the real npm. Get-Command resolves the shim itself once installed,
-# so we filter to executables NOT in our install dir.
+# so we filter to executables NOT in our install dir. Prefer .cmd over .ps1
+# because Node.js child_process.spawnSync can execute .cmd directly on Windows
+# but cannot execute .ps1 files without a powershell.exe wrapper.
 $realNpm = $null
+$candidates = @()
 foreach ($cmd in (Get-Command npm -All -ErrorAction SilentlyContinue)) {
     $src = $cmd.Source
     if ($src -and -not $src.StartsWith($CidasDir, [StringComparison]::OrdinalIgnoreCase)) {
-        $realNpm = $src
-        break
+        $candidates += $src
     }
+}
+# Pick the first .cmd candidate; fall back to the first non-.ps1; then any.
+foreach ($src in $candidates) {
+    if ($src -match '\.cmd$') { $realNpm = $src; break }
+}
+if (-not $realNpm) {
+    foreach ($src in $candidates) {
+        if ($src -notmatch '\.ps1$') { $realNpm = $src; break }
+    }
+}
+if (-not $realNpm -and $candidates.Count -gt 0) {
+    $realNpm = $candidates[0]
 }
 if (-not $realNpm) {
     Write-Error "[CIDAS] npm not found on PATH. Install Node.js first."
     exit 1
 }
+Write-Host "[CIDAS] Real npm -> $realNpm"
 
 # Guard: refuse to wrap our own wrapper (catches a reinstall where the
 # previous run left ~/.cidas first on PATH but real npm has since been
