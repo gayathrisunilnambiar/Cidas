@@ -294,11 +294,12 @@ function _passthrough() {
 }
 
 /**
- * Print a one-line disk-footprint summary plus any size/space warnings.
+ * Print a structured disk-footprint block plus any size/space warnings.
  *
- * Writes the info line to stdout so it flows with other ALLOW/dep lines.
- * Warnings (large install, insufficient space, high dep count) go to stderr
- * so they stand out alongside other risk signals.
+ * Writes an aligned key : value table to stdout showing all seven fields
+ * returned by the daemon so the developer can see the full picture at a
+ * glance. Warnings (large install, insufficient space, high dep count) go
+ * to stderr so they stand out alongside other risk signals.
  *
  * Silent when disk_footprint is null (check disabled) or when the check
  * failed on the daemon side (disk_check_unavailable flag).
@@ -308,26 +309,33 @@ function _printDiskFootprint(disk) {
   const flags = Array.isArray(disk.flags) ? disk.flags : [];
   if (flags.includes("disk_check_unavailable")) return;
 
-  const sizeStr = flags.includes("size_unknown")
-    ? "size unknown"
-    : `~${disk.estimated_install_mb} MB`;
-  const availMB = disk.available_disk_mb || 0;
-  const availStr = availMB > 0
-    ? `${Math.round(availMB)} MB free`
-    : "free space unknown";
-  const fitIcon = disk.will_fit
-    ? "\x1b[32m✓\x1b[0m"
-    : "\x1b[31m✗\x1b[0m";
+  const KW  = 22;
+  const row = (key, val) => `  ${key.padEnd(KW)}: ${val}`;
 
-  process.stdout.write(
-    `\x1b[36m[CIDAS]\x1b[0m Disk: ${sizeStr}  (${availStr})  ${fitIcon}\n`
-  );
+  const sizeVal    = flags.includes("size_unknown") ? "unknown" : String(disk.estimated_install_mb);
+  const fitColor   = disk.will_fit ? "\x1b[32m" : "\x1b[31m";
+  const fitMark    = disk.will_fit ? "✓" : "✗";
+  const score      = disk.disk_risk_score || 0;
+  const scoreColor = score >= 100 ? "\x1b[31m" : score >= 30 ? "\x1b[33m" : "\x1b[32m";
+  const flagsStr   = flags.length ? `\x1b[33m${JSON.stringify(flags)}\x1b[0m` : "[]";
+
+  process.stdout.write([
+    `\x1b[36m[CIDAS]\x1b[0m Disk footprint:`,
+    row("estimated_install_mb", sizeVal),
+    row("available_disk_mb",    String(disk.available_disk_mb || 0)),
+    row("node_modules_bytes",   String(disk.node_modules_bytes || 0)),
+    row("dep_count",            String(disk.dep_count || 0)),
+    row("will_fit",             `${fitColor}${fitMark} ${disk.will_fit}\x1b[0m`),
+    row("flags",                flagsStr),
+    row("disk_risk_score",      `${scoreColor}${score}\x1b[0m`),
+    "",
+  ].join("\n"));
 
   if (!disk.will_fit) {
     process.stderr.write(
       `\x1b[31m[CIDAS DISK WARNING]\x1b[0m Insufficient disk space — ` +
       `install requires ~${disk.estimated_install_mb} MB but only ` +
-      `~${Math.round(availMB)} MB is free.\n`
+      `~${Math.round(disk.available_disk_mb || 0)} MB is free.\n`
     );
   } else if (flags.includes("very_large_install")) {
     process.stderr.write(

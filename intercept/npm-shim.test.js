@@ -586,15 +586,15 @@ describe("_printDiskFootprint", () => {
     shim._printDiskFootprint(_disk());
     const out = stdoutSpy.mock.calls.map((c) => c[0]).join("");
     expect(out).toContain("[CIDAS]");
-    expect(out).toContain("5");           // estimated_install_mb
-    expect(out).toContain("MB");
+    expect(out).toContain("Disk footprint");
+    expect(out).toContain("5");           // estimated_install_mb value
     expect(stderrSpy).not.toHaveBeenCalled();
   });
 
   it("shows 'size unknown' in the info line when size_unknown flag is set", () => {
     shim._printDiskFootprint(_disk({ estimated_install_mb: 0, flags: ["size_unknown"] }));
     const out = stdoutSpy.mock.calls.map((c) => c[0]).join("");
-    expect(out).toContain("size unknown");
+    expect(out).toContain("unknown");
   });
 
   it("prints a red DISK WARNING to stderr when will_fit is false", () => {
@@ -657,6 +657,6 @@ describe("_printDiskFootprint", () => {
     shim._printDiskFootprint(_disk({ available_disk_mb: 4096.0 }));
     const out = stdoutSpy.mock.calls.map((c) => c[0]).join("");
     expect(out).toContain("4096");
-    expect(out).toContain("MB free");
+    expect(out).toContain("available_disk_mb");
   });
 });
