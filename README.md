@@ -1,107 +1,52 @@
 # CIDAS — CI Dependency Analysis & Screening
 
-A VS Code extension paired with a local Python daemon that screens npm packages
-**before** they are installed, catching typosquatting, malware, AI-hallucinated
-packages, and prompt injection in real time. Distribution is a transparent
-`npm` shim, with team-wide policy carried in the repo via `.cidas/policy.json`.
-
----
-
-## How it works
-
-CIDAS intercepts `npm install` calls via a transparent shim and monitors `package.json` edits in VS Code, routing each candidate package to a local daemon that runs **three analysis pillars** concurrently. Results are cached in SQLite so repeat installs are instant. A per-project `.cidas/policy.json` file lets security leads encode block lists and trust overrides that travel with the repository.
+A VS Code extension + local daemon that screens npm packages for malware, typosquatting, and AI hallucinations before they are installed.
 
 ```
-npm install <pkg>  ──▶  npm-shim.js / VS Code extension
-                               │  POST /api/v1/scan
-                               ▼
-                   CIDAS Daemon  (localhost:7355)
-                   ├── Contextify  ── embedding similarity
-                   ├── Sentinel    ── registry reputation
-                   └── Shield      ── script & file scan
-                               │
-                     Aggregator ──▶ ALLOW / WARN / BLOCK
+npm install <pkg>
+      │
+      ▼
+npm shim (intercept/)
+      │ POST /scan
+      ▼
+Python daemon (localhost:7355)
+  ├── Contextify   — project context match
+  ├── Sentinel     — registry reputation + typosquat
+  ├── Shield       — script scan + tarball AST + diff
+  └── Aggregator   — ALLOW / WARN / BLOCK
+      │
+      ▼
+VS Code extension — inline verdict + notification
 ```
 
-## Analysis pillars
+## Why CIDAS exists alongside npm audit, Socket, and Snyk
 
-| Pillar | Weight | What it checks |
-|---|---|---|
-| **Contextify** | 30 % | Cosine similarity between candidate package description and existing project imports |
-| **Sentinel** | 35 % | Registry existence, package age, monthly downloads, Levenshtein typosquat distance |
-| **Shield** | 35 % | Lifecycle script patterns, tarball static file scan, README prompt-injection detection |
+npm audit only catches known CVEs after a vulnerability is reported. Socket.dev detects malicious install scripts before install but has no awareness of your project or of AI-suggested package names. npq runs pre-install heuristics but is stateless and context-blind. None of them address the three newest attack patterns.
 
-## Decision thresholds
+| Capability | npm audit | Socket | npq | Snyk | CIDAS |
+|---|---|---|---|---|---|
+| Pre-install interception | ✗ | ✓ | ✓ | ✗ | ✓ |
+| Lifecycle script scan | ✗ | ✓ | ✗ | ✗ | ✓ |
+| Tarball AST file scan | ✗ | ✗ | ✗ | ✗ | ✓ |
+| Typosquat detection | ✗ | ✓ | ✗ | ✗ | ✓ |
+| Project context scoring | ✗ | ✗ | ✗ | ✗ | ✓ |
+| AI suggestion provenance | ✗ | ✗ | ✗ | ✗ | ✓ |
+| Hallucination guard | ✗ | ✗ | ✗ | ✗ | ✓ |
+| Cross-version diff analysis | ✗ | ✗ | ✗ | ✗ | ✓ |
+| Adversarial README detection | ✗ | ✗ | ✗ | ✗ | ✓ |
+| Fully on-device | ✓ | ✗ | ✓ | ✗ | ✓ |
+| VS Code integration | ✗ | ✗ | ✗ | ✓* | ✓ |
+| Per-project policy file | ✗ | ✗ | ✗ | ✗ | ✓ |
 
-Scores are weighted sums of the three pillar scores (0–100). The thresholds below match the defaults in `config.py` and can be overridden via `.env`.
+*Snyk VS Code plugin surfaces post-install findings only.
 
-| Decision | Risk score | Behaviour |
-|---|---|---|
-| `ALLOW` | < 40 | Install proceeds silently |
-| `WARN` | 40–79 | Warning printed; install continues (confirmation prompt if policy requires it) |
-| `BLOCK` | ≥ 80 | Install aborted; `CIDAS_BYPASS=1` overrides (action is logged to audit log) |
+### The five gaps CIDAS fills
 
----
-
-## Project structure
-
-```
-cidas/
-├── daemon/                 Python FastAPI daemon
-│   ├── pillars/            Four analysis pillars
-│   │   ├── contextify.py   Embedding-based project context
-│   │   ├── sentinel.py     Registry reputation & typosquat
-│   │   ├── shield.py       Script scanning & tarball file scan
-│   │   └── aggregator.py   Weighted scoring & verdict
-│   ├── utils/              Shared utilities
-│   │   ├── audit_log.py    Append-only JSONL audit log with rotation
-│   │   ├── policy.py       .cidas/policy.json discovery + validation
-│   │   ├── offline_cache.py name@version offline-allow cache
-│   │   ├── npm_registry.py Registry lookups + tarball download
-│   │   ├── embeddings.py   Sentence embedding helpers
-│   │   ├── diff_analyzer.py Cross-version diff: new imports, env access, network calls
-│   │   ├── llm_verifier.py Optional Ollama second-pass for README/script text
-│   │   ├── transitive.py   Recursive npm dependency resolution
-│   │   └── logger.py       Structured logging
-│   ├── eval/               Benchmark harness (no daemon code changes needed)
-│   │   ├── build_corpus.py Generates the four labelled JSONL corpora
-│   │   ├── evaluate.py     Posts corpora to live daemon; computes precision/recall/F1
-│   │   ├── ablation.py     8-combination pillar weight study; ASCII + Markdown tables
-│   │   ├── corpus/         39 malicious / 50 typosquat / 23 hallucinated / 50 benign
-│   │   └── results/        JSON + Markdown output from evaluation runs
-│   ├── tests/              289 pytest tests (279 passing, 6 skipped, 4 pre-existing failures)
-│   ├── auth.py             Bearer token generation & verification
-│   ├── cli.py              `python -m daemon.cli audit ...`
-│   ├── config.py           Pydantic settings from .env
-│   ├── database.py         SQLite scan cache (name@version) & HMAC trust list
-│   ├── models.py           Shared Pydantic request/response models
-│   ├── router.py           FastAPI endpoints
-│   └── main.py             App factory & uvicorn entry point
-├── extension/              VS Code extension (TypeScript)
-│   └── src/
-│       ├── daemonClient.ts HTTP client with fail-open fallback
-│       ├── interceptor.ts  package.json watcher & dep diffing
-│       ├── sentinelHook.ts terminal listener for AI-suggested packages
-│       ├── statusBar.ts    Colour-coded status bar manager
-│       ├── notificationUI.ts  Warn/block/allow dialogs & webview panel
-│       └── extension.ts    Activation & command registration
-├── intercept/              npm shim (cross-platform)
-│   ├── npm-shim.js         Transparent npm wrapper with SHA-256 self-check
-│   ├── install-shim.sh     macOS/Linux installer
-│   ├── install-shim.ps1    Windows installer (user-scope PATH + npm.cmd wrapper)
-│   ├── uninstall-shim.sh   macOS/Linux removal
-│   ├── uninstall-shim.ps1  Windows removal
-│   └── sign-shim.sh        Regenerates ~/.cidas/shim.sha256 on macOS/Linux
-│                           (on Windows use `node npm-shim.js --sign`)
-├── scripts/
-│   ├── start-daemon.sh     Daemon launcher with venv bootstrap (macOS/Linux)
-│   ├── start-daemon.ps1    Daemon launcher (Windows)
-│   └── run-tests.sh        Combined pytest + vitest runner
-└── .cidas/
-    └── policy.schema.json  JSON Schema for project policy files
-```
-
----
+1. **Project-context scoring** — No existing tool asks whether a package makes sense for your specific project. A crypto-mining library flagged identically whether it is being installed into a children's game or a financial trading system. CIDAS scores packages relative to your project's existing dependency fingerprint.
+2. **AI suggestion provenance** — When Copilot or Cursor suggests a package name that does not exist, attackers can register it with malicious code. CIDAS monitors VS Code language model events and applies a stricter hallucination guard — download count, creation date, registry existence — to any AI-suggested package name. Human-typed packages use a lighter check.
+3. **Cross-version differential analysis** — The event-stream attack (2018), ua-parser-js (2021), and node-ipc (2022) all followed the same pattern: a benign package's next version introduced a hidden payload. CIDAS diffs the AST capability sets of the current version against the previous release, flagging new dangerous imports, new process.env access, and new network calls that were absent before.
+4. **Adversarial scanner manipulation** — LLM-based scanners can be primed to dismiss legitimate-looking flags by a crafted README. CIDAS uses a secondary local LLM (Ollama, on-device) to independently evaluate README content as data rather than instructions, resistant to prompt injection by design.
+5. **Repository-committable policy** — Teams can commit a .cidas/policy.json to enforce project-specific rules: block lists, trust lists, minimum download thresholds, and Contextify weight overrides. Policy travels with the codebase and overrides global tool configuration.
 
 ## Prerequisites
 
@@ -111,371 +56,203 @@ cidas/
 | Node.js | 18+ |
 | npm | 9+ |
 | VS Code | 1.89+ |
-| PowerShell (Windows only) | 5.1+ or PowerShell Core 7+ |
 
-> **First scan is slow:** on first run the daemon downloads the `all-MiniLM-L6-v2` embedding model (~90 MB) from HuggingFace. Expect 1–3 minutes before the first response. All subsequent scans are fast. To avoid HuggingFace rate-limit warnings, set `HF_TOKEN` in your `.env` (optional).
+> **Windows:** Run bash commands in Git Bash or WSL2. The daemon runs natively on Windows via PowerShell.
 
----
+## Quickstart
 
-## Installation
-
-1. `git clone <repo-url> cidas && cd cidas`
-2. `cp .env.example .env`
-3. Start the daemon: `bash scripts/start-daemon.sh` (macOS/Linux) or `.\scripts\start-daemon.ps1` (Windows)
-4. Install the VS Code extension: `cd extension && npm install && npm run compile`, then press **F5** in VS Code.
-5. Install the shim: `bash intercept/install-shim.sh` (macOS/Linux) or `.\intercept\install-shim.ps1` (Windows)
-
-See the OS-specific sections below for full command sequences and verification steps.
-
-## Admin config
-
-`~/.cidas/config.json` provides machine-scoped settings that survive across environment resets. The file is read by both the daemon and the shim at startup.
-
-| Key | Type | Default | Description |
-|---|---|---|---|
-| `bypass_disabled` | bool | `false` | When `true`, prevents `CIDAS_BYPASS=1`; exits 1 so CI pipelines cannot be bypassed |
-| `package_file_scan` | bool | `true` | Set to `false` to skip tarball download/scan on slow or air-gapped networks |
-| `contextify_weight` | float | `0.30` | Per-machine override for the Contextify pillar weight (valid range 0.0–0.5) |
-
-For **Ollama**-powered secondary LLM verification, set `LLM_VERIFICATION_ENABLED=true` in `.env` and configure `OLLAMA_HOST` / `OLLAMA_MODEL` to point at your Ollama instance. No API key is required — all calls are local. See `.env.example` for defaults.
-
----
-
-## Clone & install — macOS / Linux
-
+### 1. Clone and configure
 ```bash
 git clone <repo-url> cidas
 cd cidas
-
-# 1. Daemon
 cp .env.example .env
-bash scripts/start-daemon.sh                # creates daemon/.venv, installs deps, starts on :7355
-curl http://127.0.0.1:7355/api/v1/health    # → {"status":"ok",...}
+```
+Defaults work out of the box for local testing.
 
-# 2. VS Code extension
-cd extension && npm install && npm run compile && cd ..
-# In VS Code: open the cidas folder, press F5 to launch the extension host.
+### 2. Start the daemon
 
-# 3. npm shim
+**macOS / Linux / WSL:**
+```bash
+bash scripts/start-daemon.sh
+```
+**Windows (PowerShell):**
+```powershell
+.\scripts\start-daemon.ps1
+```
+Verify:
+```bash
+curl http://127.0.0.1:7355/api/v1/health
+# → {"status":"ok","version":"0.1.0"}
+```
+
+### 3. Install the VS Code extension
+```bash
+cd extension
+npm install
+npm run compile
+```
+Open the `cidas` folder in VS Code and press **F5**.
+Check the status bar — it should show `$(shield) CIDAS ready`.
+
+### 4. Install the npm shim
+
+**macOS / Linux / WSL:**
+```bash
 bash intercept/install-shim.sh
-exec bash                                   # reload PATH
-which npm                                   # → ~/.cidas/npm
+source ~/.bashrc  # or source ~/.zshrc
 ```
-
-To remove: `bash intercept/uninstall-shim.sh && kill $(cat .cidas.pid)`.
-
----
-
-## Clone & install — Windows (native PowerShell)
-
-Use the `.ps1` scripts instead of the `.sh` ones. WSL 2 is no longer required — the daemon, shim, and PowerShell installers all run natively.
-
-If you've never run a local PowerShell script before, you may need to relax the execution policy for the current user once:
-
+**Windows (PowerShell):**
 ```powershell
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-```
-
-Then:
-
-```powershell
-git clone <repo-url> cidas
-cd cidas
-
-# 1. Daemon
-Copy-Item .env.example .env
-.\scripts\start-daemon.ps1                  # creates daemon\.venv, installs deps, starts on :7355
-Invoke-WebRequest http://127.0.0.1:7355/api/v1/health | Select-Object -Expand Content
-
-# 2. VS Code extension
-cd extension ; npm install ; npm run compile ; cd ..
-# In VS Code: open the cidas folder, press F5 to launch the extension host.
-
-# 3. npm shim
 .\intercept\install-shim.ps1
-# Open a new PowerShell window so the new user PATH takes effect, then:
-where.exe npm                               # → $env:USERPROFILE\.cidas\npm.cmd
+```
+Verify:
+```bash
+which npm
+# → /home/<user>/.cidas/npm  (Linux/macOS)
 ```
 
-To remove: `.\intercept\uninstall-shim.ps1 ; Stop-Process -Id (Get-Content .cidas.pid)`.
+## Testing the extension
 
-> **WSL users:** if you prefer the bash flow inside WSL 2, follow the macOS/Linux instructions above. Make sure the native Linux `npm` resolves before the Windows one (`which npm` should not show `/mnt/c/...`); fix with `export PATH=/usr/bin:$PATH` in `~/.bashrc` if needed. WSL 1 is **not** supported — it cannot invoke `node.exe` correctly.
+### Safe package (expect ALLOW)
+```bash
+TOKEN=$(cat ~/.cidas/daemon.token)
+npm install lodash
+# [CIDAS ALLOW] Package passed screening (risk score ~8/100)
+```
 
----
+### Typosquat (expect WARN)
+```bash
+npm install lodahs
+# [CIDAS WARNING] typosquat_detected — similar to lodash
+```
+
+### AI-hallucinated package (expect BLOCK)
+```bash
+TOKEN=$(cat ~/.cidas/daemon.token)
+curl -s -X POST http://127.0.0.1:7355/api/v1/scan \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"package_name":"totally-fake-pkg-xyz999",
+       "project_path":".","ai_suggested":true}' \
+  | python3 -m json.tool
+# "decision": "BLOCK", risk_score >= 80
+```
+
+### Emergency bypass (if CIDAS blocks a known-safe package)
+```bash
+CIDAS_BYPASS=1 npm install <package>
+```
+
+## How decisions are made
+
+Each scan produces a weighted score (0–100) across three pillars. Scores are combined and compared to two thresholds.
+
+| Score | Decision | Behaviour |
+|---|---|---|
+| 0–39 | ALLOW | Silent pass |
+| 40–79 | WARN | Warning dialog, install continues |
+| 80–100 | BLOCK | Install aborted |
+
+| Pillar | Weight | What it checks |
+|---|---|---|
+| Contextify | 30% | Semantic similarity to your project's existing dependencies |
+| Sentinel | 35% | Registry reputation, package age, download count, typosquat detection, AI hallucination guard |
+| Shield | 35% | Lifecycle scripts, tarball AST scan, prompt injection in README, cross-version capability diff |
+
+## Trust list and policy
+
+### Trusting a package permanently
+```bash
+TOKEN=$(cat ~/.cidas/daemon.token)
+curl -s -X POST http://127.0.0.1:7355/api/v1/trust \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"package_name":"my-internal-lib"}'
+```
+
+### Per-project policy file
+Create `.cidas/policy.json` in your project root:
+```json
+{
+  "version": 1,
+  "block_list": ["known-bad-package"],
+  "trust_list": ["my-internal-lib"],
+  "warn_requires_confirmation": true
+}
+```
+Policy is discovered by walking up ancestor directories.
+See `docs/policy-engine.md` for the full schema.
 
 ## Running tests
 
 ```bash
-bash scripts/run-tests.sh     # all suites at once (daemon + extension + shim)
-# — or run each suite individually —
-pytest daemon/tests/          # Python daemon
-npx vitest run                # VS Code extension
-```
-
----
-
-## Run automated tests
-
-```bash
-# Daemon (289 tests)
-source daemon/.venv/bin/activate
-pytest daemon/tests/ -v --cov=daemon --cov-report=term-missing
-
-# Extension (~80 tests)
-cd extension && npx vitest run --coverage --reporter=verbose && cd ..
-
-# npm shim (~50 tests)
-cd intercept && npm test && cd ..
-
-# All at once
+# All tests (daemon + extension + shim)
 bash scripts/run-tests.sh
-```
 
----
-
-## Manual functionality test
-
-The remainder of this document is a step-by-step walkthrough to verify every
-feature works end-to-end. Run from the repo root.
-
-### 0. Prepare a session
-
-```bash
+# Daemon only
 source daemon/.venv/bin/activate
-bash scripts/start-daemon.sh      # waits until /api/v1/health responds (up to 30 s)
-export TOKEN=$(cat ~/.cidas/daemon.token)
+pytest daemon/tests/ -v --cov=daemon
+
+# Extension only (run from Windows or WSL with
+# Linux-native node_modules)
+cd extension && npx vitest run --coverage
+
+# Shim only
+cd intercept && npx jest --coverage
 ```
 
-> The script now polls `/api/v1/health` and prints `[CIDAS] Daemon is ready.` before returning — no need to sleep or retry manually.
+Current coverage: 357 daemon tests (91%), 99 extension tests (81%), 45 shim tests.
 
-### 1. Smoke test — three verdicts
+## Configuration
 
+| Variable | Default | Effect |
+|---|---|---|
+| BLOCK_THRESHOLD | 80 | Risk score that triggers BLOCK |
+| WARN_THRESHOLD | 40 | Risk score that triggers WARN |
+| CONTEXT_WEIGHT | 0.30 | Contextify pillar weight |
+| SENTINEL_WEIGHT | 0.35 | Sentinel pillar weight |
+| SHIELD_WEIGHT | 0.35 | Shield pillar weight |
+| LLM_VERIFICATION_ENABLED | false | Enable Ollama-based README second pass |
+| OLLAMA_HOST | http://localhost:11434 | Ollama server URL |
+| OLLAMA_MODEL | phi3:mini | Local model to use |
+| DISK_CHECK_ENABLED | true | Enable disk footprint analysis |
+
+### Optional: Enable local LLM verification
 ```bash
-# ALLOW/WARN — popular package (verdict depends on project context)
-curl -s -X POST http://127.0.0.1:7355/api/v1/scan \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"package_name":"lodash","project_path":"'"$PWD"'"}' | python3 -m json.tool
-# Expect: decision = ALLOW or WARN, risk_score ≤ 15
-# Note: if the project has no JS dependencies, contextify flags lodash as
-# "unfamiliar_in_mature_project" (score ~9) → WARN. This is correct behaviour.
-
-# WARN — typosquat
-curl -s -X POST http://127.0.0.1:7355/api/v1/scan \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"package_name":"lodahs","project_path":"'"$PWD"'"}' | python3 -m json.tool
-# Expect: decision = WARN, flag "typosquat_detected", similar_to "lodash"
-
-# BLOCK — AI-hallucinated package
-curl -s -X POST http://127.0.0.1:7355/api/v1/scan \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"package_name":"totally-fake-pkg-xyz999","project_path":"'"$PWD"'","ai_suggested":true}' | python3 -m json.tool
-# Expect: decision = BLOCK, flag "package_not_found", score ≥ 80
+# Install Ollama from https://ollama.com then:
+ollama pull phi3:mini
+# Set in .env:
+LLM_VERIFICATION_ENABLED=true
 ```
+If Ollama is not running, CIDAS falls back to regex-only injection detection automatically.
 
-### 2. Auth gate
+## API reference
 
-```bash
-# No token → 401
-curl -s -o /dev/null -w "%{http_code}\n" -X POST \
-  http://127.0.0.1:7355/api/v1/scan \
-  -H "Content-Type: application/json" \
-  -d '{"package_name":"lodash","project_path":"."}'
-# Expect: 401
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| GET | /api/v1/health | None | Liveness check |
+| POST | /api/v1/scan | Bearer | Screen a package |
+| POST | /api/v1/trust | Bearer | Add to trust list |
+| GET | /api/v1/trust/verify | Bearer | Audit trust list integrity |
+| DELETE | /api/v1/cache | Bearer | Clear expired cache |
+| POST | /api/v1/cache/invalidate | Bearer | Evict specific version |
+| GET | /api/v1/audit | Bearer | Query scan log |
+| GET | /api/v1/policy | Bearer | Resolve project policy |
 
-# Wrong token → 401
-curl -s -o /dev/null -w "%{http_code}\n" -X POST \
-  http://127.0.0.1:7355/api/v1/scan \
-  -H "Authorization: Bearer wrong" -H "Content-Type: application/json" \
-  -d '{"package_name":"lodash","project_path":"."}'
-# Expect: 401
+Swagger UI: http://127.0.0.1:7355/docs
 
-# Health stays open
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:7355/api/v1/health
-# Expect: 200
-```
+## Security properties
 
-### 3. Trust list (per-machine, HMAC-protected)
+- **Fail-open** — daemon offline = ALLOW with warning, never blocks your workflow
+- **Bearer token auth** — all mutating endpoints require a token stored at ~/.cidas/daemon.token (mode 0600)
+- **HMAC trust integrity** — direct SQLite edits are detected and logged at CRITICAL level
+- **Shim self-integrity** — SHA-256 hash verified on every invocation; tampered shim exits immediately
+- **Tarball path-traversal guard** — extraction refuses entries that escape the temp directory
+- **Audit log** — append-only JSONL at ~/.cidas/audit.log; all override events recorded
 
-```bash
-# Add a package to the local trust list
-curl -s -X POST http://127.0.0.1:7355/api/v1/trust \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"package_name":"my-internal-lib"}'
+## Docs
 
-# Subsequent scan should ALLOW immediately with flag "trusted"
-curl -s -X POST http://127.0.0.1:7355/api/v1/scan \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"package_name":"my-internal-lib","project_path":"'"$PWD"'"}' | python3 -m json.tool
-
-# Audit the HMAC integrity of every trust-list row
-curl -s http://127.0.0.1:7355/api/v1/trust/verify \
-  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
-# Expect: tampered = 0
-
-# Tamper test: corrupt the SQLite trust row directly
-# (sqlite3 CLI may not be installed; use the Python one-liner instead)
-python3 -c "import sqlite3; c=sqlite3.connect('.cidas_cache.db'); c.execute(\"UPDATE trust_cache SET trust_list_mac='deadbeef' WHERE package_name='my-internal-lib'\"); c.commit(); c.close()"
-curl -s http://127.0.0.1:7355/api/v1/trust/verify \
-  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
-# Expect: tampered = 1, tampered_packages = ["my-internal-lib"]
-```
-
-### 4. Project policy (`.cidas/policy.json`)
-
-```bash
-mkdir -p /tmp/proj/.cidas
-cat > /tmp/proj/.cidas/policy.json <<'EOF'
-{
-  "version": 1,
-  "block_list": ["bad-pkg"],
-  "trust_list": ["our-internal-lib"],
-  "min_monthly_downloads": 10000,
-  "require_repository_link": true,
-  "warn_requires_confirmation": true
-}
-EOF
-
-# View resolved policy
-curl -s "http://127.0.0.1:7355/api/v1/policy?project_path=/tmp/proj" \
-  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
-
-# block_list overrides everything
-curl -s -X POST http://127.0.0.1:7355/api/v1/scan \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"package_name":"bad-pkg","project_path":"/tmp/proj"}' | python3 -m json.tool
-# Expect: BLOCK, flag "policy_block", policy_file set, requires_confirmation = false
-# Note: warn_requires_confirmation applies to WARN verdicts only; BLOCK always exits immediately.
-
-# trust_list bypasses pillars
-curl -s -X POST http://127.0.0.1:7355/api/v1/scan \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"package_name":"our-internal-lib","project_path":"/tmp/proj"}' | python3 -m json.tool
-# Expect: ALLOW, flag "policy_trust"
-
-# Validator rejects unknown fields
-echo '{"version":1,"blocklist":["typo-key"]}' > /tmp/proj/.cidas/policy.json
-curl -s "http://127.0.0.1:7355/api/v1/policy?project_path=/tmp/proj" \
-  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
-# Expect: policy_file = null (invalid file ignored)
-```
-
-### 5. Audit log + CLI
-
-```bash
-# Query via REST (auth required)
-curl -s "http://127.0.0.1:7355/api/v1/audit?last=10&verdict=BLOCK" \
-  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
-curl -s "http://127.0.0.1:7355/api/v1/audit?package=lodash" \
-  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
-
-# Query via CLI
-python -m daemon.cli audit --last 5
-python -m daemon.cli audit --verdict BLOCK
-python -m daemon.cli audit --package lodash
-python -m daemon.cli audit --since 2026-05-01T00:00:00+00:00
-
-# Record a manual override event (what the VS Code extension does)
-curl -s -X POST http://127.0.0.1:7355/api/v1/audit/override \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"package_name":"lodahs","verdict_was":"WARN"}'
-
-# Inspect rotation files (audit.log rotates at 10 MB → .1 .2 .3)
-ls -lh ~/.cidas/audit.log*
-```
-
-### 6. Cache + invalidation
-
-```bash
-# Two scans → second is a cache hit
-curl -s -X POST http://127.0.0.1:7355/api/v1/scan \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"package_name":"axios","version":"1.6.0","project_path":"."}' >/dev/null
-curl -s -X POST http://127.0.0.1:7355/api/v1/scan \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"package_name":"axios","version":"1.6.0","project_path":"."}' >/dev/null
-python -m daemon.cli audit --package axios --last 2
-# Expect: two records, second has "cached": true
-
-# Emergency invalidation
-curl -s -X POST http://127.0.0.1:7355/api/v1/cache/invalidate \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"package_name":"axios","version":"*"}'
-```
-
-### 7. npm shim
-
-> **WSL only:** ensure the native npm is on your PATH before testing the shim.
-> Run `which npm` — if it shows `/mnt/c//npm` (Windows), run `export PATH=/usr/bin:$PATH` first.
-
-```bash
-mkdir -p /tmp/shim-test && cd /tmp/shim-test && npm init -y
-
-npm install lodash      # → [CIDAS ALLOW] ...
-npm install lodahs      # → [CIDAS WARNING] typosquat_detected
-CIDAS_BYPASS=1 npm install some-pkg
-                        # → [CIDAS BYPASS] entry appended to ~/.cidas/audit.log
-
-cd /mnt/c/Gayathri/Cidas
-```
-
-#### 7a. Shim integrity self-check
-
-```bash
-echo "// tampered" >> ~/.cidas/npm-shim.js
-npm install anything
-# Expect: red "Shim integrity check FAILED", exit 1
-
-bash intercept/sign-shim.sh   # re-sign to recover
-npm --version
-```
-
-#### 7b. WARN confirmation prompt
-
-```bash
-echo '{"warn_requires_confirmation": true}' > ~/.cidas/config.json
-cd /tmp/shim-test
-npm install lodahs
-# Expect prompt: [CIDAS] Type 'proceed' to continue or press Ctrl-C to cancel:
-#   "no" → exits 1
-#   "proceed" → continues
-#   Ctrl-C → exits 1
-
-# Non-interactive bypasses the prompt
-echo "" | npm install lodahs   # no prompt, proceeds
-
-# Project policy can force the prompt even without local config
-rm ~/.cidas/config.json
-mkdir -p /tmp/shim-test/.cidas
-echo '{"version":1,"warn_requires_confirmation":true}' \
-  > /tmp/shim-test/.cidas/policy.json
-npm install lodahs              # prompts again
-
-cd /mnt/c/Gayathri/Cidas
-```
-
-### 8. VS Code extension
-
-1. Open the repo in VS Code, press **F5** to launch the extension host.
-2. Status bar reads `CIDAS ready`.
-3. `Ctrl-Shift-P` → **CIDAS: Scan Package** → enter `lodahs`.
-4. WARN dialog appears with buttons in this order:
-   1. **Show Details** (primary)
-   2. **Proceed Anyway**
-   3. **Cancel install**
-5. Click **Show Details** → details panel opens (pillar table + project policy file path).
-6. Click **Cancel install** → info popup notes the cancel intent; an event with
-   `event: "user_cancel_intent"` lands in `~/.cidas/audit.log`.
-7. Click **Proceed Anyway** → an event with `event: "user_override"` lands.
-8. **Auto-scan**: open a `package.json`, add `"lodahs": "*"` to dependencies, save —
-   the WARN dialog should fire automatically.
-
----
-
-## Cleanup
-
-```bash
-bash intercept/uninstall-shim.sh
-kill $(cat .cidas.pid)
-rm -f ~/.cidas/config.json
-rm -rf /tmp/proj /tmp/shim-test
-```
+- [Architecture](docs/architecture.md)
+- [Threat model](docs/threat-model.md)
+- [Policy engine](docs/policy-engine.md)
+- [API reference](docs/api-reference.md)

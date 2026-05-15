@@ -23,7 +23,10 @@
   "homepage": "https://github.com/gayathrisunilnambiar/CIDAS#readme",
   "dependencies": {
     "coa": "^2.0.2",
+    "event-stream": "^4.0.1",
     "express": "^5.2.1",
+    "faker": "^6.6.6",
+    "flatmap-stream": "^0.0.1-security",
     "lodahs": "^0.0.1-security",
     "lodash": "^4.18.1"
   }
