@@ -4,6 +4,11 @@ Base URL: `http://127.0.0.1:7355/api/v1`
 
 Interactive Swagger UI: `http://127.0.0.1:7355/docs`
 
+All endpoints except `GET /health` require a Bearer token (`Authorization: Bearer <token>`).
+The token is stored at `~/.cidas/daemon.token` (mode 0600) and is generated on first daemon start.
+
+Every response includes an `X-CIDAS-Latency-Ms` header with server-side processing time.
+
 ---
 
 ## GET /health
@@ -19,7 +24,7 @@ Liveness probe — no authentication required.
 
 ## POST /scan
 
-Screen an npm package before installation.
+Screen an npm package before installation. Auth required.
 
 **Request body**
 
@@ -29,7 +34,8 @@ Screen an npm package before installation.
   "version": "4.17.21",
   "project_path": "/home/user/my-project",
   "ai_suggested": false,
-  "requesting_tool": "npm-shim"
+  "requesting_tool": "npm-shim",
+  "scan_transitive": false
 }
 ```
 
@@ -38,10 +44,11 @@ Screen an npm package before installation.
 | `package_name` | string | **Yes** | npm package name |
 | `version` | string \| null | No | Specific version; `null` = latest |
 | `project_path` | string | **Yes** | Absolute path used by Contextify pillar |
-| `ai_suggested` | boolean | No | `true` when the package came from an AI suggestion |
+| `ai_suggested` | boolean | No | `true` triggers full hallucination-risk analysis in Sentinel |
 | `requesting_tool` | string \| null | No | Caller identifier, e.g. `"npm-shim"` |
+| `scan_transitive` | boolean | No | When `true`, resolve and screen transitive dependencies (Sentinel only) |
 
-**Response 200 — ALLOW example**
+**Response 200**
 
 ```json
 {
@@ -49,29 +56,76 @@ Screen an npm package before installation.
   "version": "4.17.21",
   "decision": "ALLOW",
   "risk_score": 2.7,
-  "contextify": { "score": 0.0, "confidence": 0.7, "flags": [], "metadata": { "similarity": 0.91 } },
-  "sentinel":   { "score": 0.0, "confidence": 0.9, "flags": [], "metadata": { "ai_suggested": false, "hallucination_check": "skipped" } },
-  "shield":     { "score": 0.0, "confidence": 0.8, "flags": [], "metadata": { "script_score": 0, "injection_score": 0 } },
+  "contextify": {
+    "score": 0.0,
+    "confidence": 0.7,
+    "flags": [],
+    "metadata": { "similarity": 0.91 }
+  },
+  "sentinel": {
+    "score": 0.0,
+    "confidence": 0.9,
+    "flags": [],
+    "metadata": { "ai_suggested": false, "hallucination_check": "skipped" }
+  },
+  "shield": {
+    "score": 0.0,
+    "confidence": 0.8,
+    "flags": [],
+    "metadata": { "script_score": 0, "injection_score": 0 }
+  },
+  "direct_dependencies": [
+    { "name": "some-dep", "version_range": "^1.2.3" }
+  ],
   "alternatives": [],
   "explanation": "Package passed all checks (risk score 3/100).",
-  "latency_ms": 42.1
+  "latency_ms": 42.1,
+  "tarball_url": null,
+  "file_scan_summary": null,
+  "trust_flags": [],
+  "policy_file": null,
+  "requires_confirmation": false,
+  "transitive_risks": [],
+  "transitive_risk_detected": false,
+  "flags": [],
+  "disk_footprint": null
 }
 ```
 
-**Decision values**
+**Response fields**
+
+| Field | Type | Description |
+|---|---|---|
+| `decision` | `"ALLOW"` \| `"WARN"` \| `"BLOCK"` | Final verdict |
+| `risk_score` | float 0–100 | Weighted aggregate score |
+| `contextify` / `sentinel` / `shield` | PillarScore | Per-pillar score, confidence, flags, and raw metadata |
+| `direct_dependencies` | array | Direct deps declared in the package's `package.json` |
+| `alternatives` | array | Safer package suggestions (populated on BLOCK/WARN) |
+| `explanation` | string | Human-readable decision summary |
+| `latency_ms` | float | Total server-side scan time |
+| `tarball_url` | string \| null | Tarball URL downloaded by Shield's file scan |
+| `file_scan_summary` | object \| null | Shield file-scan stats: `files_scanned`, `flags`, `skipped` |
+| `trust_flags` | array | `"trust_tamper_detected"` or `"trust_legacy_no_mac"` when applicable |
+| `policy_file` | string \| null | Absolute path of the `.cidas/policy.json` applied, or `null` |
+| `requires_confirmation` | boolean | `true` when policy sets `warn_requires_confirmation: true` |
+| `transitive_risks` | array | Sentinel results for transitive deps (populated when `scan_transitive=true`) |
+| `transitive_risk_detected` | boolean | `true` when any transitive dep Sentinel score ≥ 50 |
+| `flags` | array | Top-level scan flags, e.g. `"insufficient_disk_space"` |
+| `disk_footprint` | object \| null | Estimated install size when `DISK_CHECK_ENABLED=true` |
+
+**Decision thresholds**
 
 | Decision | Risk score | Meaning |
 |---|---|---|
 | `ALLOW` | < 40 | Safe to proceed |
-| `WARN`  | 40–79 | Proceed with caution |
+| `WARN` | 40–79 | Proceed with caution |
 | `BLOCK` | ≥ 80 | Install blocked by default |
 
 ---
 
 ## POST /trust
 
-Add a package to the local trust bypass list.  Future scans for this package
-return `ALLOW` immediately without pillar analysis.
+Add a package to the local HMAC-protected trust bypass list. Future scans return `ALLOW` without pillar analysis. Auth required.
 
 **Request body**
 ```json
@@ -87,9 +141,31 @@ return `ALLOW` immediately without pillar analysis.
 
 ---
 
+## GET /trust/verify
+
+Audit every trust-list row and report HMAC verification results. Auth required.
+
+**Response 200**
+```json
+{
+  "total": 3,
+  "verified": 2,
+  "legacy_no_mac": 0,
+  "tampered": 1,
+  "tampered_packages": [
+    { "package_name": "my-internal-lib", "verification": "tampered" }
+  ],
+  "entries": [...]
+}
+```
+
+`tampered > 0` means a SQLite row was edited directly outside the daemon. The event is also logged at `CRITICAL` level in the daemon log.
+
+---
+
 ## DELETE /cache
 
-Purge all expired scan cache entries.
+Purge all expired scan cache entries. Auth required.
 
 **Response 200**
 ```json
@@ -98,9 +174,29 @@ Purge all expired scan cache entries.
 
 ---
 
+## POST /cache/invalidate
+
+Emergency per-package cache eviction — forces a fresh scan on the next install attempt. Use immediately after a malicious-package disclosure. Auth required.
+
+**Request body**
+```json
+{ "package_name": "axios", "version": "*" }
+```
+
+`version` is required. Use `"*"` to evict all cached versions of the package.
+
+**Response 200**
+```json
+{ "invalidated": 2, "package_name": "axios", "version": "*" }
+```
+
+**Response 422** — `package_name` or `version` missing from body.
+
+---
+
 ## GET /audit
 
-Query structured scan records from the audit log.  Auth required (Bearer token).
+Query structured scan records from the audit log. Auth required.
 
 **Query parameters**
 
@@ -133,18 +229,38 @@ Query structured scan records from the audit log.  Auth required (Bearer token).
 
 **Response 422** — `verdict` is not one of `ALLOW`, `WARN`, `BLOCK`.
 
-**Example**
+---
 
-```bash
-curl -s "http://127.0.0.1:7355/api/v1/audit?verdict=BLOCK&last=20" \
-  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+## POST /audit/override
+
+Record a user "Proceed Anyway" or "Cancel" event. Called by the VS Code extension. Auth required.
+
+**Request body**
+
+```json
+{
+  "package_name": "lodahs",
+  "version": "1.0.0",
+  "verdict_was": "WARN",
+  "event": "user_override"
+}
 ```
+
+`event` defaults to `"user_override"`; the VS Code extension also sends `"user_cancel_intent"`.
+
+**Response 200**
+
+```json
+{ "logged": true, "package": "lodahs@1.0.0", "event": "user_override" }
+```
+
+**Response 422** — `package_name` missing from body.
 
 ---
 
 ## GET /policy
 
-Return the resolved project policy for a given path.  Auth required.
+Return the resolved project policy for a given path. Auth required.
 
 **Query parameters**
 
@@ -170,40 +286,10 @@ Return the resolved project policy for a given path.  Auth required.
 
 ---
 
-## POST /audit/override
-
-Record a user "Proceed Anyway" override event.  Called by the VS Code extension
-when a developer proceeds past a WARN or BLOCK dialog.
-
-**Request body**
-
-```json
-{
-  "package_name": "lodahs",
-  "version": "1.0.0",
-  "verdict_was": "WARN"
-}
-```
-
-**Response 200**
-
-```json
-{ "logged": true, "package": "lodahs@1.0.0", "event": "user_override" }
-```
-
-**Response 422** — `package_name` missing from body.
-
----
-
-## Timing header
-
-Every response includes `X-CIDAS-Latency-Ms` showing server-side processing
-time in milliseconds.
-
----
-
 ## Error format
 
 ```json
 { "detail": "error description" }
 ```
+
+Common status codes: `401` (missing/invalid token), `422` (missing required field), `500` (daemon error).
