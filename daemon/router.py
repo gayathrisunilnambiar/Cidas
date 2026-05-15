@@ -38,6 +38,7 @@ from .database import (
 )
 from .models import (
     DirectDependency,
+    DiskFootprint,
     HealthResponse,
     PackageScanRequest,
     PillarScore,
@@ -76,6 +77,33 @@ async def _append_direct_deps(req: PackageScanRequest, response: ScanResponse) -
         ]
     except Exception as exc:  # noqa: BLE001
         log.warning("direct dep fetch failed for %s: %s", req.package_name, exc)
+    return response
+
+
+async def _append_disk_footprint(req: PackageScanRequest, response: ScanResponse) -> ScanResponse:
+    """Fetch and attach disk install footprint to *response*.
+
+    No-op when disk_check_enabled is False.  Runs on both fresh scans and
+    cache-hit paths so the footprint is always fresh (sizes change between
+    package versions).  Never raises — disk_checker itself is fault-tolerant.
+    """
+    settings = get_settings()
+    if not settings.disk_check_enabled:
+        return response
+    from daemon.utils.disk_checker import check_disk_footprint
+    transitive_list = [
+        {"name": r.name, "version": r.version}
+        for r in response.transitive_risks
+    ] if req.scan_transitive else []
+    disk_result = await check_disk_footprint(
+        package_name=req.package_name,
+        version=req.version or "latest",
+        transitive_deps=transitive_list,
+        project_path=req.project_path,
+    )
+    response.disk_footprint = DiskFootprint(**disk_result)
+    if "exceeds_available_disk" in disk_result["flags"]:
+        response.flags.append("insufficient_disk_space")
     return response
 
 
@@ -294,6 +322,7 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
         cached = await _append_direct_deps(req, cached)
         if req.scan_transitive:
             cached = await _append_transitive(req, cached)
+        cached = await _append_disk_footprint(req, cached)
         await _audit_scan(req, cached, cached=True)
         return cached
 
@@ -354,11 +383,13 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
         # packages silently when the daemon is unreachable.
         await record_allow(req.package_name, req.version)
 
-    # Direct deps and transitive scan run after store_result so the cache
-    # always holds the base result; both are computed fresh per request.
+    # Direct deps, transitive scan, and disk footprint run after store_result
+    # so the cache always holds the base pillar result; all three are computed
+    # fresh per request (disk sizes change with new package versions).
     response = await _append_direct_deps(req, response)
     if req.scan_transitive:
         response = await _append_transitive(req, response)
+    response = await _append_disk_footprint(req, response)
 
     await _audit_scan(req, response, cached=False)
     log.info("result: decision=%s score=%.1f package=%s", decision, risk_score, req.package_name)

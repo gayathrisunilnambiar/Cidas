@@ -294,6 +294,60 @@ function _passthrough() {
 }
 
 /**
+ * Print a one-line disk-footprint summary plus any size/space warnings.
+ *
+ * Writes the info line to stdout so it flows with other ALLOW/dep lines.
+ * Warnings (large install, insufficient space, high dep count) go to stderr
+ * so they stand out alongside other risk signals.
+ *
+ * Silent when disk_footprint is null (check disabled) or when the check
+ * failed on the daemon side (disk_check_unavailable flag).
+ */
+function _printDiskFootprint(disk) {
+  if (!disk) return;
+  const flags = Array.isArray(disk.flags) ? disk.flags : [];
+  if (flags.includes("disk_check_unavailable")) return;
+
+  const sizeStr = flags.includes("size_unknown")
+    ? "size unknown"
+    : `~${disk.estimated_install_mb} MB`;
+  const availMB = disk.available_disk_mb || 0;
+  const availStr = availMB > 0
+    ? `${Math.round(availMB)} MB free`
+    : "free space unknown";
+  const fitIcon = disk.will_fit
+    ? "\x1b[32m✓\x1b[0m"
+    : "\x1b[31m✗\x1b[0m";
+
+  process.stdout.write(
+    `\x1b[36m[CIDAS]\x1b[0m Disk: ${sizeStr}  (${availStr})  ${fitIcon}\n`
+  );
+
+  if (!disk.will_fit) {
+    process.stderr.write(
+      `\x1b[31m[CIDAS DISK WARNING]\x1b[0m Insufficient disk space — ` +
+      `install requires ~${disk.estimated_install_mb} MB but only ` +
+      `~${Math.round(availMB)} MB is free.\n`
+    );
+  } else if (flags.includes("very_large_install")) {
+    process.stderr.write(
+      `\x1b[33m[CIDAS DISK]\x1b[0m Very large install (~${disk.estimated_install_mb} MB). ` +
+      `Verify you have sufficient disk space before proceeding.\n`
+    );
+  } else if (flags.includes("large_install")) {
+    process.stderr.write(
+      `\x1b[33m[CIDAS DISK]\x1b[0m Large install (~${disk.estimated_install_mb} MB).\n`
+    );
+  }
+
+  if (flags.includes("high_dep_count")) {
+    process.stderr.write(
+      `\x1b[33m[CIDAS DISK]\x1b[0m High dependency count: ${disk.dep_count} transitive deps.\n`
+    );
+  }
+}
+
+/**
  * Decide whether the shim should prompt the user before continuing past a
  * WARN. Returns true when the policy/config asks for confirmation AND the
  * shell is interactive — non-TTY environments (CI, scripts) skip the prompt
@@ -446,6 +500,9 @@ function _main() {
           );
         }
       }
+
+      // Show disk footprint estimate
+      _printDiskFootprint(result.disk_footprint || null);
     }
 
     if (blocked) {
@@ -473,4 +530,5 @@ module.exports = {
   _scan,
   _shouldPromptForWarn,
   _promptProceed,
+  _printDiskFootprint,
 };

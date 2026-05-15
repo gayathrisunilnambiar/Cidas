@@ -35,9 +35,26 @@ _UNKNOWN_TRUST = TrustCheckResult(status=TRUST_STATUS_UNKNOWN, package_name="")
 _VERIFIED_TRUST = TrustCheckResult(status=TRUST_STATUS_VERIFIED, package_name="")
 
 
+_DISK_UNAVAILABLE = {
+    "estimated_install_bytes": 0,
+    "estimated_install_mb": 0.0,
+    "available_disk_bytes": 0,
+    "available_disk_mb": 0.0,
+    "node_modules_bytes": 0,
+    "dep_count": 0,
+    "will_fit": True,
+    "flags": ["disk_check_unavailable"],
+    "disk_risk_score": 0.0,
+}
+
+
 @pytest.fixture
 def mock_db():
-    """Patch all database references in daemon.router to avoid SQLite I/O."""
+    """Patch all database references in daemon.router to avoid SQLite I/O.
+
+    Also stubs check_disk_footprint so existing tests do not make real npm
+    registry calls for package size lookups.
+    """
     with (
         patch("daemon.router.check_trust", new=AsyncMock(return_value=_UNKNOWN_TRUST)),
         patch("daemon.router.get_cached_result", new=AsyncMock(return_value=None)),
@@ -49,6 +66,10 @@ def mock_db():
         patch("daemon.router.record_allow", new=AsyncMock()),
         patch("daemon.router.audit_log.append", new=AsyncMock()),
         patch("daemon.router.audit_log.read_records", new=AsyncMock(return_value=[])),
+        patch(
+            "daemon.utils.disk_checker.check_disk_footprint",
+            new=AsyncMock(return_value=_DISK_UNAVAILABLE),
+        ),
     ):
         yield
 
@@ -743,3 +764,108 @@ async def test_audit_override_missing_package_name_returns_422(async_client, moc
         "verdict_was": "WARN",
     })
     assert response.status_code == 422
+
+
+# ── Disk footprint integration ────────────────────────────────────────────────
+
+async def test_scan_response_includes_disk_footprint(async_client, mock_db, mock_pillars_low):
+    """When disk_check_enabled=True, ScanResponse must include a populated disk_footprint."""
+    fake_disk = {
+        "estimated_install_bytes": 1024 * 1024,
+        "estimated_install_mb": 1.0,
+        "available_disk_bytes": 10 * 1024 * 1024 * 1024,
+        "available_disk_mb": 10240.0,
+        "node_modules_bytes": 0,
+        "dep_count": 2,
+        "will_fit": True,
+        "flags": [],
+        "disk_risk_score": 0.0,
+    }
+    with patch(
+        "daemon.utils.disk_checker.check_disk_footprint",
+        new=AsyncMock(return_value=fake_disk),
+    ):
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "lodash",
+            "project_path": "/tmp/project",
+        })
+    assert response.status_code == 200
+    body = response.json()
+    assert "disk_footprint" in body
+    assert body["disk_footprint"] is not None
+    assert "estimated_install_mb" in body["disk_footprint"]
+    assert "will_fit" in body["disk_footprint"]
+
+
+async def test_disk_check_disabled_omits_disk_footprint(async_client, mock_db, mock_pillars_low):
+    """When disk_check_enabled=False, disk_footprint must be absent (null) in the response."""
+    from daemon.config import Settings
+    disabled_settings = Settings(disk_check_enabled=False)
+    with patch("daemon.router.get_settings", return_value=disabled_settings):
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "lodash",
+            "project_path": "/tmp/project",
+        })
+    assert response.status_code == 200
+    assert response.json()["disk_footprint"] is None
+
+
+async def test_exceeds_disk_adds_flag_to_response(async_client, mock_db, mock_pillars_low):
+    """'exceeds_available_disk' from the disk checker must surface as 'insufficient_disk_space'
+    in the top-level response flags."""
+    exceeds_disk = {
+        "estimated_install_bytes": 20 * 1024 * 1024 * 1024,
+        "estimated_install_mb": 20480.0,
+        "available_disk_bytes": 1 * 1024 * 1024 * 1024,
+        "available_disk_mb": 1024.0,
+        "node_modules_bytes": 0,
+        "dep_count": 1,
+        "will_fit": False,
+        "flags": ["exceeds_available_disk", "very_large_install", "large_install"],
+        "disk_risk_score": 100.0,
+    }
+    with patch(
+        "daemon.utils.disk_checker.check_disk_footprint",
+        new=AsyncMock(return_value=exceeds_disk),
+    ):
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "massive-pkg",
+            "project_path": "/tmp/project",
+        })
+    assert response.status_code == 200
+    body = response.json()
+    assert "insufficient_disk_space" in body["flags"]
+
+
+async def test_cache_hit_includes_disk_footprint(async_client, mock_db):
+    """Cache hits must also receive a disk_footprint — the old cached ScanResponse
+    never had the field, so _append_disk_footprint must run on the cache-hit path."""
+    cached = _cached_response("express", "WARN")
+    fake_disk = {
+        "estimated_install_bytes": 5 * 1024 * 1024,
+        "estimated_install_mb": 5.0,
+        "available_disk_bytes": 10 * 1024 * 1024 * 1024,
+        "available_disk_mb": 10240.0,
+        "node_modules_bytes": 0,
+        "dep_count": 0,
+        "will_fit": True,
+        "flags": [],
+        "disk_risk_score": 0.0,
+    }
+    with (
+        patch("daemon.router.get_cached_result", new=AsyncMock(return_value=cached)),
+        patch("daemon.router.get_direct_dependencies", new=AsyncMock(return_value={})),
+        patch(
+            "daemon.utils.disk_checker.check_disk_footprint",
+            new=AsyncMock(return_value=fake_disk),
+        ),
+    ):
+        response = await async_client.post("/api/v1/scan", json={
+            "package_name": "express",
+            "project_path": "/tmp/project",
+        })
+    assert response.status_code == 200
+    body = response.json()
+    assert body["disk_footprint"] is not None
+    assert body["disk_footprint"]["estimated_install_mb"] == 5.0
+    assert body["disk_footprint"]["will_fit"] is True

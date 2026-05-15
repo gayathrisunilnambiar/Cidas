@@ -62,6 +62,22 @@ class TransitiveDependencyResult(BaseModel):
     flags: list[str] = Field(default_factory=list)
 
 
+# ── Disk footprint ────────────────────────────────────────────────────────────
+
+class DiskFootprint(BaseModel):
+    """Estimated disk cost for installing a package plus its transitive deps."""
+
+    estimated_install_bytes: int = 0
+    estimated_install_mb: float = 0.0
+    available_disk_bytes: int = 0
+    available_disk_mb: float = 0.0
+    node_modules_bytes: int = 0
+    dep_count: int = 0
+    will_fit: bool = True
+    flags: list[str] = []
+    disk_risk_score: float = 0.0
+
+
 # ── Scan response ─────────────────────────────────────────────────────────────
 
 class ScanResponse(BaseModel):
@@ -117,6 +133,14 @@ class ScanResponse(BaseModel):
     transitive_risk_detected: bool = Field(
         default=False,
         description="True when any transitive dependency sentinel_score >= WARN_THRESHOLD",
+    )
+    flags: list[str] = Field(
+        default_factory=list,
+        description="Top-level scan flags (e.g. 'insufficient_disk_space').",
+    )
+    disk_footprint: Optional[DiskFootprint] = Field(
+        default=None,
+        description="Estimated disk cost for this installation, or null when disk check is disabled.",
     )
 
 

@@ -55,6 +55,13 @@ class Settings(BaseSettings):
     # ── NPM registry ──────────────────────────────────────────────────────
     npm_registry_url: str = "https://registry.npmjs.org"
 
+    # ── Disk space checking ───────────────────────────────────────────────
+    # When True the daemon estimates the on-disk cost of a requested install
+    # (top-level package + transitive deps) and surfaces the result in the
+    # ScanResponse.disk_footprint field.  Disable on constrained CI runners
+    # that should not make extra npm-registry size lookups.
+    disk_check_enabled: bool = True
+
     # ── LLM secondary verification ────────────────────────────────────────
     # Optional second-pass check that asks a local Ollama model to evaluate
     # README text the regex flagged as possibly adversarial. Off by default

@@ -50,6 +50,7 @@ let appendFileSyncSpy;
 let mkdirSyncSpy;
 let readFileSyncSpy;
 let stderrSpy;
+let stdoutSpy;
 
 beforeEach(() => {
   jest.resetModules();
@@ -58,6 +59,7 @@ beforeEach(() => {
   appendFileSyncSpy = jest.spyOn(fs, "appendFileSync").mockImplementation(() => {});
   mkdirSyncSpy      = jest.spyOn(fs, "mkdirSync").mockImplementation(() => {});
   stderrSpy         = jest.spyOn(process.stderr, "write").mockImplementation(() => {});
+  stdoutSpy         = jest.spyOn(process.stdout, "write").mockImplementation(() => {});
 
   // Default: config absent, hash file absent (integrity check warns + proceeds).
   readFileSyncSpy = jest.spyOn(fs, "readFileSync").mockImplementation((filePath, opts) => {
@@ -537,5 +539,124 @@ describe("integrity check — hash mismatch (tampered shim)", () => {
     const output = stderrSpy.mock.calls.map((c) => c[0]).join("");
     expect(output).toContain("00".repeat(32)); // expected (the fake)
     expect(output).toContain(REAL_SHIM_HASH);  // actual (the real)
+  });
+});
+
+// ── _printDiskFootprint ───────────────────────────────────────────────────────
+
+describe("_printDiskFootprint", () => {
+  // The integrity IIFE writes to stderr during loadShim() in the outer beforeEach.
+  // Clear both spies so assertions only see calls made by _printDiskFootprint itself.
+  beforeEach(() => {
+    stderrSpy.mockClear();
+    stdoutSpy.mockClear();
+  });
+
+  /** Minimal valid disk footprint returned by the daemon. */
+  function _disk(overrides = {}) {
+    return Object.assign(
+      {
+        estimated_install_bytes: 5 * 1024 * 1024,
+        estimated_install_mb: 5.0,
+        available_disk_bytes: 10 * 1024 * 1024 * 1024,
+        available_disk_mb: 10240.0,
+        node_modules_bytes: 0,
+        dep_count: 3,
+        will_fit: true,
+        flags: [],
+        disk_risk_score: 0.0,
+      },
+      overrides,
+    );
+  }
+
+  it("does nothing when disk_footprint is null", () => {
+    shim._printDiskFootprint(null);
+    expect(stdoutSpy).not.toHaveBeenCalled();
+    expect(stderrSpy).not.toHaveBeenCalled();
+  });
+
+  it("does nothing when flags include disk_check_unavailable", () => {
+    shim._printDiskFootprint(_disk({ flags: ["disk_check_unavailable"] }));
+    expect(stdoutSpy).not.toHaveBeenCalled();
+    expect(stderrSpy).not.toHaveBeenCalled();
+  });
+
+  it("prints a [CIDAS] info line to stdout for a normal small install", () => {
+    shim._printDiskFootprint(_disk());
+    const out = stdoutSpy.mock.calls.map((c) => c[0]).join("");
+    expect(out).toContain("[CIDAS]");
+    expect(out).toContain("5");           // estimated_install_mb
+    expect(out).toContain("MB");
+    expect(stderrSpy).not.toHaveBeenCalled();
+  });
+
+  it("shows 'size unknown' in the info line when size_unknown flag is set", () => {
+    shim._printDiskFootprint(_disk({ estimated_install_mb: 0, flags: ["size_unknown"] }));
+    const out = stdoutSpy.mock.calls.map((c) => c[0]).join("");
+    expect(out).toContain("size unknown");
+  });
+
+  it("prints a red DISK WARNING to stderr when will_fit is false", () => {
+    shim._printDiskFootprint(_disk({
+      estimated_install_mb: 20480.0,
+      available_disk_mb: 1024.0,
+      will_fit: false,
+      flags: ["exceeds_available_disk", "very_large_install", "large_install"],
+    }));
+    const err = stderrSpy.mock.calls.map((c) => c[0]).join("");
+    expect(err).toContain("DISK WARNING");
+    expect(err).toContain("Insufficient disk space");
+    expect(err).toContain("20480");
+    expect(err).toContain("1024");
+  });
+
+  it("prints a yellow DISK warning for very_large_install when disk fits", () => {
+    shim._printDiskFootprint(_disk({
+      estimated_install_mb: 300.0,
+      will_fit: true,
+      flags: ["very_large_install", "large_install"],
+    }));
+    const err = stderrSpy.mock.calls.map((c) => c[0]).join("");
+    expect(err).toContain("[CIDAS DISK]");
+    expect(err).toContain("Very large install");
+    expect(err).toContain("300");
+  });
+
+  it("prints a yellow DISK notice for large_install (but not very_large)", () => {
+    shim._printDiskFootprint(_disk({
+      estimated_install_mb: 80.0,
+      will_fit: true,
+      flags: ["large_install"],
+    }));
+    const err = stderrSpy.mock.calls.map((c) => c[0]).join("");
+    expect(err).toContain("[CIDAS DISK]");
+    expect(err).toContain("Large install");
+    expect(err).not.toContain("Very large");
+  });
+
+  it("prints a high_dep_count warning independently of size warnings", () => {
+    shim._printDiskFootprint(_disk({ dep_count: 150, flags: ["high_dep_count"] }));
+    const err = stderrSpy.mock.calls.map((c) => c[0]).join("");
+    expect(err).toContain("High dependency count");
+    expect(err).toContain("150");
+  });
+
+  it("prints both size and dep-count warnings when both flags are present", () => {
+    shim._printDiskFootprint(_disk({
+      estimated_install_mb: 80.0,
+      dep_count: 120,
+      flags: ["large_install", "high_dep_count"],
+    }));
+    const err = stderrSpy.mock.calls.map((c) => c[0]).join("");
+    expect(err).toContain("Large install");
+    expect(err).toContain("High dependency count");
+  });
+
+  it("shows the available MB in the stdout info line", () => {
+    shim._printDiskFootprint(_disk({ available_disk_mb: 4096.0 }));
+    const out = stdoutSpy.mock.calls.map((c) => c[0]).join("");
+    expect(out).toContain("4096");
+    expect(out).toContain("MB free");
   });
 });

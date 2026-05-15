@@ -22,6 +22,7 @@
   },
   "homepage": "https://github.com/gayathrisunilnambiar/CIDAS#readme",
   "dependencies": {
+    "express": "^5.2.1",
     "lodahs": "^0.0.1-security",
     "lodash": "^4.18.1"
   }
