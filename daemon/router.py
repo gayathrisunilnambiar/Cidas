@@ -54,6 +54,7 @@ from .utils.npm_registry import get_direct_dependencies
 from .utils.transitive import resolve_transitive
 from .utils.logger import get_logger
 from .utils.offline_cache import record_allow
+from .utils.drift_monitor import check_drift, BASELINE_PATH
 
 log = get_logger(__name__)
 router = APIRouter()
@@ -187,9 +188,28 @@ async def _audit_scan(
     await audit_log.append(record)
 
 
-@router.get("/health", response_model=HealthResponse)
-async def health() -> HealthResponse:
-    return HealthResponse()
+@router.get("/health")
+async def health() -> dict:
+    settings = get_settings()
+    if settings.drift_monitoring_enabled:
+        try:
+            report = check_drift()
+            drift_data: dict = {
+                "status": report.status,
+                "overall_kl": round(report.overall_kl, 4),
+                "drifted_pillars": report.drifted_pillars,
+                "sufficient_data": report.sufficient_data,
+                "baseline_loaded": report.baseline_loaded,
+            }
+        except Exception as e:  # noqa: BLE001
+            drift_data = {"status": "unavailable", "error": str(e)}
+    else:
+        drift_data = {"status": "disabled"}
+    return {
+        "status": "ok",
+        "version": "0.1.0",
+        "drift": drift_data,
+    }
 
 
 @router.post("/scan", response_model=ScanResponse, dependencies=[Depends(require_token)])

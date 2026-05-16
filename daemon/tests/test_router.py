@@ -96,6 +96,34 @@ async def test_health_returns_ok(async_client):
     assert "version" in body
 
 
+async def test_health_includes_drift_field(async_client):
+    response = await async_client.get("/api/v1/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert "drift" in body
+    assert "status" in body["drift"]
+    assert body["drift"]["status"] in (
+        "ok", "warn", "alert", "insufficient_data", "unavailable"
+    )
+
+
+async def test_health_drift_has_required_fields(async_client):
+    response = await async_client.get("/api/v1/health")
+    assert response.status_code == 200
+    drift = response.json()["drift"]
+    for key in ("status", "overall_kl", "drifted_pillars", "sufficient_data", "baseline_loaded"):
+        assert key in drift, f"missing key: {key}"
+
+
+async def test_health_still_returns_200_when_drift_raises(async_client):
+    with patch("daemon.router.check_drift", side_effect=RuntimeError("test error")):
+        response = await async_client.get("/api/v1/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["drift"]["status"] == "unavailable"
+
+
 # ── POST /scan — decision paths ───────────────────────────────────────────────
 
 async def test_scan_allow(async_client, mock_db, mock_pillars_low):

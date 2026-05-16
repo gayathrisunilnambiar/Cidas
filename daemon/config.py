@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     ollama_host: str = "http://localhost:11434"
     ollama_model: str = "phi3:mini"
 
+    # ── Concept drift monitoring ──────────────────────────────────────────────
+    drift_monitoring_enabled: bool = True
+    drift_kl_warn_threshold: float = 0.15
+    drift_kl_alert_threshold: float = 0.30
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
