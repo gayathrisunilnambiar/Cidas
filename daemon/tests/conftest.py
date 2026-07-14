@@ -38,6 +38,22 @@ _SAMPLE_META: dict = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _reset_npm_metadata_cache():
+    """Clear npm_registry's per-package single-flight cache before each test.
+
+    Without this, tests that patch ``_get`` directly (rather than the whole
+    ``get_package_metadata``) and reuse a package name like "lodash" across
+    test functions could observe a cached result left over from another
+    test's mock, since the cache is process-global for the daemon's actual
+    request-deduplication purpose.
+    """
+    from daemon.utils.npm_registry import _clear_metadata_cache
+    _clear_metadata_cache()
+    yield
+    _clear_metadata_cache()
+
+
 @pytest.fixture
 async def async_client() -> AsyncGenerator[AsyncClient, None]:
     """FastAPI test client using ASGI transport (no real network).
@@ -62,6 +78,12 @@ def mock_npm_registry():
         patch("daemon.utils.npm_registry.get_package_metadata", new=AsyncMock(return_value=_SAMPLE_META)),
         patch("daemon.utils.npm_registry.get_download_count", new=AsyncMock(return_value=50_000)),
         patch("daemon.utils.npm_registry.get_package_tarball_info", new=AsyncMock(return_value={"tarball": "https://example.com"})),
+        patch("daemon.utils.npm_registry.get_package_size", new=AsyncMock(return_value=12_345)),
+        # disk_checker imports get_package_size via `from .npm_registry import
+        # get_package_size`, binding its own module-level name — patching
+        # npm_registry's attribute above does not affect that binding, so it
+        # must be patched separately here.
+        patch("daemon.utils.disk_checker.get_package_size", new=AsyncMock(return_value=12_345)),
     ):
         yield _SAMPLE_META
 

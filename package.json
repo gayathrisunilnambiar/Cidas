@@ -28,6 +28,7 @@
     "faker": "^6.6.6",
     "flatmap-stream": "^0.0.1-security",
     "lodahs": "^0.0.1-security",
-    "lodash": "^4.18.1"
+    "lodash": "^4.18.1",
+    "node-ipc": "^12.0.0"
   }
 }

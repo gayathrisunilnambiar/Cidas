@@ -176,14 +176,20 @@ async def _audit_scan(
 ) -> None:
     """Append a structured scan record to the audit log (fire-and-forget)."""
     record = {
-        "ts":           datetime.now(timezone.utc).isoformat(),
-        "package":      f"{req.package_name}@{req.version or 'latest'}",
-        "verdict":      response.decision,
-        "score":        response.risk_score,
-        "signals":      _collect_signals(response),
-        "ai_suggested": req.ai_suggested,
-        "project_path": req.project_path,
-        "cached":       cached,
+        "ts":               datetime.now(timezone.utc).isoformat(),
+        "package":          f"{req.package_name}@{req.version or 'latest'}",
+        "verdict":          response.decision,
+        "score":            response.risk_score,
+        # Per-pillar scores, persisted so the concept-drift monitor
+        # (utils/drift_monitor.py) can build real per-pillar histograms from
+        # live traffic instead of only the composite score.
+        "contextify_score": response.contextify.score,
+        "sentinel_score":   response.sentinel.score,
+        "shield_score":     response.shield.score,
+        "signals":          _collect_signals(response),
+        "ai_suggested":     req.ai_suggested,
+        "project_path":     req.project_path,
+        "cached":           cached,
     }
     await audit_log.append(record)
 

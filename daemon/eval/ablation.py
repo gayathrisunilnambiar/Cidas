@@ -139,11 +139,19 @@ def _recompute_decision(
 
     Returns None when *result* carries a daemon error (caller records ERROR).
 
-    Replication of daemon/pillars/aggregator.py::Aggregator.aggregate():
+    Replication of daemon/pillars/aggregator.py::Aggregator.aggregate() — kept
+    in lockstep with that module by hand since this script recomputes locally
+    rather than calling it. Mirrors, in order:
       1. Weighted sum of the three pillar scores.
       2. Contextify floor penalty when similarity < 0.05.
-      3. Force-block for AI-suggested packages not found in registry.
-      4. Threshold comparison → ALLOW / WARN / BLOCK.
+      3. Covert-dropper amplification (Shield base64_decode + Contextify
+         unfamiliar_in_mature_project → +15).
+      4. Force-block for packages not found in the registry (regardless of
+         ai_suggested — the real aggregator does not gate this on it).
+      5. Force-block for a known supply-chain incident.
+      6. Force-WARN floor for a detected typosquat (Sentinel's 0.35 weight
+         alone caps at 35 points, below the 40-point WARN threshold).
+      7. Threshold comparison → ALLOW / WARN / BLOCK.
     """
     if "error" in result:
         return None
@@ -169,11 +177,24 @@ def _recompute_decision(
 
     score = min(score, 100.0)
 
-    # Force-block for confirmed registry misses on AI-suggested packages.
+    ctx_flags  = ctx.get("flags")  or []
+    shi_flags  = shi.get("flags")  or []
     sent_flags = sent.get("flags") or []
-    sent_meta  = sent.get("metadata") or {}
-    if "package_not_found" in sent_flags and sent_meta.get("ai_suggested"):
+
+    if "base64_decode" in shi_flags and "unfamiliar_in_mature_project" in ctx_flags:
+        score = min(score + 15.0, 100.0)
+
+    # Force-block for confirmed registry misses (any install, not just AI-suggested).
+    if "package_not_found" in sent_flags:
         score = max(score, _BLOCK_THRESHOLD)
+
+    # Force-block for a known, documented supply-chain incident.
+    if "known_supply_chain_incident" in sent_flags:
+        score = max(score, _BLOCK_THRESHOLD)
+
+    # Force-WARN floor for a detected typosquat.
+    if "typosquat_detected" in sent_flags:
+        score = max(score, _WARN_THRESHOLD)
 
     if score >= _BLOCK_THRESHOLD:
         return "BLOCK"

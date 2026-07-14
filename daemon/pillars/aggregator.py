@@ -107,7 +107,34 @@ class Aggregator:
         explanation is a plain-English summary listing the top signal flags.
         ``policy_overrides`` is the merged project policy from
         ``utils.policy.resolve`` and takes precedence over admin config.
+
+        Two-stage structure: Stage 2 (``_stage2_score``, the weighted pillar
+        sum plus additive modifiers) always runs; Stage 1 (``_stage1_gates``,
+        deterministic flag-driven force-floors) supplies an optional floor
+        that Stage 2's result is combined with via ``max()``. This is the
+        same behavior as a single sequential pass of ``max()`` calls — it's
+        organized into named stages for clarity and so future signals (a
+        learned classifier, homoglyph detection) have a clean place to plug
+        into Stage 2 without diluting into a sum that force-rules already
+        dominate (per the ablation study in the eval results).
         """
+        stage2_score = self._stage2_score(contextify, sentinel, shield, settings, policy_overrides)
+        gate_floor = self._stage1_gates(sentinel, settings)
+        score = stage2_score if gate_floor is None else max(stage2_score, gate_floor)
+
+        explanation = self._build_explanation(score, contextify, sentinel, shield, settings)
+        return score, explanation
+
+    def _stage2_score(
+        self,
+        contextify: PillarScore,
+        sentinel: PillarScore,
+        shield: PillarScore,
+        settings: Settings,
+        policy_overrides: dict | None,
+    ) -> float:
+        """Weighted pillar sum plus the Contextify-floor and covert-dropper
+        modifiers. Does not consider Stage 1's force-conditions."""
         ctx_w, sen_w, shi_w = _resolved_weights(settings, policy_overrides)
         score = (
             ctx_w * contextify.score
@@ -125,12 +152,49 @@ class Aggregator:
 
         score = round(min(score, 100.0), 2)
 
-        # A nonexistent package should always be blocked — it's either hallucinated or malicious
-        if "package_not_found" in sentinel.flags:
-            score = max(score, float(settings.block_threshold))
+        # Signal amplification: base64_decode co-occurring with unfamiliar_in_mature_project
+        # is a strong indicator of a covert dropper — legitimate minified bundles don't also
+        # look alien to the project's dependency graph. Add a flat penalty so the combination
+        # escapes ALLOW even when each signal is individually weak.
+        if (
+            "base64_decode" in shield.flags
+            and "unfamiliar_in_mature_project" in contextify.flags
+        ):
+            score = min(score + 15.0, 100.0)
+            if "covert_dropper_signals" not in shield.flags:
+                shield.flags.append("covert_dropper_signals")
 
-        explanation = self._build_explanation(score, contextify, sentinel, shield, settings)
-        return score, explanation
+        return score
+
+    @staticmethod
+    def _stage1_gates(sentinel: PillarScore, settings: Settings) -> float | None:
+        """Deterministic, flag-driven force-floors. Returns the threshold to
+        floor the score at, or ``None`` if no gate fires.
+
+        Priority (block-level checked before warn-level) mirrors the
+        pre-refactor sequential ``max()`` calls; since
+        ``block_threshold > warn_threshold`` the ordering is immaterial to
+        the final composed score, but is kept for readability.
+        """
+        # A nonexistent package should always be blocked — it's either hallucinated or malicious.
+        if "package_not_found" in sentinel.flags:
+            return float(settings.block_threshold)
+
+        # A known supply-chain incident should always be blocked.
+        if "known_supply_chain_incident" in sentinel.flags:
+            return float(settings.block_threshold)
+
+        # A detected typosquat must never silently ALLOW: Sentinel's weight
+        # (0.35) alone caps its contribution at 35 points, below the WARN
+        # threshold (40), so a typosquat with a quiet Contextify/Shield
+        # signal (e.g. an evaluation harness with no real project_path)
+        # would otherwise pass straight through. Floor at WARN rather than
+        # forcing BLOCK, since name-similarity alone can still legitimately
+        # false-positive on a similarly-named but unrelated real package.
+        if "typosquat_detected" in sentinel.flags:
+            return float(settings.warn_threshold)
+
+        return None
 
     @staticmethod
     def get_decision(score: float, settings: Settings) -> str:

@@ -110,6 +110,14 @@ def get_admin_config() -> dict:
         projects that legitimately mix domains (e.g. ML + web + tooling) where
         a low Contextify weight reduces nuisance "alien_to_project" hits.
         Out-of-range values are clamped; non-numeric values are ignored.
+    shield_manifest_gating : bool (default true)
+        When true, Shield skips the cross-version tarball diff whenever the
+        current and immediately-preceding version's `scripts` and
+        `dependencies` fields are identical — this is the dominant source of
+        Shield's tail latency (two full tarball downloads per scan). Set to
+        false to force every version-having package through the full diff
+        regardless of manifest equality, e.g. while validating that gating
+        isn't suppressing a real detection.
     """
     config_path = Path.home() / ".cidas" / "config.json"
     try:

@@ -188,3 +188,83 @@ def test_admin_config_invalid_value_falls_back_to_default(aggregator, settings, 
     risk, _ = aggregator.aggregate(_ps(100), _ps(0), _ps(0), settings)
     # Falls back to env default (0.30) → 30.
     assert risk == pytest.approx(30.0, abs=0.5)
+
+
+# ── Signal amplification ──────────────────────────────────────────────────────
+
+def test_base64_plus_unfamiliar_adds_penalty(aggregator: Aggregator, settings) -> None:
+    """base64_decode co-occurring with unfamiliar_in_mature_project adds +15 and
+    covert_dropper_signals flag — simulates a covert dropper that evades single-signal
+    detection."""
+    ctx = _ps(10, flags=["unfamiliar_in_mature_project"])
+    sen = _ps(5)
+    shi = _ps(10, flags=["base64_decode"])
+
+    risk_with, _ = aggregator.aggregate(ctx, sen, shi, settings)
+
+    # Without amplification: 0.30*10 + 0.35*5 + 0.35*10 = 3 + 1.75 + 3.5 = 8.25
+    # With +15 amplification: 23.25
+    assert risk_with >= 20.0
+    assert "covert_dropper_signals" in shi.flags
+
+
+def test_base64_alone_does_not_amplify(aggregator: Aggregator, settings) -> None:
+    """base64_decode without unfamiliar_in_mature_project must not trigger amplification."""
+    ctx = _ps(10)  # no unfamiliar flag
+    sen = _ps(5)
+    shi = _ps(10, flags=["base64_decode"])
+
+    risk, _ = aggregator.aggregate(ctx, sen, shi, settings)
+    assert "covert_dropper_signals" not in shi.flags
+    assert risk == pytest.approx(8.25, abs=0.5)
+
+
+def test_known_supply_chain_incident_always_blocks(aggregator: Aggregator, settings) -> None:
+    """known_supply_chain_incident in sentinel flags must force the score to block_threshold."""
+    sen = PillarScore(
+        score=95.0, confidence=0.99,
+        flags=["known_supply_chain_incident"],
+        metadata={"incident": "test incident"},
+    )
+    risk, _ = aggregator.aggregate(_ps(0), sen, _ps(0), settings)
+    assert aggregator.get_decision(risk, settings) == "BLOCK"
+    assert risk >= settings.block_threshold
+
+
+# ── Two-stage refactor: _stage1_gates / _stage2_score unit tests ─────────────
+
+def test_stage1_gates_returns_block_threshold_for_package_not_found(settings) -> None:
+    sen = _ps(0, flags=["package_not_found"])
+    assert Aggregator._stage1_gates(sen, settings) == float(settings.block_threshold)
+
+
+def test_stage1_gates_returns_block_threshold_for_known_incident(settings) -> None:
+    sen = _ps(0, flags=["known_supply_chain_incident"])
+    assert Aggregator._stage1_gates(sen, settings) == float(settings.block_threshold)
+
+
+def test_stage1_gates_returns_warn_threshold_for_typosquat_only(settings) -> None:
+    sen = _ps(0, flags=["typosquat_detected"])
+    assert Aggregator._stage1_gates(sen, settings) == float(settings.warn_threshold)
+
+
+def test_stage1_gates_prioritizes_block_over_warn_when_both_conditions_present(settings) -> None:
+    sen = _ps(0, flags=["package_not_found", "typosquat_detected"])
+    assert Aggregator._stage1_gates(sen, settings) == float(settings.block_threshold)
+
+
+def test_stage1_gates_returns_none_when_no_gate_fires(settings) -> None:
+    sen = _ps(50, flags=["zero_downloads"])
+    assert Aggregator._stage1_gates(sen, settings) is None
+
+
+def test_stage2_score_matches_aggregate_when_no_gate_fires(aggregator: Aggregator, settings) -> None:
+    """When Stage 1 fires no gate, aggregate()'s result must equal _stage2_score's
+    result directly — the composition adds nothing beyond Stage 2 in that case."""
+    ctx = _ps(20, flags=["unfamiliar_in_mature_project"])
+    sen = _ps(30, flags=["zero_downloads"])
+    shi = _ps(10)
+
+    stage2 = aggregator._stage2_score(ctx, sen, shi, settings, None)
+    risk, _ = aggregator.aggregate(ctx, sen, shi, settings)
+    assert risk == stage2

@@ -20,13 +20,29 @@ TODO(phase-2): tune similarity thresholds based on false-positive data.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 from ..models import PillarScore
 from ..utils.logger import get_logger
 from ..utils.npm_registry import get_download_count, get_package_metadata
+from ..utils.osv_client import check_osv
 
 log = get_logger(__name__)
+
+# Packages with documented, public supply-chain compromise incidents.
+# A hit here returns an immediate BLOCK-level score without further analysis.
+# Only include packages where malware was *injected* (not just sabotaged or
+# yanked) so the signal stays high-precision.
+_KNOWN_COMPROMISED: dict[str, str] = {
+    "flatmap-stream": "2018: backdoor via event-stream dependency (Bitcoin wallet theft)",
+    "event-stream":   "2018: compromised via malicious flatmap-stream dependency",
+    "node-ipc":       "2022: peacenotwar module (destructive file wipe on RU/BY IPs)",
+    "ua-parser-js":   "2021: malware injection (cryptominer + password stealer)",
+    "coa":            "2021: malware injection (cryptominer + password stealer)",
+    "rc":             "2021: malware injection (cryptominer + password stealer)",
+    "eslint-scope":   "2018: npm credentials theft via malicious postinstall",
+}
 
 # TODO(phase-2): replace with full top-500 list loaded from a bundled JSON file
 TOP_PACKAGES: list[str] = [
@@ -59,6 +75,20 @@ class Sentinel:
 
     async def score(self, package_name: str, ai_suggested: bool) -> PillarScore:
         """Return a PillarScore; always checks registry existence."""
+        # Known-incident blocklist: synchronous dict lookup, no network call.
+        # Applies to all installs (human or AI-suggested) because historical
+        # supply-chain attacks are equally dangerous regardless of install origin.
+        if package_name in _KNOWN_COMPROMISED:
+            return PillarScore(
+                score=95.0,
+                confidence=0.99,
+                flags=["known_supply_chain_incident"],
+                metadata={
+                    "incident": _KNOWN_COMPROMISED[package_name],
+                    "ai_suggested": ai_suggested,
+                },
+            )
+
         # Always check if package exists - this catches hallucinated/fake packages
         exists, registry_signals = await self.check_registry_existence(package_name)
         is_typo, similar_to = self.check_name_similarity(package_name)
@@ -69,7 +99,12 @@ class Sentinel:
             flags = ["package_not_found"]
             if is_typo:
                 flags.append("typosquat_detected")
-                score = 95.0
+                # A typosquat name that isn't even registered yet is at least as
+                # dangerous as one that already exists (score=100 below) — the
+                # attacker has staged the name but not yet published, or the
+                # target simply doesn't exist. Never score this lower than an
+                # existing typosquat.
+                score = 100.0
             return PillarScore(
                 score=score,
                 confidence=0.95,
@@ -114,6 +149,19 @@ class Sentinel:
             exists, registry_signals, is_typo, similar_to
         )
 
+        # OSV vulnerability check — only for AI-suggested packages to avoid
+        # adding a live network call to the human-typed fast path.
+        osv = await check_osv(package_name)
+        if osv["has_malware"]:
+            # Confirmed malware (MAL- entry or unambiguous keyword) overrides all
+            # other signals — the package is definitively dangerous.
+            flags.append("osv_advisory_found")
+            flags.append("osv_malware_confirmed")
+            final_score = 100.0
+        elif osv["vuln_count"] > 0:
+            flags.append("osv_advisory_found")
+            final_score = min(final_score + 20.0, 100.0)
+
         return PillarScore(
             score=final_score,
             confidence=0.85,
@@ -122,6 +170,8 @@ class Sentinel:
                 "ai_suggested": True,
                 "exists": exists,
                 "similar_to": similar_to,
+                "osv_vuln_count": osv["vuln_count"],
+                "osv_vuln_ids": osv["vuln_ids"],
                 **registry_signals,
             },
         )
@@ -130,6 +180,18 @@ class Sentinel:
         """Check NPM registry for package existence, age, and download count."""
         signals: dict = {}
         meta = await get_package_metadata(package_name)
+        if meta is None:
+            # get_package_metadata returns None both for a confirmed 404 and
+            # for an exhausted-retries network/transport failure — and this
+            # is the one call site where treating a transient failure as
+            # "confirmed absent" has a severe consequence (Sentinel forces a
+            # BLOCK-level score for "package_not_found", regardless of
+            # ai_suggested). One confirmatory re-fetch, after the failed
+            # attempt's cache entry is evicted (see
+            # npm_registry._fetch_registry_doc_cached), catches most
+            # transient blips before we escalate to that.
+            await asyncio.sleep(0.5)
+            meta = await get_package_metadata(package_name)
         if meta is None:
             return False, {"registry_miss": True}
 
