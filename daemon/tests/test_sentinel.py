@@ -11,7 +11,15 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from daemon.models import PillarScore
+from daemon.pillars import sentinel as sentinel_module
 from daemon.pillars.sentinel import Sentinel, _levenshtein
+
+
+@pytest.fixture(autouse=True)
+def _no_admin_config(monkeypatch):
+    """Disable ~/.cidas/config.json influence so unit tests stay deterministic
+    regardless of what's on the machine running them (matches test_aggregator.py)."""
+    monkeypatch.setattr(sentinel_module, "get_admin_config", lambda: {})
 
 
 @pytest.fixture
@@ -187,31 +195,59 @@ async def test_no_repository_flag_set(sentinel: Sentinel) -> None:
 
 @pytest.mark.asyncio
 async def test_existing_typosquat_scores_100(sentinel: Sentinel) -> None:
-    """Package that exists and is a typosquat (dist=1 from 'lodash') scores 100."""
+    """Package that exists and is a typosquat (dist=1 from 'lodash') scores 100.
+
+    Reputation-corroboration requires the candidate to actually look
+    disparate from the matched target — mocks are keyed by name so "lodahs"
+    (candidate: near-zero downloads, brand new) looks nothing like "lodash"
+    (target: huge downloads, long-established), confirming the disparity.
+    """
+    recent = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    async def _meta(name: str) -> dict:
+        return _make_meta(created=recent) if name == "lodahs" else _make_meta(created="2015-01-01T00:00:00Z")
+
+    async def _downloads(name: str) -> int:
+        return 3 if name == "lodahs" else 5_000_000
+
     with (
-        patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_make_meta())),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=5000)),
+        patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(side_effect=_meta)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(side_effect=_downloads)),
     ):
         result = await sentinel.score("lodahs", ai_suggested=False)
 
     assert result.score == 100.0
     assert "typosquat_detected" in result.flags
+    assert "reputation_disparity_confirmed" in result.flags
 
 
 # ── Non-existent + typosquat path (lines 71-72) ───────────────────────────────
 
 @pytest.mark.asyncio
 async def test_typosquat_also_nonexistent_scores_95_plus(sentinel: Sentinel) -> None:
-    """Package that does not exist and is a typosquat scores >= 95."""
+    """Package that does not exist and is a typosquat scores >= 95.
+
+    The candidate's own lookup returns None (registry miss); the target
+    ("lodash") lookup succeeds, so corroboration confirms genuinely (0
+    candidate downloads vs. lodash's real popularity), not via the
+    lookup-failure fallback path.
+    """
+    async def _meta(name: str) -> dict | None:
+        return None if name == "lodahs" else _make_meta(created="2015-01-01T00:00:00Z")
+
+    async def _downloads(name: str) -> int:
+        return 0 if name == "lodahs" else 5_000_000
+
     with (
-        patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=None)),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+        patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(side_effect=_meta)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(side_effect=_downloads)),
     ):
         result = await sentinel.score("lodahs", ai_suggested=False)
 
     assert result.score >= 95.0
     assert "typosquat_detected" in result.flags
     assert "package_not_found" in result.flags
+    assert "reputation_disparity_confirmed" in result.flags
 
 
 # ── AI-suggested: very_new_package (lines 193-194) ───────────────────────────
@@ -450,3 +486,142 @@ async def test_osv_not_called_for_human_typed(sentinel: Sentinel) -> None:
         await sentinel.score("unique-package-xyz-123", ai_suggested=False)
 
     mock_osv.assert_not_called()
+
+
+# ── Affix canonicalization ─────────────────────────────────────────────────────
+
+def test_check_affix_similarity_detects_node_prefix(sentinel: Sentinel) -> None:
+    is_match, target = sentinel.check_affix_similarity("node-react")
+    assert is_match is True
+    assert target == "react"
+
+
+def test_check_affix_similarity_detects_util_suffix(sentinel: Sentinel) -> None:
+    is_match, target = sentinel.check_affix_similarity("lodash-util")
+    assert is_match is True
+    assert target == "lodash"
+
+
+def test_check_affix_similarity_no_match_for_unrelated_name(sentinel: Sentinel) -> None:
+    is_match, target = sentinel.check_affix_similarity("node-some-other-tool")
+    assert is_match is False
+    assert target == ""
+
+
+def test_check_affix_similarity_ignores_exact_name_with_no_affix(sentinel: Sentinel) -> None:
+    """"react" itself has no affix to strip, so this must not match despite
+    being trivially "equal to itself" after a no-op strip."""
+    is_match, target = sentinel.check_affix_similarity("react")
+    assert is_match is False
+    assert target == ""
+
+
+# ── Reputation-disparity corroboration ─────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_reputation_disparity_confirmed_for_low_download_new_candidate(sentinel: Sentinel) -> None:
+    with (
+        patch("daemon.pillars.sentinel.get_package_metadata",
+              new=AsyncMock(return_value=_make_meta(created="2013-01-01T00:00:00Z"))),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=10_000_000)),
+    ):
+        confirmed, info = await sentinel.check_reputation_disparity(
+            "vue-clone", "vue", {"monthly_downloads": 5, "age_days": 2},
+        )
+    assert confirmed is True
+    assert info["fallback"] is False
+
+
+@pytest.mark.asyncio
+async def test_reputation_disparity_not_confirmed_for_comparable_packages(sentinel: Sentinel) -> None:
+    """Two long-established, similarly-popular packages (the "vue" vs "vite"
+    case) must not be treated as disparate."""
+    with (
+        patch("daemon.pillars.sentinel.get_package_metadata",
+              new=AsyncMock(return_value=_make_meta(created="2016-01-01T00:00:00Z"))),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=8_000_000)),
+    ):
+        confirmed, info = await sentinel.check_reputation_disparity(
+            "vue", "vite", {"monthly_downloads": 7_500_000, "age_days": 3000},
+        )
+    assert confirmed is False
+    assert info["fallback"] is False
+
+
+@pytest.mark.asyncio
+async def test_reputation_disparity_fails_open_on_target_lookup_failure(sentinel: Sentinel) -> None:
+    """A target-lookup outage must fail toward flagging (confirmed=True), not
+    silently suppress the pre-existing force-to-100 behavior."""
+    with (
+        patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=None)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+    ):
+        confirmed, info = await sentinel.check_reputation_disparity(
+            "some-candidate", "some-target", {"monthly_downloads": 5, "age_days": 2},
+        )
+    assert confirmed is True
+    assert info["fallback"] is True
+
+
+# ── Reputation-corroborated score() integration ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_score_vue_vs_vite_not_forced_to_typosquat(sentinel: Sentinel) -> None:
+    """The motivating false-positive case: "vue" (candidate) is Levenshtein
+    distance 2 from "vite" (target) but both are huge, long-established,
+    unrelated packages — corroboration must suppress the force-to-100."""
+    async def _meta(name: str) -> dict:
+        return _make_meta(created="2016-01-01T00:00:00Z")
+
+    async def _downloads(name: str) -> int:
+        return 7_500_000 if name == "vue" else 8_000_000
+
+    with (
+        patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(side_effect=_meta)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(side_effect=_downloads)),
+    ):
+        result = await sentinel.score("vue", ai_suggested=False)
+
+    assert "typosquat_detected" not in result.flags
+    assert result.score < 100.0
+    assert "typosquat_name_similarity_uncorroborated" in result.flags
+
+
+@pytest.mark.asyncio
+async def test_score_node_react_affix_typosquat_detected(sentinel: Sentinel) -> None:
+    """The motivating false-negative case: "node-react" isn't caught by raw
+    Levenshitein distance but is caught by affix-stripping, and (being
+    unregistered / low-reputation) is corroborated."""
+    with (
+        patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=None)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+    ):
+        result = await sentinel.score("node-react", ai_suggested=False)
+
+    assert "typosquat_affix_match" in result.flags
+    assert "typosquat_detected" in result.flags
+    assert result.score == 100.0
+
+
+@pytest.mark.asyncio
+async def test_corroboration_disabled_reverts_to_legacy_behavior(sentinel: Sentinel, monkeypatch) -> None:
+    """typosquat_reputation_corroboration=False restores the pre-Feature-1
+    behavior: any raw-distance hit forces score=100 unconditionally, even for
+    the comparable-downloads "vue"/"vite" case."""
+    monkeypatch.setattr(sentinel_module, "get_admin_config",
+                         lambda: {"typosquat_reputation_corroboration": False})
+
+    async def _meta(name: str) -> dict:
+        return _make_meta(created="2016-01-01T00:00:00Z")
+
+    async def _downloads(name: str) -> int:
+        return 7_500_000 if name == "vue" else 8_000_000
+
+    with (
+        patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(side_effect=_meta)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(side_effect=_downloads)),
+    ):
+        result = await sentinel.score("vue", ai_suggested=False)
+
+    assert "typosquat_detected" in result.flags
+    assert result.score == 100.0

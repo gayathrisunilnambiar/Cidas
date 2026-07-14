@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-07-13T14:52:02.567601+00:00",
+  "timestamp": "2026-07-14T01:53:35.819954+00:00",
   "corpora": [
     "malicious",
     "typosquat",
@@ -7,7 +7,7 @@
     "benign"
   ],
   "total_records": 162,
-  "errors": 10,
+  "errors": 1,
   "metrics": {
     "per_attack_type": {
       "dependency_hijack": {
@@ -41,24 +41,24 @@
         "f1": 0.963
       },
       "protestware": {
-        "TP": 5,
+        "TP": 3,
         "FP": 0,
         "TN": 0,
-        "FN": 2,
+        "FN": 4,
         "ERROR": 0,
         "precision": 1.0,
-        "recall": 0.7143,
-        "f1": 0.8333
+        "recall": 0.4286,
+        "f1": 0.6
       },
       "typosquat": {
-        "TP": 42,
+        "TP": 52,
         "FP": 0,
         "TN": 0,
-        "FN": 15,
+        "FN": 5,
         "ERROR": 0,
         "precision": 1.0,
-        "recall": 0.7368,
-        "f1": 0.8485
+        "recall": 0.9123,
+        "f1": 0.9541
       },
       "credential_theft": {
         "TP": 3,
@@ -71,57 +71,57 @@
         "f1": 0.5455
       },
       "none": {
-        "TP": 17,
-        "FP": 6,
-        "TN": 34,
-        "FN": 6,
-        "ERROR": 10,
-        "precision": 0.7391,
-        "recall": 0.7391,
-        "f1": 0.7391
+        "TP": 18,
+        "FP": 1,
+        "TN": 48,
+        "FN": 5,
+        "ERROR": 1,
+        "precision": 0.9474,
+        "recall": 0.7826,
+        "f1": 0.8571
       }
     },
     "overall": {
-      "TP": 83,
-      "FP": 6,
-      "TN": 34,
-      "FN": 29,
-      "ERROR": 10,
-      "precision": 0.9326,
-      "recall": 0.7411,
-      "f1": 0.8259,
-      "false_positive_rate": 0.15
+      "TP": 92,
+      "FP": 1,
+      "TN": 48,
+      "FN": 20,
+      "ERROR": 1,
+      "precision": 0.9892,
+      "recall": 0.8214,
+      "f1": 0.8976,
+      "false_positive_rate": 0.0204
     },
     "confusion_matrix": {
       "malicious": {
-        "ALLOW": 13,
-        "WARN": 4,
+        "ALLOW": 15,
+        "WARN": 2,
         "BLOCK": 22,
         "ERROR": 0
       },
       "typosquat": {
-        "ALLOW": 10,
-        "WARN": 20,
+        "ALLOW": 0,
+        "WARN": 30,
         "BLOCK": 20,
         "ERROR": 0
       },
       "hallucinated": {
-        "ALLOW": 6,
-        "WARN": 0,
+        "ALLOW": 5,
+        "WARN": 1,
         "BLOCK": 17,
         "ERROR": 0
       },
       "benign": {
-        "ALLOW": 34,
-        "WARN": 6,
+        "ALLOW": 48,
+        "WARN": 1,
         "BLOCK": 0,
-        "ERROR": 10
+        "ERROR": 1
       }
     },
     "latency": {
-      "n_samples": 152,
-      "median_ms": 17202.05,
-      "p95_ms": 65519.7
+      "n_samples": 161,
+      "median_ms": 19726.0,
+      "p95_ms": 43596.1
     }
   }
 }

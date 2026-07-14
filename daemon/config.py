@@ -118,6 +118,25 @@ def get_admin_config() -> dict:
         false to force every version-having package through the full diff
         regardless of manifest equality, e.g. while validating that gating
         isn't suppressing a real detection.
+    typosquat_affix_canonicalization : bool (default true)
+        When true, Sentinel additionally strips common squat affixes
+        (node-, js- prefixes; -js, -util(s), -helper, -async, -core, -lib
+        suffixes) before comparing against TOP_PACKAGES, catching names like
+        "node-react" that raw Levenshtein distance misses entirely. Surfaces
+        as the "typosquat_affix_match" flag, independent of the raw-distance
+        "typosquat_detected" signal. When false, only raw Levenshtein
+        distance is checked (pre-Feature-1 behavior).
+    typosquat_reputation_corroboration : bool (default true)
+        When true, a raw-Levenshtein or affix-canonicalization typosquat hit
+        only escalates to a forced score=100 ("typosquat_detected") if the
+        candidate also shows a reputation disparity vs. the matched popular
+        package (far fewer downloads, or new where the target is mature).
+        Prevents false positives between short, legitimately-unrelated names
+        (e.g. "vue" vs "vite"). When false, reverts to the pre-corroboration
+        behavior: any name-similarity hit forces score=100 unconditionally.
+        If the target package's own registry/download lookup fails, the
+        corroboration check fails toward flagging (treats it as corroborated)
+        rather than silently suppressing — see Sentinel.check_reputation_disparity.
     """
     config_path = Path.home() / ".cidas" / "config.json"
     try:
