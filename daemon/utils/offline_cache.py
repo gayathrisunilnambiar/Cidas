@@ -90,7 +90,17 @@ async def record_allow(
 
     def _do() -> None:
         path = _path()
-        cache = _read_sync(path)
+        try:
+            cache = _read_sync(path)
+        except OSError as e:
+            # Concurrent scans can race a reader against another writer's
+            # os.replace() — on Windows this surfaces as a transient
+            # PermissionError, not just FileNotFoundError. _read_sync only
+            # catches the latter, so guard the call itself: a read failure
+            # here must degrade to "start from empty", matching this
+            # function's documented never-raise contract, not 500 the scan.
+            log.warning("offline-cache read failed for %s: %s", cache_key, e)
+            cache = {}
         cache[cache_key] = {
             "package_name": package_name,
             "version":      version or "latest",

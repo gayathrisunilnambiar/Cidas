@@ -5,6 +5,7 @@ Covers the hallucination-risk path (ai_suggested=True) and the fast-path
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -38,12 +39,16 @@ def test_exact_name_not_flagged_as_typosquat(sentinel: Sentinel) -> None:
 
 # ── Integration tests (async with mocked network) ─────────────────────────────
 
+_NO_OSV = {"vuln_count": 0, "has_malware": False, "vuln_ids": []}
+
+
 @pytest.mark.asyncio
 async def test_ai_suggested_nonexistent_package_scores_high(sentinel: Sentinel) -> None:
     """An AI-suggested package that does not exist in the registry should score high."""
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=None)),
         patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+        patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=_NO_OSV)),
     ):
         result = await sentinel.score("totally-made-up-pkg-xyz123", ai_suggested=True)
 
@@ -54,17 +59,31 @@ async def test_ai_suggested_nonexistent_package_scores_high(sentinel: Sentinel) 
 
 @pytest.mark.asyncio
 async def test_human_typed_package_skips_hallucination_check(sentinel: Sentinel) -> None:
-    """Human-typed installs should never trigger the hallucination registry check.
+    """Human-typed installs skip the *hallucination* risk analysis (age/OSV/etc.)
 
-    Uses 'webpack' which is an exact match in TOP_PACKAGES (distance == 0) so
+    Registry existence is still checked unconditionally regardless of
+    ai_suggested (that's what catches fake/typosquatted names for human-typed
+    installs too) — only compute_hallucination_risk and the OSV lookup are
+    skipped. 'webpack' is an exact match in TOP_PACKAGES (distance == 0) so
     the typosquat check does not fire either, giving a clean score of 0.
-    If the network were hit this would fail (no mock), confirming no async
-    calls are made for human-typed packages.
     """
-    result = await sentinel.score("webpack", ai_suggested=False)
+    good_meta = {
+        "time": {"created": "2016-01-01T00:00:00Z"},
+        "maintainers": [{"name": "a"}, {"name": "b"}],
+        "repository": {"url": "https://github.com/webpack/webpack"},
+        "versions": {"5.0.0": {}},
+    }
+    with (
+        patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=good_meta)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=5_000_000)),
+        patch("daemon.pillars.sentinel.check_osv", new=AsyncMock()) as mock_osv,
+    ):
+        result = await sentinel.score("webpack", ai_suggested=False)
+
     assert isinstance(result, PillarScore)
     assert result.score == 0.0
     assert result.metadata.get("hallucination_check") == "skipped"
+    mock_osv.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -80,6 +99,7 @@ async def test_real_package_scores_low(sentinel: Sentinel) -> None:
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=good_meta)),
         patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=5_000_000)),
+        patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=_NO_OSV)),
     ):
         result = await sentinel.score("lodash", ai_suggested=True)
 
@@ -90,8 +110,9 @@ async def test_real_package_scores_low(sentinel: Sentinel) -> None:
 @pytest.mark.asyncio
 async def test_new_ai_suggested_package_scores_higher(sentinel: Sentinel) -> None:
     """A brand-new package with zero downloads should receive a higher risk score."""
+    recent = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     new_meta = {
-        "time": {"created": "2026-04-20T00:00:00Z"},
+        "time": {"created": recent},
         "maintainers": [{"name": "anon"}],
         "repository": None,
         "versions": {"0.0.1": {}},
@@ -100,6 +121,7 @@ async def test_new_ai_suggested_package_scores_higher(sentinel: Sentinel) -> Non
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=new_meta)),
         patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+        patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=_NO_OSV)),
     ):
         result = await sentinel.score("brand-new-package", ai_suggested=True)
 
@@ -197,10 +219,12 @@ async def test_typosquat_also_nonexistent_scores_95_plus(sentinel: Sentinel) -> 
 @pytest.mark.asyncio
 async def test_very_new_package_flag_set(sentinel: Sentinel) -> None:
     """AI-suggested package created 3 days ago triggers very_new_package flag."""
-    meta = _make_meta(created="2026-05-11T00:00:00Z")
+    three_days_ago = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    meta = _make_meta(created=three_days_ago)
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=meta)),
         patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=1000)),
+        patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=_NO_OSV)),
     ):
         result = await sentinel.score("unique-package-xyz-123", ai_suggested=True)
 
@@ -213,10 +237,12 @@ async def test_very_new_package_flag_set(sentinel: Sentinel) -> None:
 @pytest.mark.asyncio
 async def test_new_package_flag_set(sentinel: Sentinel) -> None:
     """AI-suggested package created 15 days ago triggers new_package (7≤age<30) flag."""
-    meta = _make_meta(created="2026-04-29T00:00:00Z")
+    fifteen_days_ago = (datetime.now(timezone.utc) - timedelta(days=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    meta = _make_meta(created=fifteen_days_ago)
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=meta)),
         patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=1000)),
+        patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=_NO_OSV)),
     ):
         result = await sentinel.score("unique-package-xyz-123", ai_suggested=True)
 
@@ -232,6 +258,7 @@ async def test_ai_very_low_downloads_flag_set(sentinel: Sentinel) -> None:
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=meta)),
         patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=50)),
+        patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=_NO_OSV)),
     ):
         result = await sentinel.score("unique-package-xyz-123", ai_suggested=True)
 
@@ -342,3 +369,84 @@ async def test_non_ai_package_skips_age_and_download_checks(sentinel: Sentinel) 
     assert result.metadata.get("hallucination_check") == "skipped"
     for flag in ("very_new_package", "new_package", "zero_downloads", "very_low_downloads"):
         assert flag not in result.flags
+
+
+# ── Known-incident blocklist ──────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_known_compromised_package_blocked(sentinel: Sentinel) -> None:
+    """flatmap-stream must return known_supply_chain_incident without any network call."""
+    result = await sentinel.score("flatmap-stream", ai_suggested=False)
+
+    assert result.score == 95.0
+    assert "known_supply_chain_incident" in result.flags
+    assert "incident" in result.metadata
+
+
+@pytest.mark.asyncio
+async def test_node_ipc_blocked_as_known_incident(sentinel: Sentinel) -> None:
+    """node-ipc (peacenotwar, 2022) must be caught by the blocklist."""
+    result = await sentinel.score("node-ipc", ai_suggested=False)
+
+    assert result.score == 95.0
+    assert "known_supply_chain_incident" in result.flags
+
+
+@pytest.mark.asyncio
+async def test_known_incident_applies_regardless_of_ai_suggested(sentinel: Sentinel) -> None:
+    """Blocklist check fires for both human-typed and AI-suggested installs."""
+    result_human = await sentinel.score("event-stream", ai_suggested=False)
+    result_ai    = await sentinel.score("event-stream", ai_suggested=True)
+
+    assert result_human.score == 95.0
+    assert result_ai.score == 95.0
+    assert "known_supply_chain_incident" in result_human.flags
+    assert "known_supply_chain_incident" in result_ai.flags
+
+
+# ── OSV vulnerability lookup ──────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_osv_advisory_boosts_score(sentinel: Sentinel) -> None:
+    """An AI-suggested package with OSV advisories should receive a score boost."""
+    meta = _make_meta(created="2020-01-01T00:00:00Z")
+    osv_result = {"vuln_count": 2, "has_malware": False, "vuln_ids": ["GHSA-abc-123"]}
+    with (
+        patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=meta)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=5_000)),
+        patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=osv_result)),
+    ):
+        result = await sentinel.score("some-vuln-pkg", ai_suggested=True)
+
+    assert "osv_advisory_found" in result.flags
+    assert result.metadata.get("osv_vuln_count") == 2
+
+
+@pytest.mark.asyncio
+async def test_osv_malware_confirmed_flag(sentinel: Sentinel) -> None:
+    """has_malware=True from OSV should add osv_malware_confirmed flag and max out score."""
+    meta = _make_meta(created="2020-01-01T00:00:00Z")
+    osv_result = {"vuln_count": 1, "has_malware": True, "vuln_ids": ["MAL-2022-1"]}
+    with (
+        patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=meta)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=500_000)),
+        patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=osv_result)),
+    ):
+        result = await sentinel.score("some-malware-pkg", ai_suggested=True)
+
+    assert "osv_malware_confirmed" in result.flags
+    assert result.score == 100.0
+
+
+@pytest.mark.asyncio
+async def test_osv_not_called_for_human_typed(sentinel: Sentinel) -> None:
+    """check_osv must not be called for human-typed (non-AI) installs."""
+    meta = _make_meta(created="2020-01-01T00:00:00Z")
+    with (
+        patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=meta)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=500_000)),
+        patch("daemon.pillars.sentinel.check_osv", new=AsyncMock()) as mock_osv,
+    ):
+        await sentinel.score("unique-package-xyz-123", ai_suggested=False)
+
+    mock_osv.assert_not_called()

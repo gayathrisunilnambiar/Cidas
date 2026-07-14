@@ -8,7 +8,9 @@ which the calling pillar should treat as a high-risk signal.
 """
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 from datetime import datetime
 from typing import Any
 
@@ -22,6 +24,64 @@ log = get_logger(__name__)
 _TIMEOUT = httpx.Timeout(5.0)
 _DOWNLOADS_BASE = "https://api.npmjs.org/downloads/point/last-month"
 
+# ── Per-package metadata single-flight cache ──────────────────────────────────
+#
+# A single /scan request fans out to several call sites that each need the
+# same package's full registry document: Contextify (description), Sentinel
+# (existence/age/repo signals), Shield (tarball info, when router doesn't pass
+# pre-fetched metadata), disk_checker (unpacked size), get_direct_dependencies,
+# and get_version_history (used by the cross-version diff analyzer). Every one
+# of them hits the exact same URL (`{registry_url}/{name}` — version-specific
+# lookups just slice the same full document locally), so without this cache
+# one scan of an existing package makes 5+ redundant round-trips to
+# registry.npmjs.org, which measured in the tens of seconds per scan in a live
+# evaluation run. The TTL is short — just long enough to span one request's
+# concurrent pillar fan-out — so it never serves meaningfully stale data
+# across genuinely separate scans.
+_METADATA_CACHE_TTL = 10.0
+_metadata_cache: dict[str, tuple[float, "asyncio.Future[dict[str, Any] | None]"]] = {}
+_metadata_cache_lock = asyncio.Lock()
+
+
+async def _fetch_registry_doc_cached(name: str) -> dict[str, Any] | None:
+    """Single-flight, short-TTL cache around the full-document registry fetch."""
+    now = time.monotonic()
+    async with _metadata_cache_lock:
+        cached = _metadata_cache.get(name)
+        if cached is not None and now - cached[0] < _METADATA_CACHE_TTL:
+            future = cached[1]
+        else:
+            url = f"{get_settings().npm_registry_url}/{name}"
+            future = asyncio.ensure_future(_get(url))
+            _metadata_cache[name] = (now, future)
+    try:
+        result = await future
+    except Exception:
+        # A failed fetch must not poison the cache for the TTL window —
+        # drop the entry so the next caller gets a fresh attempt.
+        async with _metadata_cache_lock:
+            if _metadata_cache.get(name) == (now, future):
+                _metadata_cache.pop(name, None)
+        raise
+    if result is None:
+        # _get() also returns None (rather than raising) after exhausting
+        # its own retries on a transient timeout/transport failure — not
+        # just on a confirmed 404. Caching that outcome would mean a single
+        # network blip gets treated as "confirmed absent" by every caller
+        # for the rest of the TTL window (Sentinel escalates this to a
+        # forced BLOCK — empirically observed force-blocking real, popular
+        # packages during a live evaluation run). Don't cache failures; only
+        # a genuine successful fetch is worth sharing across pillars.
+        async with _metadata_cache_lock:
+            if _metadata_cache.get(name) == (now, future):
+                _metadata_cache.pop(name, None)
+    return result
+
+
+def _clear_metadata_cache() -> None:
+    """Test-only helper: reset the single-flight cache between test cases."""
+    _metadata_cache.clear()
+
 
 async def _get(url: str) -> dict[str, Any] | None:
     """Make a single GET request; returns parsed JSON or None on error."""
@@ -33,7 +93,12 @@ async def _get(url: str) -> dict[str, Any] | None:
                     return None
                 resp.raise_for_status()
                 return resp.json()  # type: ignore[return-value]
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            # TransportError covers NetworkError plus RemoteProtocolError
+            # ("server disconnected without sending a response") and other
+            # connection-level failures — under real concurrent load the
+            # registry occasionally drops a connection without a clean error,
+            # which used to propagate uncaught and 500 the whole /scan request.
             if attempt == 2:
                 log.warning("GET %s failed after 2 attempts: %s", url, exc)
                 return None
@@ -54,9 +119,7 @@ async def get_package_metadata(name: str, version: str | None = None) -> dict[st
     from ``dist.unpackedSize`` of the resolved version.  Defaults to 0 when
     the field is absent or the registry omits it.
     """
-    settings = get_settings()
-    url = f"{settings.npm_registry_url}/{name}"
-    meta = await _get(url)
+    meta = await _fetch_registry_doc_cached(name)
     if meta is None:
         return None
     if version:
@@ -66,13 +129,19 @@ async def get_package_metadata(name: str, version: str | None = None) -> dict[st
         dist = manifest.get("dist") or {}
         manifest["unpackedSize"] = int(dist.get("unpackedSize") or 0)
         return manifest
-    # Full registry document: inject unpackedSize from the latest version.
+    # Full registry document: inject unpackedSize and deprecation info from the latest version.
     latest = (meta.get("dist-tags") or {}).get("latest")
     if latest:
-        dist = ((meta.get("versions") or {}).get(latest) or {}).get("dist") or {}
+        latest_ver = (meta.get("versions") or {}).get(latest) or {}
+        dist = latest_ver.get("dist") or {}
         meta["unpackedSize"] = int(dist.get("unpackedSize") or 0)
+        dep_msg = latest_ver.get("deprecated")
+        meta["deprecated"] = bool(dep_msg)
+        meta["deprecation_message"] = str(dep_msg) if dep_msg else ""
     else:
         meta["unpackedSize"] = 0
+        meta["deprecated"] = False
+        meta["deprecation_message"] = ""
     return meta
 
 

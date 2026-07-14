@@ -59,6 +59,17 @@ def _percentile(sorted_vals: list[float], p: float) -> float:
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
+@pytest.fixture(autouse=True)
+def _no_real_network(mock_npm_registry):
+    """Every test in this module measures routing/scheduling overhead, not
+    real npm-registry latency. Without this, disk_checker's get_package_size
+    call (invoked on every /scan, cache-hit or not — see router.py's
+    _append_disk_footprint) makes a real HTTPS request to registry.npmjs.org,
+    which is what actually blew the latency budgets here, not a regression
+    in the routing code."""
+    yield
+
+
 @pytest.fixture
 def auth_headers() -> dict[str, str]:
     """Bearer token header; the test client already bypasses auth, but real requests need it."""
