@@ -202,6 +202,21 @@ class Aggregator:
         if "typosquat_detected" in sentinel.flags:
             return float(settings.warn_threshold)
 
+        # A raw name-similarity hit whose reputation-disparity corroboration
+        # was genuinely unresolvable (candidate/target download-count fetch
+        # failed transiently, not "checked and found not disparate") carries
+        # the same weight-dilution risk as typosquat_detected above: Sentinel's
+        # pillar-level floor score for this case (50.0) is itself already in
+        # WARN range, but at the default 0.35 sentinel_weight that only
+        # contributes ~17.5 points to the aggregate, well below the 40-point
+        # WARN threshold if Contextify/Shield are quiet. Floor at WARN so a
+        # transient corroboration failure never silently degrades to ALLOW
+        # just because the other two pillars had nothing to add — this
+        # regressed a live concurrent-load evaluation run (new false
+        # negatives) before this gate was added.
+        if "typosquat_corroboration_undetermined" in sentinel.flags:
+            return float(settings.warn_threshold)
+
         # Shield couldn't examine the actual requested version — its own
         # manifest/tarball is gone from the registry (e.g. npm purged it
         # after a compromise). That's not confirmed malicious on its own

@@ -28,6 +28,7 @@ from ..config import get_admin_config, get_settings
 from ..models import PillarScore
 from ..utils.logger import get_logger
 from ..utils.npm_registry import (
+    DownloadCountLookup,
     RegistryLookup,
     get_download_count,
     get_package_metadata,
@@ -126,6 +127,18 @@ def _strip_affixes(name: str) -> str:
     return n
 
 
+def _uncorroborated_flag(corr_info: dict) -> str:
+    """Distinguish "checked corroboration fully and it wasn't disparate"
+    from "had a name collision but couldn't verify severity because
+    download-count data was unresolved on either side" — conflating these
+    into a single flag would lose real information about which records
+    need a closer look versus which were genuinely cleared.
+    """
+    if corr_info.get("corroboration_undetermined"):
+        return "typosquat_corroboration_undetermined"
+    return "typosquat_name_similarity_uncorroborated"
+
+
 def _levenshtein(a: str, b: str) -> int:
     if len(a) < len(b):
         a, b = b, a
@@ -212,11 +225,11 @@ class Sentinel:
 
         corroborated = False
         corr_info: dict = {}
+        candidate_signals = registry_signals if exists else {"monthly_downloads": 0, "age_days": None}
         if raw_hit:
             if not corroboration_on:
                 corroborated, corr_info = True, {"fallback": True}
             else:
-                candidate_signals = registry_signals if exists else {"monthly_downloads": 0, "age_days": None}
                 corroborated, corr_info = await self.check_reputation_disparity(
                     package_name, matched_target, candidate_signals,
                 )
@@ -240,7 +253,7 @@ class Sentinel:
                     if not corr_info.get("fallback"):
                         flags.append("reputation_disparity_confirmed")
                 elif raw_hit:
-                    flags.append("typosquat_name_similarity_uncorroborated")
+                    flags.append(_uncorroborated_flag(corr_info))
                 return PillarScore(
                     score=15.0,
                     confidence=0.3,
@@ -269,7 +282,7 @@ class Sentinel:
                 # existing typosquat.
                 score = 100.0
             elif raw_hit:
-                flags.append("typosquat_name_similarity_uncorroborated")
+                flags.append(_uncorroborated_flag(corr_info))
             return PillarScore(
                 score=score,
                 confidence=0.95,
@@ -298,12 +311,46 @@ class Sentinel:
                     "similar_to": similar_to, "affix_similar_to": affix_similar_to,
                     "ai_suggested": ai_suggested, "exists": True,
                     **{k: v for k, v in corr_info.items() if k != "fallback"},
+                    **candidate_signals,
+                },
+            )
+
+        # A raw name-similarity hit whose corroboration was genuinely
+        # unresolvable (download-count data missing on either side, not
+        # "checked and found not disparate") must not silently fall through
+        # to the ordinary downloads/repo-based scoring below — for a
+        # candidate with otherwise-normal-looking registry signals (real
+        # typosquats are frequently unregistered or low-traffic, but the
+        # *fetch* failing transiently under load doesn't change what the
+        # candidate actually is), that path can land as low as ALLOW,
+        # silently dropping a genuine typosquat whose corroboration check
+        # simply couldn't complete this time. This regressed a live
+        # concurrent-load evaluation run (recall dropped 0.88 -> 0.83,
+        # +7 new false negatives) before this explicit floor was added.
+        # A WARN-level floor reflects genuine uncertainty without either
+        # confirming disparity (which would reintroduce the yup/zod
+        # false-positive) or silently clearing it.
+        if raw_hit and corr_info.get("corroboration_undetermined"):
+            flags = ["typosquat_corroboration_undetermined"]
+            if is_affix_typo:
+                flags.append("typosquat_affix_match")
+            if is_homoglyph_typo:
+                flags.append("typosquat_homoglyph_match")
+            return PillarScore(
+                score=50.0,
+                confidence=0.5,
+                flags=flags,
+                metadata={
+                    "similar_to": similar_to, "affix_similar_to": affix_similar_to,
+                    "ai_suggested": ai_suggested, "exists": True,
+                    **{k: v for k, v in corr_info.items() if k not in ("fallback", "corroboration_undetermined")},
+                    **candidate_signals,
                 },
             )
 
         # A name-similarity hit that failed corroboration still surfaces as a
         # (non-forcing) flag through whichever scoring path runs below.
-        uncorroborated_flags = ["typosquat_name_similarity_uncorroborated"] if raw_hit else []
+        uncorroborated_flags = [_uncorroborated_flag(corr_info)] if raw_hit else []
 
         # For non-AI suggested packages that exist and aren't a corroborated typosquat, do basic checks
         if not ai_suggested:
@@ -410,12 +457,21 @@ class Sentinel:
             except ValueError:
                 signals["age_days"] = None
 
-        # Download count signal
+        # Download count signal. An unresolved fetch (429-after-retries,
+        # timeout, non-404 error, or an unexpected exception) still
+        # defaults monthly_downloads to 0 for general scoring purposes, but
+        # is marked distinctly so check_reputation_disparity can tell a
+        # genuinely-confirmed zero apart from "couldn't measure this" and
+        # refuse to let the latter silently participate in a ratio.
         try:
-            downloads = await get_download_count(package_name)
-            signals["monthly_downloads"] = downloads
+            dl_result = await get_download_count(package_name)
         except Exception:
+            dl_result = None
+        if dl_result is not None and dl_result.status is DownloadCountLookup.RESOLVED:
+            signals["monthly_downloads"] = dl_result.count
+        else:
             signals["monthly_downloads"] = 0
+            signals["download_count_undetermined"] = True
 
         # Repository presence
         signals["has_repository"] = bool(meta.get("repository"))
@@ -464,9 +520,22 @@ class Sentinel:
         fails (network error, confirmed-absent target), returns
         ``(True, {"fallback": True})`` so a corroboration-check outage never
         silently downgrades the pre-existing force-to-100 behavior.
+
+        The download-count *ratio* signal is different from a total lookup
+        outage: existence and age can still be known even when the
+        download-count fetch specifically is unresolved on either side. In
+        that narrower case this must NOT confirm disparity by treating the
+        unresolved count as a real number (a candidate-side fetch failure
+        silently defaulting to 0 previously let it masquerade as "near-zero
+        downloads," spuriously confirming disparity for large, legitimate
+        packages — see the yup/zod investigation). It also must not
+        silently fall back to "checked, not disparate" either, since that
+        loses the fact that download-based corroboration genuinely
+        couldn't be attempted; age-based corroboration still runs
+        independently since it doesn't depend on the download fetch.
         """
         try:
-            target_result, target_downloads = await asyncio.gather(
+            target_result, target_dl_result = await asyncio.gather(
                 get_package_metadata(target_name), get_download_count(target_name),
             )
         except Exception as exc:
@@ -481,8 +550,16 @@ class Sentinel:
 
         settings = get_settings()
         candidate_downloads = candidate_signals.get("monthly_downloads", 0) or 0
-        ratio = candidate_downloads / target_downloads if target_downloads > 0 else 0.0
-        disparity_by_downloads = target_downloads > 0 and ratio < settings.reputation_ratio_threshold
+        candidate_dl_undetermined = bool(candidate_signals.get("download_count_undetermined"))
+        target_dl_undetermined = target_dl_result.status is not DownloadCountLookup.RESOLVED
+        download_data_undetermined = candidate_dl_undetermined or target_dl_undetermined
+
+        target_downloads: int | None = target_dl_result.count if not target_dl_undetermined else None
+        ratio: float | None = None
+        disparity_by_downloads = False
+        if not download_data_undetermined and target_downloads is not None:
+            ratio = candidate_downloads / target_downloads if target_downloads > 0 else 0.0
+            disparity_by_downloads = target_downloads > 0 and ratio < settings.reputation_ratio_threshold
 
         candidate_age = candidate_signals.get("age_days")
         target_created = target_meta.get("time", {}).get("created", "")
@@ -501,12 +578,19 @@ class Sentinel:
         )
 
         confirmed = disparity_by_downloads or disparity_by_age
-        return confirmed, {
+        info = {
             "target_downloads": target_downloads,
-            "download_ratio": round(ratio, 4),
+            "download_ratio": round(ratio, 4) if ratio is not None else None,
             "target_age_days": target_age,
             "fallback": False,
         }
+        if download_data_undetermined and not confirmed:
+            # Genuinely couldn't measure the download-based signal on
+            # either side, and age-based corroboration didn't independently
+            # confirm either — distinct from "checked both signals fully
+            # and neither indicated disparity."
+            info["corroboration_undetermined"] = True
+        return confirmed, info
 
     def compute_hallucination_risk(
         self,

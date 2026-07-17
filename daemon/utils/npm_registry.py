@@ -339,15 +339,47 @@ def _clear_download_cache() -> None:
     _download_cache.clear()
 
 
-async def _fetch_download_count(name: str) -> int:
+class DownloadCountLookup(Enum):
+    """Outcome of a download-count lookup, mirroring RegistryLookup's
+    existence/absence/ambiguity split for the same reason: a transient
+    fetch failure (429-after-retries, timeout, non-404 error) must not be
+    conflated with a genuinely-confirmed zero. A bare ``int`` return value
+    with 0 silently overloaded to mean both was found to spuriously
+    confirm reputation-disparity corroboration for large, legitimate
+    packages (``yup``/``zod``) when their download-count fetch happened to
+    fail under concurrent load — the ratio computation treated the silent
+    0 as a real number instead of recognizing it couldn't be measured.
+    """
+
+    RESOLVED = "resolved"
+    UNDETERMINED = "undetermined"
+
+
+@dataclass(frozen=True)
+class DownloadCountResult:
+    """Result of a download-count fetch. ``count`` is populated (including
+    a legitimate 0, e.g. a brand-new or obscure package) only when
+    ``status is DownloadCountLookup.RESOLVED``."""
+
+    status: DownloadCountLookup
+    count: int | None = None
+
+
+async def _fetch_download_count(name: str) -> DownloadCountResult:
     result = await _get(f"{_DOWNLOADS_BASE}/{name}")
+    if result.status is RegistryLookup.UNDETERMINED:
+        return DownloadCountResult(DownloadCountLookup.UNDETERMINED)
+    # CONFIRMED_ABSENT (404 from the downloads endpoint) and a missing
+    # "downloads" field both mean "no download data on record" — a
+    # legitimate, confirmed 0, not an ambiguous fetch failure.
     if result.status is not RegistryLookup.EXISTS or result.data is None:
-        return 0
-    return int(result.data.get("downloads", 0))
+        return DownloadCountResult(DownloadCountLookup.RESOLVED, 0)
+    return DownloadCountResult(DownloadCountLookup.RESOLVED, int(result.data.get("downloads", 0)))
 
 
-async def get_download_count(name: str) -> int:
-    """Return last-month download count from the npm downloads API.
+async def get_download_count(name: str) -> DownloadCountResult:
+    """Return a tri-state last-month download-count result from the npm
+    downloads API.
 
     Single-flight cached per *name* for _DOWNLOAD_CACHE_TTL seconds — see
     the cache docstring above for why this matters for corroboration.

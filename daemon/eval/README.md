@@ -396,6 +396,72 @@ attack variants because it does not rely on any single detection signal.
 
 ---
 
+## Sentinel regression checks and raw registry-signal logging
+
+Every `Sentinel.score()` result's `metadata` now carries the full raw
+registry inputs it read for that call — candidate `monthly_downloads`,
+`age_days`, `has_repository`, `maintainer_count`, `registry_status`, plus
+(when a name-similarity hit ran reputation-disparity corroboration)
+`target_downloads` and `target_age_days` for the matched popular package.
+This is persisted alongside `flags`/`score` in every cached `sentinel_json`
+row (`scan_cache` table) — not just on a flagged mismatch — so a future
+drift or regression investigation can read back the exact inputs behind
+any historical decision without needing to re-derive or guess them.
+
+Before this change, the "package exists + corroborated typosquat" branch
+(the one responsible for a forced `score=100.0`) only returned the
+target-side corroboration numbers, not the candidate's own
+downloads/age/repo signals — a real gap surfaced during a regression
+investigation into the Sentinel constant-promotion refactor, where a
+handful of decisions that flipped between two live runs of the same
+corpus record could not be root-caused because the candidate-side inputs
+used in the original flagging run were never persisted. This is purely
+additive (new metadata keys; no scoring or flag logic changed) and does
+not alter any existing test's expectations.
+
+**A related finding from that same investigation — since fixed.**
+`get_download_count()` used to fail *open* on a transient registry error:
+a 429 exhausted after retries, a timeout, or a non-404 HTTP error all
+resolved to a silently-returned `0` (in the old `_fetch_download_count`),
+not an exception. For most callers that's the right default (treat
+"couldn't confirm downloads" as "assume low"), but for reputation-disparity
+corroboration specifically, a transient failure on the *candidate's own*
+download-count lookup could be silently indistinguishable from "this
+package really has 0 downloads" — artificially confirming a disparity for
+a large, legitimate package if its download-count fetch happened to fail
+right when a name-similarity collision also fired (short package names,
+e.g. 3-letter names, are especially prone to incidental edit-distance
+collisions against other short popular names — a known, separate
+limitation). This was observed concretely: `yup` (48M downloads) and `zod`
+(920M downloads) — both well within Levenshtein distance 2 of `vue` and
+`got` respectively, a legitimate if coincidental name collision, not a
+matcher bug — spuriously flagged as a corroborated typosquat under 4-way
+concurrent load in one run, never reproduced serially or in any repeated
+isolated check.
+
+This is now fixed with a tri-state `DownloadCountResult`
+(`DownloadCountLookup.RESOLVED` / `UNDETERMINED`), mirroring the
+`RegistryLookup.EXISTS` / `CONFIRMED_ABSENT` / `UNDETERMINED` pattern
+already used for registry-existence checks — the same idiom, not a second
+differently-shaped one. `check_reputation_disparity` now refuses to let an
+unresolved download count on either side participate in the ratio
+computation as if it were a real number; a raw name-similarity hit whose
+corroboration was genuinely unresolvable gets its own distinct
+`typosquat_corroboration_undetermined` flag (separate from
+`typosquat_name_similarity_uncorroborated`, which now means "checked fully,
+not disparate") and a WARN-level pillar score. That pillar score alone
+isn't enough to survive weight dilution at the aggregate level (0.35 ×
+50.0 = 17.5, below the 40-point WARN threshold when Contextify/Shield are
+quiet) — an Aggregator Stage-1 gate floors the decision at WARN for this
+flag, mirroring the existing `typosquat_detected` gate. Verified via a
+full-corpus concurrent evaluation (`--concurrency 4`, matching the
+original bug's conditions): the typosquat category's confusion matrix and
+overall recall (TP=122, FN=17, F1=0.9349) are byte-identical before/after
+the fix, and `yup`/`zod` no longer spuriously confirm even when their
+download-count fetch is simulated as failing (see
+`test_score_large_package_under_simulated_concurrent_load_failure` in
+`daemon/tests/test_sentinel.py`).
+
 ## Notes on responsible use
 
 The malicious records reference packages that have been removed from

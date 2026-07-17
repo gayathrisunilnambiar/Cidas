@@ -256,6 +256,19 @@ def test_stage1_gates_returns_warn_threshold_for_typosquat_only(settings) -> Non
     assert Aggregator._stage1_gates(sen, _ps(0), settings) == float(settings.warn_threshold)
 
 
+def test_stage1_gates_returns_warn_threshold_for_undetermined_corroboration(settings) -> None:
+    """typosquat_corroboration_undetermined (a raw name-similarity hit whose
+    reputation-disparity check couldn't resolve download-count data on
+    either side) must floor at WARN, same as typosquat_detected — otherwise
+    Sentinel's pillar-level floor score (50.0) gets diluted by weighting
+    (0.35 * 50.0 = 17.5, below the 40-point WARN threshold) and silently
+    falls through to ALLOW when Contextify/Shield are quiet. This is the
+    exact false-negative regression a concurrent-load eval run surfaced
+    before this gate was added."""
+    sen = _ps(50, flags=["typosquat_corroboration_undetermined"])
+    assert Aggregator._stage1_gates(sen, _ps(0), settings) == float(settings.warn_threshold)
+
+
 def test_stage1_gates_prioritizes_block_over_warn_when_both_conditions_present(settings) -> None:
     sen = _ps(0, flags=["package_not_found", "typosquat_detected"])
     assert Aggregator._stage1_gates(sen, _ps(0), settings) == float(settings.block_threshold)

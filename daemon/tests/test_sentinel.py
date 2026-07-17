@@ -13,7 +13,7 @@ import pytest
 from daemon.models import PillarScore
 from daemon.pillars import sentinel as sentinel_module
 from daemon.pillars.sentinel import Sentinel, _levenshtein, _normalize_confusables
-from daemon.utils.npm_registry import RegistryLookup, RegistryResult
+from daemon.utils.npm_registry import DownloadCountLookup, DownloadCountResult, RegistryLookup, RegistryResult
 
 
 @pytest.fixture(autouse=True)
@@ -56,7 +56,7 @@ async def test_ai_suggested_nonexistent_package_scores_high(sentinel: Sentinel) 
     """An AI-suggested package that does not exist in the registry should score high."""
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_absent())),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 0))),
         patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=_NO_OSV)),
     ):
         result = await sentinel.score("totally-made-up-pkg-xyz123", ai_suggested=True)
@@ -84,7 +84,7 @@ async def test_human_typed_package_skips_hallucination_check(sentinel: Sentinel)
     }
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(good_meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=5_000_000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 5_000_000))),
         patch("daemon.pillars.sentinel.check_osv", new=AsyncMock()) as mock_osv,
     ):
         result = await sentinel.score("webpack", ai_suggested=False)
@@ -107,7 +107,7 @@ async def test_real_package_scores_low(sentinel: Sentinel) -> None:
     }
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(good_meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=5_000_000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 5_000_000))),
         patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=_NO_OSV)),
     ):
         result = await sentinel.score("lodash", ai_suggested=True)
@@ -129,7 +129,7 @@ async def test_new_ai_suggested_package_scores_higher(sentinel: Sentinel) -> Non
     }
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(new_meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 0))),
         patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=_NO_OSV)),
     ):
         result = await sentinel.score("brand-new-package", ai_suggested=True)
@@ -167,7 +167,7 @@ async def test_zero_downloads_flag_set(sentinel: Sentinel) -> None:
     """Non-AI package with zero downloads sets zero_downloads flag and score > 0."""
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(_make_meta()))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 0))),
     ):
         result = await sentinel.score("unique-package-xyz-123", ai_suggested=False)
 
@@ -180,7 +180,7 @@ async def test_very_low_downloads_flag_set(sentinel: Sentinel) -> None:
     """Non-AI package with 50 downloads (< 100) sets very_low_downloads flag."""
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(_make_meta()))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=50)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 50))),
     ):
         result = await sentinel.score("unique-package-xyz-123", ai_suggested=False)
 
@@ -193,7 +193,7 @@ async def test_no_repository_flag_set(sentinel: Sentinel) -> None:
     """Non-AI package with no repository field sets no_repository flag."""
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(_make_meta(has_repo=False)))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=1000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 1000))),
     ):
         result = await sentinel.score("unique-package-xyz-123", ai_suggested=False)
 
@@ -216,8 +216,8 @@ async def test_existing_typosquat_scores_100(sentinel: Sentinel) -> None:
     async def _meta(name: str, *args, **kwargs) -> RegistryResult:
         return _exists(_make_meta(created=recent) if name == "lodahs" else _make_meta(created="2015-01-01T00:00:00Z"))
 
-    async def _downloads(name: str) -> int:
-        return 3 if name == "lodahs" else 5_000_000
+    async def _downloads(name: str) -> DownloadCountResult:
+        return DownloadCountResult(DownloadCountLookup.RESOLVED, 3 if name == "lodahs" else 5_000_000)
 
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(side_effect=_meta)),
@@ -244,8 +244,8 @@ async def test_typosquat_also_nonexistent_scores_95_plus(sentinel: Sentinel) -> 
     async def _meta(name: str, *args, **kwargs) -> RegistryResult:
         return _absent() if name == "lodahs" else _exists(_make_meta(created="2015-01-01T00:00:00Z"))
 
-    async def _downloads(name: str) -> int:
-        return 0 if name == "lodahs" else 5_000_000
+    async def _downloads(name: str) -> DownloadCountResult:
+        return DownloadCountResult(DownloadCountLookup.RESOLVED, 0 if name == "lodahs" else 5_000_000)
 
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(side_effect=_meta)),
@@ -268,7 +268,7 @@ async def test_very_new_package_flag_set(sentinel: Sentinel) -> None:
     meta = _make_meta(created=three_days_ago)
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=1000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 1000))),
         patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=_NO_OSV)),
     ):
         result = await sentinel.score("unique-package-xyz-123", ai_suggested=True)
@@ -286,7 +286,7 @@ async def test_new_package_flag_set(sentinel: Sentinel) -> None:
     meta = _make_meta(created=fifteen_days_ago)
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=1000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 1000))),
         patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=_NO_OSV)),
     ):
         result = await sentinel.score("unique-package-xyz-123", ai_suggested=True)
@@ -302,7 +302,7 @@ async def test_ai_very_low_downloads_flag_set(sentinel: Sentinel) -> None:
     meta = _make_meta(created="2020-01-01T00:00:00Z")
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=50)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 50))),
         patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=_NO_OSV)),
     ):
         result = await sentinel.score("unique-package-xyz-123", ai_suggested=True)
@@ -322,7 +322,7 @@ async def test_invalid_created_date_sets_age_none(sentinel: Sentinel) -> None:
     }
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=1000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 1000))),
     ):
         result = await sentinel.score("unique-package-xyz-123", ai_suggested=False)
 
@@ -385,13 +385,13 @@ async def test_maintainer_count_signal(sentinel: Sentinel) -> None:
 
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(single_meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=5_000_000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 5_000_000))),
     ):
         single_result = await sentinel.score("unique-package-xyz-123", ai_suggested=False)
 
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(multi_meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=5_000_000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 5_000_000))),
     ):
         multi_result = await sentinel.score("unique-package-xyz-123", ai_suggested=False)
 
@@ -407,7 +407,7 @@ async def test_non_ai_package_skips_age_and_download_checks(sentinel: Sentinel) 
     meta = _make_meta(created="2015-01-01T00:00:00Z", has_repo=True)
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=500_000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 500_000))),
     ):
         result = await sentinel.score("unique-package-xyz-123", ai_suggested=False)
 
@@ -458,7 +458,7 @@ async def test_osv_advisory_boosts_score(sentinel: Sentinel) -> None:
     osv_result = {"vuln_count": 2, "has_malware": False, "vuln_ids": ["GHSA-abc-123"]}
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=5_000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 5_000))),
         patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=osv_result)),
     ):
         result = await sentinel.score("some-vuln-pkg", ai_suggested=True)
@@ -474,7 +474,7 @@ async def test_osv_malware_confirmed_flag(sentinel: Sentinel) -> None:
     osv_result = {"vuln_count": 1, "has_malware": True, "vuln_ids": ["MAL-2022-1"]}
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=500_000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 500_000))),
         patch("daemon.pillars.sentinel.check_osv", new=AsyncMock(return_value=osv_result)),
     ):
         result = await sentinel.score("some-malware-pkg", ai_suggested=True)
@@ -489,7 +489,7 @@ async def test_osv_not_called_for_human_typed(sentinel: Sentinel) -> None:
     meta = _make_meta(created="2020-01-01T00:00:00Z")
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=500_000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 500_000))),
         patch("daemon.pillars.sentinel.check_osv", new=AsyncMock()) as mock_osv,
     ):
         await sentinel.score("unique-package-xyz-123", ai_suggested=False)
@@ -532,7 +532,7 @@ async def test_reputation_disparity_confirmed_for_low_download_new_candidate(sen
     with (
         patch("daemon.pillars.sentinel.get_package_metadata",
               new=AsyncMock(return_value=_exists(_make_meta(created="2013-01-01T00:00:00Z")))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=10_000_000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 10_000_000))),
     ):
         confirmed, info = await sentinel.check_reputation_disparity(
             "vue-clone", "vue", {"monthly_downloads": 5, "age_days": 2},
@@ -548,7 +548,7 @@ async def test_reputation_disparity_not_confirmed_for_comparable_packages(sentin
     with (
         patch("daemon.pillars.sentinel.get_package_metadata",
               new=AsyncMock(return_value=_exists(_make_meta(created="2016-01-01T00:00:00Z")))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=8_000_000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 8_000_000))),
     ):
         confirmed, info = await sentinel.check_reputation_disparity(
             "vue", "vite", {"monthly_downloads": 7_500_000, "age_days": 3000},
@@ -563,13 +563,102 @@ async def test_reputation_disparity_fails_open_on_target_lookup_failure(sentinel
     silently suppress the pre-existing force-to-100 behavior."""
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_absent())),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 0))),
     ):
         confirmed, info = await sentinel.check_reputation_disparity(
             "some-candidate", "some-target", {"monthly_downloads": 5, "age_days": 2},
         )
     assert confirmed is True
     assert info["fallback"] is True
+
+
+@pytest.mark.asyncio
+async def test_reputation_disparity_genuine_zero_downloads_still_confirms(sentinel: Sentinel) -> None:
+    """A candidate that genuinely has 0 downloads (RESOLVED, count=0) — not
+    an unresolved fetch — must still confirm disparity normally. The
+    tri-state distinction must not accidentally suppress the legitimate
+    "actually has zero downloads" case."""
+    with (
+        patch("daemon.pillars.sentinel.get_package_metadata",
+              new=AsyncMock(return_value=_exists(_make_meta(created="2013-01-01T00:00:00Z")))),
+        patch("daemon.pillars.sentinel.get_download_count",
+              new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 10_000_000))),
+    ):
+        confirmed, info = await sentinel.check_reputation_disparity(
+            "vue-clone", "vue", {"monthly_downloads": 0, "age_days": 2},
+        )
+    assert confirmed is True
+    assert info["fallback"] is False
+    assert info.get("corroboration_undetermined") is None
+
+
+@pytest.mark.asyncio
+async def test_reputation_disparity_undetermined_target_downloads_does_not_confirm(sentinel: Sentinel) -> None:
+    """The yup/zod bug: a transient fetch failure for the TARGET's own
+    download count (429-after-retries/timeout, not a total lookup outage)
+    must not let a silent-0 default masquerade as "near-zero downloads" and
+    spuriously confirm disparity. This must produce a distinct
+    "cannot confirm" outcome, not a false confirm."""
+    with (
+        patch("daemon.pillars.sentinel.get_package_metadata",
+              new=AsyncMock(return_value=_exists(_make_meta(created="2016-01-01T00:00:00Z")))),
+        patch("daemon.pillars.sentinel.get_download_count",
+              new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.UNDETERMINED))),
+    ):
+        confirmed, info = await sentinel.check_reputation_disparity(
+            "yup", "vue", {"monthly_downloads": 48_438_092, "age_days": 4289},
+        )
+    assert confirmed is False
+    assert info.get("corroboration_undetermined") is True
+    assert info["fallback"] is False
+
+
+@pytest.mark.asyncio
+async def test_reputation_disparity_undetermined_candidate_downloads_does_not_confirm(sentinel: Sentinel) -> None:
+    """Same failure mode as above, but on the candidate's own download-count
+    fetch (the actual yup/zod failure site — check_registry_existence marks
+    monthly_downloads=0 with download_count_undetermined=True when its own
+    fetch is unresolved)."""
+    with (
+        patch("daemon.pillars.sentinel.get_package_metadata",
+              new=AsyncMock(return_value=_exists(_make_meta(created="2016-01-01T00:00:00Z")))),
+        patch("daemon.pillars.sentinel.get_download_count",
+              new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 57_952_552))),
+    ):
+        confirmed, info = await sentinel.check_reputation_disparity(
+            "yup", "vue", {"monthly_downloads": 0, "age_days": 4289, "download_count_undetermined": True},
+        )
+    assert confirmed is False
+    assert info.get("corroboration_undetermined") is True
+
+
+@pytest.mark.asyncio
+async def test_score_large_package_under_simulated_concurrent_load_failure(sentinel: Sentinel) -> None:
+    """End-to-end reproduction of the exact yup/zod bug conditions: a large,
+    legitimate package ("yup") coincidentally within edit-distance of
+    another popular package ("vue"), whose own download-count fetch fails
+    transiently (as observed under 4-way concurrent load in the original
+    investigation). Must land in the uncorroborated/undetermined path, not
+    a forced typosquat_detected BLOCK-level score."""
+    async def _meta(name: str, *args, **kwargs) -> RegistryResult:
+        return _exists(_make_meta(created="2016-01-01T00:00:00Z"))
+
+    async def _downloads(name: str) -> DownloadCountResult:
+        # Simulate the candidate's ("yup") own download-count fetch failing
+        # under concurrent load, while the target ("vue") resolves fine.
+        if name == "yup":
+            return DownloadCountResult(DownloadCountLookup.UNDETERMINED)
+        return DownloadCountResult(DownloadCountLookup.RESOLVED, 57_952_552)
+
+    with (
+        patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(side_effect=_meta)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(side_effect=_downloads)),
+    ):
+        result = await sentinel.score("yup", ai_suggested=False)
+
+    assert "typosquat_detected" not in result.flags
+    assert result.score < 100.0
+    assert "typosquat_corroboration_undetermined" in result.flags
 
 
 # ── Reputation-corroborated score() integration ────────────────────────────────
@@ -582,8 +671,8 @@ async def test_score_vue_vs_vite_not_forced_to_typosquat(sentinel: Sentinel) -> 
     async def _meta(name: str, *args, **kwargs) -> RegistryResult:
         return _exists(_make_meta(created="2016-01-01T00:00:00Z"))
 
-    async def _downloads(name: str) -> int:
-        return 7_500_000 if name == "vue" else 8_000_000
+    async def _downloads(name: str) -> DownloadCountResult:
+        return DownloadCountResult(DownloadCountLookup.RESOLVED, 7_500_000 if name == "vue" else 8_000_000)
 
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(side_effect=_meta)),
@@ -603,7 +692,7 @@ async def test_score_node_react_affix_typosquat_detected(sentinel: Sentinel) -> 
     unregistered / low-reputation) is corroborated."""
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_absent())),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 0))),
     ):
         result = await sentinel.score("node-react", ai_suggested=False)
 
@@ -623,8 +712,8 @@ async def test_corroboration_disabled_reverts_to_legacy_behavior(sentinel: Senti
     async def _meta(name: str, *args, **kwargs) -> RegistryResult:
         return _exists(_make_meta(created="2016-01-01T00:00:00Z"))
 
-    async def _downloads(name: str) -> int:
-        return 7_500_000 if name == "vue" else 8_000_000
+    async def _downloads(name: str) -> DownloadCountResult:
+        return DownloadCountResult(DownloadCountLookup.RESOLVED, 7_500_000 if name == "vue" else 8_000_000)
 
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(side_effect=_meta)),
@@ -644,7 +733,7 @@ async def test_confirmed_absent_sets_package_not_found(sentinel: Sentinel) -> No
     floors risk high, as before."""
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_absent())),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 0))),
     ):
         result = await sentinel.score("totally-made-up-pkg-xyz123", ai_suggested=False)
 
@@ -663,7 +752,7 @@ async def test_undetermined_registry_lookup_does_not_set_package_not_found(senti
             "daemon.pillars.sentinel.get_package_metadata",
             new=AsyncMock(return_value=RegistryResult(RegistryLookup.UNDETERMINED)),
         ),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 0))),
     ):
         result = await sentinel.score("redux-thunk", ai_suggested=False)
 
@@ -706,7 +795,7 @@ async def test_security_placeholder_version_forces_flag_and_score(sentinel: Sent
     meta["dist-tags"] = {"latest": "0.0.1-security.0"}
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 0))),
     ):
         result = await sentinel.score("plain-crypto-js", ai_suggested=False)
 
@@ -722,7 +811,7 @@ async def test_security_placeholder_check_uses_requested_version_when_given(sent
     meta["dist-tags"] = {"latest": "4.2.2"}
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 0))),
     ):
         result = await sentinel.score("plain-crypto-js", ai_suggested=False, version="0.0.1-security.0")
 
@@ -743,7 +832,7 @@ async def test_security_placeholder_detected_when_requested_version_wiped(sentin
     meta["versions"] = {"0.0.1-security.0": {}}  # the original "4.2.1" no longer resolves
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(meta))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 0))),
     ):
         result = await sentinel.score("plain-crypto-js", ai_suggested=False, version="4.2.1")
 
@@ -774,7 +863,7 @@ async def test_score_detects_cyrillic_homoglyph_typosquat(sentinel: Sentinel) ->
     given it's an unregistered, unfamiliar name."""
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_absent())),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=0)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 0))),
     ):
         result = await sentinel.score("reаct", ai_suggested=False)
 
@@ -789,7 +878,7 @@ async def test_score_legitimate_package_unaffected_by_normalization(sentinel: Se
     confusable-normalization step."""
     with (
         patch("daemon.pillars.sentinel.get_package_metadata", new=AsyncMock(return_value=_exists(_make_meta()))),
-        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=5_000_000)),
+        patch("daemon.pillars.sentinel.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 5_000_000))),
     ):
         result = await sentinel.score("lodash", ai_suggested=False)
 

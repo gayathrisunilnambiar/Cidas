@@ -16,7 +16,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from daemon.main import app
-from daemon.utils.npm_registry import RegistryLookup, RegistryResult
+from daemon.utils.npm_registry import DownloadCountLookup, DownloadCountResult, RegistryLookup, RegistryResult
 
 # ── Sample registry metadata ──────────────────────────────────────────────────
 _SAMPLE_META: dict = {
@@ -101,7 +101,7 @@ def mock_npm_registry():
             "daemon.utils.npm_registry.get_package_metadata",
             new=AsyncMock(return_value=RegistryResult(RegistryLookup.EXISTS, _SAMPLE_META)),
         ),
-        patch("daemon.utils.npm_registry.get_download_count", new=AsyncMock(return_value=50_000)),
+        patch("daemon.utils.npm_registry.get_download_count", new=AsyncMock(return_value=DownloadCountResult(DownloadCountLookup.RESOLVED, 50_000))),
         patch("daemon.utils.npm_registry.get_package_tarball_info", new=AsyncMock(return_value={"tarball": "https://example.com"})),
         patch("daemon.utils.npm_registry.get_package_size", new=AsyncMock(return_value=12_345)),
         # disk_checker imports get_package_size via `from .npm_registry import

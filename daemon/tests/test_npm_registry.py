@@ -330,33 +330,56 @@ async def test_is_security_placeholder_version_does_not_match() -> None:
 # ── get_download_count ────────────────────────────────────────────────────────
 
 async def test_get_download_count_success() -> None:
-    from daemon.utils.npm_registry import get_download_count
+    from daemon.utils.npm_registry import DownloadCountLookup, get_download_count
 
     with patch("daemon.utils.npm_registry._get", new=AsyncMock(return_value=_exists({"downloads": 50_000_000}))):
-        count = await get_download_count("lodash")
+        result = await get_download_count("lodash")
 
-    assert count == 50_000_000
+    assert result.status is DownloadCountLookup.RESOLVED
+    assert result.count == 50_000_000
 
 
 async def test_get_download_count_zero_on_404() -> None:
-    from daemon.utils.npm_registry import get_download_count
+    """A confirmed-absent (404) downloads-endpoint lookup is a genuine,
+    confirmed 0 — no download data on record — not an unresolved fetch."""
+    from daemon.utils.npm_registry import DownloadCountLookup, get_download_count
 
     with patch(
         "daemon.utils.npm_registry._get",
         new=AsyncMock(return_value=RegistryResult(RegistryLookup.CONFIRMED_ABSENT)),
     ):
-        count = await get_download_count("no-such-pkg")
+        result = await get_download_count("no-such-pkg")
 
-    assert count == 0
+    assert result.status is DownloadCountLookup.RESOLVED
+    assert result.count == 0
 
 
 async def test_get_download_count_zero_when_field_missing() -> None:
-    from daemon.utils.npm_registry import get_download_count
+    from daemon.utils.npm_registry import DownloadCountLookup, get_download_count
 
     with patch("daemon.utils.npm_registry._get", new=AsyncMock(return_value=_exists({"period": "last-month"}))):
-        count = await get_download_count("weird-pkg")
+        result = await get_download_count("weird-pkg")
 
-    assert count == 0
+    assert result.status is DownloadCountLookup.RESOLVED
+    assert result.count == 0
+
+
+async def test_get_download_count_undetermined_on_transient_failure() -> None:
+    """A 429-after-retries/timeout/non-404 error must resolve as
+    UNDETERMINED, not a bare 0 — this is the tri-state fix for the yup/zod
+    false-positive: a transient fetch failure must never silently
+    masquerade as "genuinely zero downloads" for reputation-disparity
+    corroboration."""
+    from daemon.utils.npm_registry import DownloadCountLookup, get_download_count
+
+    with patch(
+        "daemon.utils.npm_registry._get",
+        new=AsyncMock(return_value=RegistryResult(RegistryLookup.UNDETERMINED)),
+    ):
+        result = await get_download_count("flaky-under-load-pkg")
+
+    assert result.status is DownloadCountLookup.UNDETERMINED
+    assert result.count is None
 
 
 async def test_get_download_count_is_cached_across_repeated_lookups() -> None:
@@ -371,8 +394,8 @@ async def test_get_download_count_is_cached_across_repeated_lookups() -> None:
         first = await get_download_count("react")
         second = await get_download_count("react")
 
-    assert first == 42
-    assert second == 42
+    assert first.count == 42
+    assert second.count == 42
     mock_get.assert_called_once()
 
 
@@ -388,8 +411,8 @@ async def test_get_download_count_cache_is_per_name() -> None:
         react_count = await get_download_count("react")
         lodash_count = await get_download_count("lodash")
 
-    assert react_count == 100
-    assert lodash_count == 200
+    assert react_count.count == 100
+    assert lodash_count.count == 200
 
 
 # ── get_direct_dependencies ───────────────────────────────────────────────────
