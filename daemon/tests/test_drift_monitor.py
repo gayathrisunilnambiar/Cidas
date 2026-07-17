@@ -27,6 +27,7 @@ from daemon.utils.drift_monitor import (
     extract_scores_from_audit_log,
     kl_divergence,
     load_baseline,
+    population_stability_index,
     save_baseline,
 )
 
@@ -129,6 +130,45 @@ def test_kl_divergence_empty_inputs_return_zero():
     assert kl_divergence([], [1, 2]) == 0.0
     assert kl_divergence([1, 2], []) == 0.0
     assert kl_divergence([], []) == 0.0
+
+
+# ── population_stability_index ──────────────────────────────────────────────
+
+def test_psi_identical_distributions_returns_zero():
+    p = [10, 20, 30, 40]
+    q = [10, 20, 30, 40]
+    result = population_stability_index(p, q)
+    assert result < 0.001
+
+
+def test_psi_very_different_distributions():
+    p = [100, 0, 0, 0]
+    q = [0, 0, 0, 100]
+    result = population_stability_index(p, q)
+    assert result > 0.25  # standard PSI "significant shift" threshold
+
+
+def test_psi_handles_zeros_without_raising():
+    p = [0, 0, 0, 0]
+    q = [0, 0, 0, 0]
+    result = population_stability_index(p, q)
+    assert result == 0.0
+
+
+def test_psi_is_symmetric():
+    # Unlike KL, PSI(P,Q) == PSI(Q,P) by construction (the (P-Q) term flips
+    # sign but log(P/Q) also flips, so the product is invariant).
+    p = [90, 10]
+    q = [50, 50]
+    psi_pq = population_stability_index(p, q)
+    psi_qp = population_stability_index(q, p)
+    assert psi_pq == pytest.approx(psi_qp, abs=1e-9)
+
+
+def test_psi_empty_inputs_return_zero():
+    assert population_stability_index([], [1, 2]) == 0.0
+    assert population_stability_index([1, 2], []) == 0.0
+    assert population_stability_index([], []) == 0.0
 
 
 # ── build_baseline_from_scores ────────────────────────────────────────────────
@@ -289,6 +329,34 @@ def test_check_drift_report_has_all_pillar_keys(tmp_path, monkeypatch):
     if report.sufficient_data:
         for p in _PILLARS:
             assert p in report.pillar_kl_divergences
+
+
+def test_check_drift_report_includes_psi_without_changing_status(tmp_path, monkeypatch):
+    """PSI is additive: present in the report, but status/overall_kl/
+    drifted_pillars are computed exactly as before (KL-driven only) —
+    verified by checking the KL-based fields match a baseline run with
+    PSI computation stubbed out entirely."""
+    monkeypatch.setattr(dm, "BASELINE_PATH", tmp_path / "baseline.json")
+    save_baseline(_simple_profile())
+    window = {p: [50.0] * MIN_WINDOW_SCANS for p in _PILLARS}
+    monkeypatch.setattr(dm, "extract_scores_from_audit_log", lambda *_: window)
+
+    report = check_drift()
+    assert report.sufficient_data is True
+    for p in _PILLARS:
+        assert p in report.pillar_psi
+        assert isinstance(report.pillar_psi[p], float)
+    assert isinstance(report.overall_psi, float)
+
+    # Status/overall_kl/drifted_pillars must be unaffected by PSI's presence:
+    # stub population_stability_index to a dummy value and confirm the
+    # KL-driven fields are identical to the run above.
+    monkeypatch.setattr(dm, "population_stability_index", lambda *_: 999.0)
+    report_stubbed_psi = check_drift()
+    assert report_stubbed_psi.status == report.status
+    assert report_stubbed_psi.overall_kl == report.overall_kl
+    assert report_stubbed_psi.drifted_pillars == report.drifted_pillars
+    assert report_stubbed_psi.overall_psi == 999.0
 
 
 def test_check_drift_baseline_loaded_true_when_baseline_exists(tmp_path, monkeypatch):

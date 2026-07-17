@@ -167,7 +167,7 @@ async def test_transitive_risk_detected_when_subdep_scores_high() -> None:
     async def mock_deps(name: str, version: str) -> dict[str, str]:
         return {"evil-dep": "1.0.0", "safe-dep": "1.0.0"}
 
-    async def mock_sentinel_score(pkg_name: str, ai_suggested: bool) -> PillarScore:
+    async def mock_sentinel_score(pkg_name: str, ai_suggested: bool, version: str | None = None) -> PillarScore:
         return evil_sentinel if pkg_name == "evil-dep" else safe_sentinel
 
     with (
@@ -199,7 +199,7 @@ async def test_transitive_risk_not_detected_when_all_safe() -> None:
     async def mock_deps(name: str, version: str) -> dict[str, str]:
         return {"safe-a": "1.0.0", "safe-b": "1.0.0"}
 
-    async def mock_sentinel_score(pkg_name: str, ai_suggested: bool) -> PillarScore:
+    async def mock_sentinel_score(pkg_name: str, ai_suggested: bool, version: str | None = None) -> PillarScore:
         return _ps(score=10.0)
 
     with (

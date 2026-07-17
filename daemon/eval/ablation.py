@@ -149,9 +149,16 @@ def _recompute_decision(
       4. Force-block for packages not found in the registry (regardless of
          ai_suggested — the real aggregator does not gate this on it).
       5. Force-block for a known supply-chain incident.
-      6. Force-WARN floor for a detected typosquat (Sentinel's 0.35 weight
+      6. Force-block for a resolved version matching npm's security-
+         placeholder convention ("-security.N" — npm pulled this exact
+         version as malicious/reserved).
+      7. Force-WARN floor for a detected typosquat (Sentinel's 0.35 weight
          alone caps at 35 points, below the 40-point WARN threshold).
-      7. Threshold comparison → ALLOW / WARN / BLOCK.
+      8. Force-WARN floor when Shield couldn't examine the actual requested
+         version (its manifest/tarball is gone from the registry, e.g. a
+         purged compromise) — not confirmed malicious on its own, but
+         meaningful enough to warrant caution.
+      9. Threshold comparison → ALLOW / WARN / BLOCK.
     """
     if "error" in result:
         return None
@@ -192,8 +199,16 @@ def _recompute_decision(
     if "known_supply_chain_incident" in sent_flags:
         score = max(score, _BLOCK_THRESHOLD)
 
+    # Force-block for npm's security-placeholder version convention.
+    if "npm_security_placeholder_version" in sent_flags:
+        score = max(score, _BLOCK_THRESHOLD)
+
     # Force-WARN floor for a detected typosquat.
     if "typosquat_detected" in sent_flags:
+        score = max(score, _WARN_THRESHOLD)
+
+    # Force-WARN floor when Shield couldn't examine the requested version.
+    if "requested_version_unresolved" in shi_flags:
         score = max(score, _WARN_THRESHOLD)
 
     if score >= _BLOCK_THRESHOLD:

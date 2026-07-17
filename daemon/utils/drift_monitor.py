@@ -62,6 +62,13 @@ class DriftReport:
     drifted_pillars: list[str]
     baseline_loaded: bool
     note: str = ""
+    # Population Stability Index — a standard, symmetric KL-divergence variant
+    # widely used in ML-monitoring practice, with its own interpretive
+    # thresholds (<0.1 no significant shift, 0.1-0.25 moderate, >0.25
+    # significant). Reported alongside KL for comparison; does not currently
+    # drive `status`/`drifted_pillars` — see check_drift.
+    pillar_psi: dict[str, float] = field(default_factory=dict)
+    overall_psi: float = 0.0
 
 
 # ── Histogram + KL ────────────────────────────────────────────────────────────
@@ -86,6 +93,15 @@ def build_score_histogram(scores: list[float]) -> tuple[list[float], list[int]]:
     return bin_edges, bin_counts
 
 
+def _normalized_bins(counts: list[int], eps: float = 1e-10) -> list[float]:
+    """Smooth zero-count bins and normalize to a probability distribution.
+    Shared by kl_divergence and population_stability_index so both metrics
+    compare the exact same smoothed proportions."""
+    smoothed = [c + eps for c in counts]
+    total = sum(smoothed)
+    return [v / total for v in smoothed]
+
+
 def kl_divergence(p_counts: list[int], q_counts: list[int]) -> float:
     """KL(P || Q) — current window vs baseline. Returns 0.0 if either is all zeros."""
     if not p_counts or not q_counts:
@@ -93,17 +109,34 @@ def kl_divergence(p_counts: list[int], q_counts: list[int]) -> float:
     if sum(p_counts) == 0 or sum(q_counts) == 0:
         return 0.0
     n = min(len(p_counts), len(q_counts))
-    eps = 1e-10
-    p_smoothed = [p_counts[i] + eps for i in range(n)]
-    q_smoothed = [q_counts[i] + eps for i in range(n)]
-    p_total = sum(p_smoothed)
-    q_total = sum(q_smoothed)
-    p_norm = [v / p_total for v in p_smoothed]
-    q_norm = [v / q_total for v in q_smoothed]
+    p_norm = _normalized_bins(p_counts[:n])
+    q_norm = _normalized_bins(q_counts[:n])
     total = 0.0
     for p_i, q_i in zip(p_norm, q_norm):
         if p_i > 0.0:
             total += p_i * math.log(p_i / q_i)
+    return total
+
+
+def population_stability_index(p_counts: list[int], q_counts: list[int]) -> float:
+    """PSI(P, Q) — Population Stability Index between the current window (P)
+    and baseline (Q), over the same smoothed/normalized bins kl_divergence
+    uses. Unlike KL divergence (asymmetric, unbounded), PSI is symmetric and
+    has widely-used interpretive thresholds in ML-monitoring practice
+    (<0.1 no significant shift, 0.1-0.25 moderate, >0.25 significant).
+    Reported as a second, standard metric for comparison against the
+    existing KL-based thresholds — see check_drift, which does not yet use
+    this to drive the warn/alert decision."""
+    if not p_counts or not q_counts:
+        return 0.0
+    if sum(p_counts) == 0 or sum(q_counts) == 0:
+        return 0.0
+    n = min(len(p_counts), len(q_counts))
+    p_norm = _normalized_bins(p_counts[:n])
+    q_norm = _normalized_bins(q_counts[:n])
+    total = 0.0
+    for p_i, q_i in zip(p_norm, q_norm):
+        total += (p_i - q_i) * math.log(p_i / q_i)
     return total
 
 
@@ -291,6 +324,8 @@ def _empty_report(
         drifted_pillars=[],
         baseline_loaded=baseline_loaded,
         note=note,
+        pillar_psi={p: 0.0 for p in _PILLARS},
+        overall_psi=0.0,
     )
 
 
@@ -323,6 +358,7 @@ def check_drift(audit_log_path: Path | None = None) -> DriftReport:
             )
 
         kl_per_pillar: dict[str, float] = {}
+        psi_per_pillar: dict[str, float] = {}
         for pillar in _PILLARS:
             window_scores = scores_by_pillar[pillar]
             _, window_counts = build_score_histogram(window_scores)
@@ -330,9 +366,13 @@ def check_drift(audit_log_path: Path | None = None) -> DriftReport:
             kl_per_pillar[pillar] = round(
                 kl_divergence(window_counts, baseline_counts), 6
             )
+            psi_per_pillar[pillar] = round(
+                population_stability_index(window_counts, baseline_counts), 6
+            )
 
         overall = sum(kl_per_pillar.values()) / len(kl_per_pillar)
         overall = round(overall, 6)
+        overall_psi = round(sum(psi_per_pillar.values()) / len(psi_per_pillar), 6)
 
         if overall >= KL_ALERT_THRESHOLD:
             status = "alert"
@@ -353,6 +393,8 @@ def check_drift(audit_log_path: Path | None = None) -> DriftReport:
             drifted_pillars=drifted,
             baseline_loaded=True,
             note="",
+            pillar_psi=psi_per_pillar,
+            overall_psi=overall_psi,
         )
     except Exception as exc:  # noqa: BLE001
         return _empty_report(

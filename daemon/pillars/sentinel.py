@@ -21,12 +21,18 @@ TODO(phase-2): tune similarity thresholds based on false-positive data.
 from __future__ import annotations
 
 import asyncio
+import unicodedata
 from datetime import datetime, timezone
 
 from ..config import get_admin_config
 from ..models import PillarScore
 from ..utils.logger import get_logger
-from ..utils.npm_registry import get_download_count, get_package_metadata
+from ..utils.npm_registry import (
+    RegistryLookup,
+    get_download_count,
+    get_package_metadata,
+    is_security_placeholder_version,
+)
 from ..utils.osv_client import check_osv
 
 log = get_logger(__name__)
@@ -75,6 +81,35 @@ _REPUTATION_RATIO_THRESHOLD: float = 0.05  # candidate has <5% of target's downl
 _MATURE_AGE_DAYS: int = 365
 _NEW_AGE_DAYS: int = 30
 
+# ── Confusable-character normalization ─────────────────────────────────────────
+#
+# Scope is deliberately narrow: a small, hardcoded table of Cyrillic and Greek
+# code points documented as used in real-world homoglyph package-name squats,
+# not a full Unicode confusables.txt import — this keeps the mapping small and
+# auditable at the cost of not covering every script. Anything outside this
+# table (fullwidth Latin, other scripts) is an explicit out-of-scope gap for
+# this pass, not a silent claim of full Unicode coverage.
+_CONFUSABLE_MAP: dict[str, str] = {
+    # Cyrillic -> Latin
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x", "у": "y",
+    "А": "A", "Е": "E", "О": "O", "Р": "P", "С": "C", "Х": "X", "У": "Y",
+    # Greek -> Latin
+    "ο": "o", "α": "a", "ρ": "p", "υ": "u",
+    "Ο": "O", "Α": "A", "Ρ": "P", "Υ": "U",
+}
+
+
+def _normalize_confusables(name: str) -> str:
+    """Map known Cyrillic/Greek confusable characters in *name* to their
+    ASCII-skeleton Latin equivalent, then apply NFKC normalization for
+    compatibility-equivalent forms. Characters outside _CONFUSABLE_MAP pass
+    through unchanged. Must run before affix stripping / edit-distance
+    comparison so a homoglyph-substituted name is compared on equal footing
+    with its ASCII target.
+    """
+    mapped = "".join(_CONFUSABLE_MAP.get(ch, ch) for ch in name)
+    return unicodedata.normalize("NFKC", mapped)
+
 
 def _strip_affixes(name: str) -> str:
     """Strip one leading squat prefix and one trailing squat suffix (lowercased)."""
@@ -105,7 +140,9 @@ def _levenshtein(a: str, b: str) -> int:
 class Sentinel:
     """Pillar 2: detect AI hallucinations and typosquats via registry signals."""
 
-    async def score(self, package_name: str, ai_suggested: bool) -> PillarScore:
+    async def score(
+        self, package_name: str, ai_suggested: bool, version: str | None = None,
+    ) -> PillarScore:
         """Return a PillarScore; always checks registry existence."""
         # Known-incident blocklist: synchronous dict lookup, no network call.
         # Applies to all installs (human or AI-suggested) because historical
@@ -122,14 +159,47 @@ class Sentinel:
             )
 
         # Always check if package exists - this catches hallucinated/fake packages
-        exists, registry_signals = await self.check_registry_existence(package_name)
-        is_typo, similar_to = self.check_name_similarity(package_name)
+        exists, registry_signals = await self.check_registry_existence(package_name, version)
+
+        # A resolved version matching npm's "-security.N" placeholder convention
+        # means npm's security team pulled a malicious/reserved release and
+        # republished an inert stub in its place — the tarball resolves (200 OK)
+        # but installing it is either pointless or, if any tooling still has the
+        # original malicious tarball cached, dangerous. Force a floor regardless
+        # of typosquat status; this is root-caused separately from the general
+        # tri-state registry fix (see plain-crypto-js investigation).
+        if exists and registry_signals.get("npm_security_placeholder"):
+            return PillarScore(
+                score=95.0,
+                confidence=0.9,
+                flags=["npm_security_placeholder_version"],
+                metadata={"ai_suggested": ai_suggested, "exists": True, **registry_signals},
+            )
+
+        normalized_name = _normalize_confusables(package_name)
+        is_typo, similar_to = self.check_name_similarity(normalized_name)
+
+        # A homoglyph-substituted name that normalizes to an *exact* skeleton
+        # match of a popular package (e.g. Cyrillic "reаct" -> "react") is not
+        # caught by check_name_similarity, which deliberately excludes
+        # dist==0 (exact matches are legitimate re-installs, not typos) — but
+        # here the *raw* string differs from the popular package while its
+        # normalized skeleton is identical, which is itself the homoglyph
+        # attack signal.
+        is_homoglyph_typo = False
+        homoglyph_similar_to = ""
+        if normalized_name.lower() != package_name.lower():
+            for popular in TOP_PACKAGES:
+                if normalized_name.lower() == popular.lower():
+                    is_homoglyph_typo = True
+                    homoglyph_similar_to = popular
+                    break
 
         admin_cfg = get_admin_config()
         affix_on = admin_cfg.get("typosquat_affix_canonicalization", True) is not False
-        is_affix_typo, affix_similar_to = self.check_affix_similarity(package_name) if affix_on else (False, "")
-        raw_hit = is_typo or is_affix_typo
-        matched_target = similar_to or affix_similar_to
+        is_affix_typo, affix_similar_to = self.check_affix_similarity(normalized_name) if affix_on else (False, "")
+        raw_hit = is_typo or is_affix_typo or is_homoglyph_typo
+        matched_target = similar_to or affix_similar_to or homoglyph_similar_to
 
         # A raw-distance or affix name-similarity hit only escalates to a
         # forced BLOCK-level score once corroborated by a reputation
@@ -152,10 +222,41 @@ class Sentinel:
 
         # If package doesn't exist, always flag it regardless of ai_suggested
         if not exists:
-            score = 85.0  # High risk for non-existent packages
+            if registry_signals.get("registry_status") == "undetermined":
+                # Fail open: a registry timeout/transport/non-404 error is not
+                # evidence the package doesn't exist — it must NOT set
+                # "package_not_found" (the flag the aggregator's Stage-1 gate
+                # keys off to floor risk at BLOCK), or a transient outage would
+                # force-block real, popular packages (the redux-thunk/
+                # nodemailer false-positive pattern this fixes).
+                flags = ["registry_lookup_undetermined"]
+                if is_affix_typo:
+                    flags.append("typosquat_affix_match")
+                if is_homoglyph_typo:
+                    flags.append("typosquat_homoglyph_match")
+                if raw_hit and corroborated:
+                    flags.append("typosquat_detected")
+                    if not corr_info.get("fallback"):
+                        flags.append("reputation_disparity_confirmed")
+                elif raw_hit:
+                    flags.append("typosquat_name_similarity_uncorroborated")
+                return PillarScore(
+                    score=15.0,
+                    confidence=0.3,
+                    flags=flags,
+                    metadata={
+                        "similar_to": similar_to, "affix_similar_to": affix_similar_to,
+                        "ai_suggested": ai_suggested, "exists": False,
+                        **{k: v for k, v in corr_info.items() if k != "fallback"},
+                        **registry_signals,
+                    },
+                )
+            score = 85.0  # High risk for confirmed non-existent packages
             flags = ["package_not_found"]
             if is_affix_typo:
                 flags.append("typosquat_affix_match")
+            if is_homoglyph_typo:
+                flags.append("typosquat_homoglyph_match")
             if raw_hit and corroborated:
                 flags.append("typosquat_detected")
                 if not corr_info.get("fallback"):
@@ -184,6 +285,8 @@ class Sentinel:
             flags = ["typosquat_detected"]
             if is_affix_typo:
                 flags.append("typosquat_affix_match")
+            if is_homoglyph_typo:
+                flags.append("typosquat_homoglyph_match")
             if not corr_info.get("fallback"):
                 flags.append("reputation_disparity_confirmed")
             return PillarScore(
@@ -223,8 +326,8 @@ class Sentinel:
             )
 
         # Full hallucination-risk analysis for AI-suggested packages
-        exists, registry_signals = await self.check_registry_existence(package_name)
-        is_typo, similar_to = self.check_name_similarity(package_name)
+        exists, registry_signals = await self.check_registry_existence(package_name, version)
+        is_typo, similar_to = self.check_name_similarity(normalized_name)
         final_score, flags = self.compute_hallucination_risk(
             exists, registry_signals, is_typo, similar_to
         )
@@ -257,24 +360,44 @@ class Sentinel:
             },
         )
 
-    async def check_registry_existence(self, package_name: str) -> tuple[bool, dict]:
-        """Check NPM registry for package existence, age, and download count."""
+    async def check_registry_existence(
+        self, package_name: str, version: str | None = None,
+    ) -> tuple[bool, dict]:
+        """Check NPM registry for package existence, age, and download count.
+
+        Distinguishes a confirmed-absent package (a real HTTP 404 — the
+        appropriate trigger for the "package_not_found" BLOCK-floor gate)
+        from an undetermined lookup (registry timeout/transport/non-404
+        error) — the latter must fail open rather than being treated as
+        equivalent to confirmed absence. This distinction, and the
+        confirmatory-retry-before-declaring-absent policy, now live in
+        ``npm_registry.get_package_metadata(..., confirm_absence=True)``.
+        """
         signals: dict = {}
-        meta = await get_package_metadata(package_name)
-        if meta is None:
-            # get_package_metadata returns None both for a confirmed 404 and
-            # for an exhausted-retries network/transport failure — and this
-            # is the one call site where treating a transient failure as
-            # "confirmed absent" has a severe consequence (Sentinel forces a
-            # BLOCK-level score for "package_not_found", regardless of
-            # ai_suggested). One confirmatory re-fetch, after the failed
-            # attempt's cache entry is evicted (see
-            # npm_registry._fetch_registry_doc_cached), catches most
-            # transient blips before we escalate to that.
-            await asyncio.sleep(0.5)
-            meta = await get_package_metadata(package_name)
-        if meta is None:
-            return False, {"registry_miss": True}
+        result = await get_package_metadata(package_name, confirm_absence=True)
+        if result.status is RegistryLookup.CONFIRMED_ABSENT:
+            return False, {"registry_status": "confirmed_absent"}
+        if result.status is RegistryLookup.UNDETERMINED:
+            return False, {"registry_status": "undetermined", "registry_miss": True}
+        meta = result.data or {}
+
+        # npm security-placeholder version check (see score()'s consumption
+        # of this signal for the rationale). When npm's security team pulls
+        # a malicious release, it can wipe the *entire* versions map down to
+        # a single placeholder (e.g. "0.0.1-security.0") — so a pinned
+        # install request for the original malicious version (e.g. "4.2.1")
+        # no longer resolves in `meta["versions"]` at all, and the only
+        # signal left is dist-tags.latest itself being the placeholder.
+        # Checking only the resolved/requested version string (as this used
+        # to) misses exactly that case — the requested version is real
+        # ("4.2.1"), it's the registry's *current* state that flags it.
+        latest_tag = (meta.get("dist-tags") or {}).get("latest") or ""
+        resolved_version = version or latest_tag
+        if (
+            (resolved_version and is_security_placeholder_version(resolved_version))
+            or (latest_tag and is_security_placeholder_version(latest_tag))
+        ):
+            signals["npm_security_placeholder"] = True
 
         # Age signal
         created_str = meta.get("time", {}).get("created", "")
@@ -296,6 +419,7 @@ class Sentinel:
         # Repository presence
         signals["has_repository"] = bool(meta.get("repository"))
         signals["maintainer_count"] = len(meta.get("maintainers", []))
+        signals["registry_status"] = "exists"
 
         return True, signals
 
@@ -341,17 +465,18 @@ class Sentinel:
         silently downgrades the pre-existing force-to-100 behavior.
         """
         try:
-            target_meta, target_downloads = await asyncio.gather(
+            target_result, target_downloads = await asyncio.gather(
                 get_package_metadata(target_name), get_download_count(target_name),
             )
         except Exception as exc:
             log.debug("reputation lookup failed for target %r (candidate %r): %s",
                       target_name, candidate_name, exc)
             return True, {"fallback": True}
-        if target_meta is None:
+        if target_result.status is not RegistryLookup.EXISTS or target_result.data is None:
             log.debug("target %r not found while corroborating candidate %r",
                       target_name, candidate_name)
             return True, {"fallback": True}
+        target_meta = target_result.data
 
         candidate_downloads = candidate_signals.get("monthly_downloads", 0) or 0
         ratio = candidate_downloads / target_downloads if target_downloads > 0 else 0.0

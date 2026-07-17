@@ -119,7 +119,7 @@ class Aggregator:
         dominate (per the ablation study in the eval results).
         """
         stage2_score = self._stage2_score(contextify, sentinel, shield, settings, policy_overrides)
-        gate_floor = self._stage1_gates(sentinel, settings)
+        gate_floor = self._stage1_gates(sentinel, shield, settings)
         score = stage2_score if gate_floor is None else max(stage2_score, gate_floor)
 
         explanation = self._build_explanation(score, contextify, sentinel, shield, settings)
@@ -167,7 +167,7 @@ class Aggregator:
         return score
 
     @staticmethod
-    def _stage1_gates(sentinel: PillarScore, settings: Settings) -> float | None:
+    def _stage1_gates(sentinel: PillarScore, shield: PillarScore, settings: Settings) -> float | None:
         """Deterministic, flag-driven force-floors. Returns the threshold to
         floor the score at, or ``None`` if no gate fires.
 
@@ -184,6 +184,14 @@ class Aggregator:
         if "known_supply_chain_incident" in sentinel.flags:
             return float(settings.block_threshold)
 
+        # A resolved version matching npm's "-security.N" placeholder
+        # convention means npm's security team pulled this exact version as
+        # malicious/reserved and republished an inert stub in its place —
+        # installing it is pointless at best and dangerous at worst if any
+        # tooling still has the original tarball cached. Always block.
+        if "npm_security_placeholder_version" in sentinel.flags:
+            return float(settings.block_threshold)
+
         # A detected typosquat must never silently ALLOW: Sentinel's weight
         # (0.35) alone caps its contribution at 35 points, below the WARN
         # threshold (40), so a typosquat with a quiet Contextify/Shield
@@ -192,6 +200,16 @@ class Aggregator:
         # forcing BLOCK, since name-similarity alone can still legitimately
         # false-positive on a similarly-named but unrelated real package.
         if "typosquat_detected" in sentinel.flags:
+            return float(settings.warn_threshold)
+
+        # Shield couldn't examine the actual requested version — its own
+        # manifest/tarball is gone from the registry (e.g. npm purged it
+        # after a compromise). That's not confirmed malicious on its own
+        # (unlike a known incident or security placeholder), but "the exact
+        # pinned version cannot be examined at all" is itself meaningful
+        # enough to warrant caution rather than silently passing through
+        # on whatever Contextify/Sentinel alone conclude.
+        if "requested_version_unresolved" in shield.flags:
             return float(settings.warn_threshold)
 
         return None
