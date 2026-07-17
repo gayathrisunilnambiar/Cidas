@@ -1,12 +1,12 @@
 {
-  "timestamp": "2026-07-17T05:06:02.360150+00:00",
+  "timestamp": "2026-07-17T11:40:02.933246+00:00",
   "corpora": [
     "malicious",
     "typosquat",
     "hallucinated",
     "benign"
   ],
-  "total_records": 179,
+  "total_records": 189,
   "errors": 0,
   "metrics": {
     "per_attack_type": {
@@ -51,14 +51,14 @@
         "f1": 0.8333
       },
       "typosquat": {
-        "TP": 52,
+        "TP": 62,
         "FP": 0,
         "TN": 0,
         "FN": 5,
         "ERROR": 0,
         "precision": 1.0,
-        "recall": 0.9123,
-        "f1": 0.9541
+        "recall": 0.9254,
+        "f1": 0.9612
       },
       "credential_theft": {
         "TP": 3,
@@ -102,14 +102,14 @@
       }
     },
     "overall": {
-      "TP": 112,
+      "TP": 122,
       "FP": 0,
       "TN": 50,
       "FN": 17,
       "ERROR": 0,
       "precision": 1.0,
-      "recall": 0.8682,
-      "f1": 0.9295,
+      "recall": 0.8777,
+      "f1": 0.9349,
       "false_positive_rate": 0.0
     },
     "confusion_matrix": {
@@ -122,7 +122,7 @@
       "typosquat": {
         "ALLOW": 0,
         "WARN": 30,
-        "BLOCK": 20,
+        "BLOCK": 30,
         "ERROR": 0
       },
       "hallucinated": {
@@ -139,9 +139,9 @@
       }
     },
     "latency": {
-      "n_samples": 179,
-      "median_ms": 4016.6,
-      "p95_ms": 8409.6
+      "n_samples": 189,
+      "median_ms": 4009.3,
+      "p95_ms": 8993.1
     }
   }
 }

@@ -1,0 +1,12 @@
+{
+  "tool": "socket.dev",
+  "status": "infeasible_on_available_quota",
+  "notes": "baseline_socket.py is implemented and verified correct end-to-end (endpoint POST https://api.socket.dev/v0/orgs/{org_slug}/purl, Bearer auth, NDJSON response parsing) against live single/small-batch requests. Full-corpus comparison is blocked by API quota, not correctness: the batch-PURL endpoint charges a flat 100 quota units per request regardless of batch size, confirmed empirically ('Requires 100, but token has only 11' after 3 small test calls exhausted the available token's starting pool). The publicly advertised Free-tier '1,000 scans/month' figure does not describe this API quota dimension. This snapshot is explicitly pinned to corpus v1.0 (179 records, commit-dated before the 10-record Unicode-homoglyph addition that produced corpus v1.1/189). It is not re-run against v1.1: (a) the quota constraint above makes any full re-run infeasible regardless of corpus size, and (b) none of the 3 live-tested external tools (npm audit, OSV-Scanner, Socket.dev) implement name-similarity/homoglyph detection, so the 10 new records added in v1.1 exist purely to validate CIDAS's own homoglyph-normalization path and have no comparison value against Socket.dev specifically. Re-run with a higher-quota token against v1.0 to produce a full comparison; re-running against v1.1 would add cost without adding comparative signal.",
+  "corpus_version_pinned": "v1.0 (179 records)",
+  "verified_working": {
+    "endpoint": "POST https://api.socket.dev/v0/orgs/{org_slug}/purl?alerts=true",
+    "auth": "Bearer token",
+    "response_format": "application/x-ndjson (one JSON object per line, not a {\"packages\": [...]} wrapper as the reference docs' example implies)",
+    "sample_verified_lookup": "pkg:npm/lodash@4.17.21 correctly returned 8 alerts (gptAnomaly + CVE/prototype-pollution entries)"
+  }
+}

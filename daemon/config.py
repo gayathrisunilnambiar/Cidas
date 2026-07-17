@@ -45,6 +45,24 @@ class Settings(BaseSettings):
     sentinel_weight: float = Field(default=0.35, ge=0.0, le=1.0)
     shield_weight: float = Field(default=0.35, ge=0.0, le=1.0)
 
+    # ── Sentinel reputation-corroboration thresholds ──────────────────────
+    # Previously hardcoded module constants in daemon/pillars/sentinel.py;
+    # promoted to Settings so a threshold-sensitivity sweep (or a per-machine
+    # override) can vary them without a code change, matching the existing
+    # pattern for block_threshold/warn_threshold/weights above.
+    reputation_ratio_threshold: float = Field(
+        default=0.05, ge=0.0, le=1.0,
+        description="Candidate flagged as disparate when its downloads are under this fraction of the matched target's.",
+    )
+    mature_age_days: int = Field(
+        default=365, ge=1,
+        description="Target package age (days) above which it's considered long-established for corroboration.",
+    )
+    new_age_days: int = Field(
+        default=30, ge=1,
+        description="Candidate package age (days) below which it's considered new for corroboration.",
+    )
+
     # ── Embeddings ────────────────────────────────────────────────────────
     embedding_model: str = "all-MiniLM-L6-v2"
     chroma_persist_dir: str = ".cidas_chroma"

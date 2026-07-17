@@ -1,0 +1,156 @@
+{
+  "timestamp": "2026-07-17T10:31:23.531073+00:00",
+  "total_records": 179,
+  "sentinel_sweep": {
+    "reputation_ratio_threshold": [
+      {
+        "param": "reputation_ratio_threshold",
+        "value": 0.01,
+        "TP": 94,
+        "FP": 0,
+        "TN": 50,
+        "FN": 35,
+        "precision": 1.0,
+        "recall": 0.7287,
+        "f1": 0.843,
+        "false_positive_rate": 0.0
+      },
+      {
+        "param": "reputation_ratio_threshold",
+        "value": 0.05,
+        "TP": 94,
+        "FP": 0,
+        "TN": 50,
+        "FN": 35,
+        "precision": 1.0,
+        "recall": 0.7287,
+        "f1": 0.843,
+        "false_positive_rate": 0.0
+      },
+      {
+        "param": "reputation_ratio_threshold",
+        "value": 0.1,
+        "TP": 94,
+        "FP": 1,
+        "TN": 49,
+        "FN": 35,
+        "precision": 0.9895,
+        "recall": 0.7287,
+        "f1": 0.8393,
+        "false_positive_rate": 0.02
+      },
+      {
+        "param": "reputation_ratio_threshold",
+        "value": 0.2,
+        "TP": 94,
+        "FP": 1,
+        "TN": 49,
+        "FN": 35,
+        "precision": 0.9895,
+        "recall": 0.7287,
+        "f1": 0.8393,
+        "false_positive_rate": 0.02
+      }
+    ],
+    "mature_age_days": [
+      {
+        "param": "mature_age_days",
+        "value": 180,
+        "TP": 94,
+        "FP": 0,
+        "TN": 50,
+        "FN": 35,
+        "precision": 1.0,
+        "recall": 0.7287,
+        "f1": 0.843,
+        "false_positive_rate": 0.0
+      },
+      {
+        "param": "mature_age_days",
+        "value": 365,
+        "TP": 94,
+        "FP": 0,
+        "TN": 50,
+        "FN": 35,
+        "precision": 1.0,
+        "recall": 0.7287,
+        "f1": 0.843,
+        "false_positive_rate": 0.0
+      },
+      {
+        "param": "mature_age_days",
+        "value": 545,
+        "TP": 94,
+        "FP": 0,
+        "TN": 50,
+        "FN": 35,
+        "precision": 1.0,
+        "recall": 0.7287,
+        "f1": 0.843,
+        "false_positive_rate": 0.0
+      },
+      {
+        "param": "mature_age_days",
+        "value": 730,
+        "TP": 94,
+        "FP": 0,
+        "TN": 50,
+        "FN": 35,
+        "precision": 1.0,
+        "recall": 0.7287,
+        "f1": 0.843,
+        "false_positive_rate": 0.0
+      }
+    ],
+    "new_age_days": [
+      {
+        "param": "new_age_days",
+        "value": 7,
+        "TP": 94,
+        "FP": 0,
+        "TN": 50,
+        "FN": 35,
+        "precision": 1.0,
+        "recall": 0.7287,
+        "f1": 0.843,
+        "false_positive_rate": 0.0
+      },
+      {
+        "param": "new_age_days",
+        "value": 15,
+        "TP": 94,
+        "FP": 0,
+        "TN": 50,
+        "FN": 35,
+        "precision": 1.0,
+        "recall": 0.7287,
+        "f1": 0.843,
+        "false_positive_rate": 0.0
+      },
+      {
+        "param": "new_age_days",
+        "value": 30,
+        "TP": 94,
+        "FP": 0,
+        "TN": 50,
+        "FN": 35,
+        "precision": 1.0,
+        "recall": 0.7287,
+        "f1": 0.843,
+        "false_positive_rate": 0.0
+      },
+      {
+        "param": "new_age_days",
+        "value": 60,
+        "TP": 94,
+        "FP": 0,
+        "TN": 50,
+        "FN": 35,
+        "precision": 1.0,
+        "recall": 0.7287,
+        "f1": 0.843,
+        "false_positive_rate": 0.0
+      }
+    ]
+  }
+}

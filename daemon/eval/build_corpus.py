@@ -43,6 +43,7 @@ on the npm registry. False = the name is a pure invented typosquat.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 CORPUS_DIR = Path(__file__).parent / "corpus"
@@ -353,6 +354,29 @@ _TYPOSQUAT_RECORDS: list[tuple[str, str, str, bool]] = [
     ("node-uuid",        "uuid",       "prefix",     True),   # legacy deprecated package
 ]
 
+# ── Genuine Unicode homoglyph mutations ───────────────────────────────────────
+#
+# The "homoglyph" mutation label above (l0dash, axlos, etc.) actually uses
+# ASCII digit/letter lookalikes, not true Unicode homoglyphs — it doesn't
+# exercise Sentinel's Cyrillic/Greek confusable-normalization path at all
+# (daemon/pillars/sentinel.py::_normalize_confusables). These entries use
+# real Cyrillic/Greek code points from that module's _CONFUSABLE_MAP (one
+# substituted character per target, chosen to be visually near-identical to
+# the Latin original), so the corpus actually tests the normalization it's
+# meant to validate. None are registered on npm (npm_registered=False).
+_UNICODE_HOMOGLYPH_RECORDS: list[tuple[str, str, str, bool]] = [
+    ("reаct",         "react",      "unicode_homoglyph", False),  # Cyrillic а (U+0430) for 'a'
+    ("lоdash",        "lodash",     "unicode_homoglyph", False),  # Cyrillic о (U+043E) for 'o'
+    ("еxpress",       "express",    "unicode_homoglyph", False),  # Cyrillic е (U+0435) for 'e'
+    ("аxios",         "axios",      "unicode_homoglyph", False),  # Cyrillic а (U+0430) for 'a'
+    ("wеbpack",       "webpack",    "unicode_homoglyph", False),  # Cyrillic е (U+0435) for 'e'
+    ("typesсript",    "typescript", "unicode_homoglyph", False),  # Cyrillic с (U+0441) for 'c'
+    ("mоment",        "moment",     "unicode_homoglyph", False),  # Cyrillic о (U+043E) for 'o'
+    ("сhalk",         "chalk",      "unicode_homoglyph", False),  # Cyrillic с (U+0441) for 'c'
+    ("cоmmander",     "commander",  "unicode_homoglyph", False),  # Cyrillic о (U+043E) for 'o'
+    ("υuid",          "uuid",       "unicode_homoglyph", False),  # Greek υ (U+03C5) for 'u'
+]
+
 
 def _record_typosquat(name: str, target: str, mutation: str, npm_registered: bool) -> dict:
     return {
@@ -455,19 +479,37 @@ def _write_jsonl(name: str, records: list[dict]) -> int:
     return len(records)
 
 
+# ── Corpus version stamping ────────────────────────────────────────────────────
+#
+# Bump this whenever the corpus composition changes (new records added,
+# mutation strategies extended, etc.) so an evaluation run's results can be
+# tied to the exact corpus version that produced them — see
+# corpus_metadata.json, written alongside the four *.jsonl files below.
+CORPUS_VERSION = "2026.07.2"
+
+
 def main() -> None:
     CORPUS_DIR.mkdir(parents=True, exist_ok=True)
 
     counts = {
         "malicious":    _write_jsonl("malicious",    [_record_malicious(*t) for t in _MALICIOUS_RECORDS]),
-        "typosquat":    _write_jsonl("typosquat",    [_record_typosquat(*t) for t in _TYPOSQUAT_RECORDS]),
+        "typosquat":    _write_jsonl("typosquat",    [_record_typosquat(*t) for t in _TYPOSQUAT_RECORDS + _UNICODE_HOMOGLYPH_RECORDS]),
         "hallucinated": _write_jsonl("hallucinated", [_record_hallucinated(*t) for t in _HALLUCINATED_NAMES]),
         "benign":       _write_jsonl("benign",       [_record_benign(n) for n in _BENIGN_PACKAGES]),
     }
 
-    print("Corpus build summary:")
+    metadata = {
+        "corpus_version": CORPUS_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "counts": counts,
+        "total_records": sum(counts.values()),
+    }
+    (CORPUS_DIR / "corpus_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    print(f"Corpus build summary (version {CORPUS_VERSION}):")
     for name, count in counts.items():
         print(f"  corpus/{name}.jsonl  : {count} records")
+    print(f"  corpus/corpus_metadata.json written")
 
 
 if __name__ == "__main__":

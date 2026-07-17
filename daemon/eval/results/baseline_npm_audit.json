@@ -1,0 +1,74 @@
+{
+  "timestamp": "2026-07-17T11:36:24.196074+00:00",
+  "tool": "npm-audit",
+  "npm_version": "10.8.2",
+  "npm_binary": "/usr/bin/npm",
+  "corpora": [
+    "malicious",
+    "typosquat",
+    "hallucinated",
+    "benign"
+  ],
+  "total_records": 189,
+  "completion_rate": 0.4656,
+  "error_reasons": {
+    "version-not-found": 40,
+    "other": 21,
+    "package-not-found": 40
+  },
+  "metrics": {
+    "per_ground_truth": {
+      "malicious": {
+        "TP": 0,
+        "FP": 0,
+        "TN": 0,
+        "FN": 12,
+        "ERROR": 44,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      "typosquat": {
+        "TP": 0,
+        "FP": 0,
+        "TN": 0,
+        "FN": 20,
+        "ERROR": 40,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      "hallucinated": {
+        "TP": 0,
+        "FP": 0,
+        "TN": 0,
+        "FN": 6,
+        "ERROR": 17,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      "benign": {
+        "TP": 0,
+        "FP": 0,
+        "TN": 50,
+        "FN": 0,
+        "ERROR": 0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      }
+    },
+    "overall": {
+      "TP": 0,
+      "FP": 0,
+      "TN": 50,
+      "FN": 38,
+      "ERROR": 101,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "false_positive_rate": 0.0
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "corpus_version": "2026.07.2",
+  "generated_at": "2026-07-17T10:33:19.069673+00:00",
+  "counts": {
+    "malicious": 56,
+    "typosquat": 60,
+    "hallucinated": 23,
+    "benign": 50
+  },
+  "total_records": 189
+}

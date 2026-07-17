@@ -203,6 +203,16 @@ cd intercept && npx jest --coverage
 
 Current coverage: 357 daemon tests (91%), 99 extension tests (81%), 45 shim tests.
 
+## Reproducing the evaluation results
+
+The labelled-corpus evaluation, ablation study, threshold-sensitivity sweep,
+and external baseline comparisons (npm audit, OSV-Scanner, Socket.dev,
+GuardDog) all live in `daemon/eval/` — see
+[`daemon/eval/README.md`](daemon/eval/README.md) for corpus provenance,
+setup instructions per baseline tool, and how to run each script. Corpus
+composition and version are recorded in `daemon/eval/corpus/corpus_metadata.json`;
+per-record citations are in `daemon/eval/CORPUS_PROVENANCE.md`.
+
 ## Configuration
 
 | Variable | Default | Effect |

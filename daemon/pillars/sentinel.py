@@ -24,7 +24,7 @@ import asyncio
 import unicodedata
 from datetime import datetime, timezone
 
-from ..config import get_admin_config
+from ..config import get_admin_config, get_settings
 from ..models import PillarScore
 from ..utils.logger import get_logger
 from ..utils.npm_registry import (
@@ -77,9 +77,10 @@ _AFFIX_PREFIXES: tuple[str, ...] = ("node-", "js-")
 _AFFIX_SUFFIXES: tuple[str, ...] = ("-js", "-utils", "-util", "-helper", "-async", "-core", "-lib")
 
 # ── Reputation-disparity thresholds ───────────────────────────────────────────
-_REPUTATION_RATIO_THRESHOLD: float = 0.05  # candidate has <5% of target's downloads
-_MATURE_AGE_DAYS: int = 365
-_NEW_AGE_DAYS: int = 30
+# Read live from Settings (daemon/config.py: reputation_ratio_threshold,
+# mature_age_days, new_age_days) rather than hardcoded here, so a
+# threshold-sensitivity sweep or a per-machine override can vary them
+# without a code change — see check_reputation_disparity.
 
 # ── Confusable-character normalization ─────────────────────────────────────────
 #
@@ -478,9 +479,10 @@ class Sentinel:
             return True, {"fallback": True}
         target_meta = target_result.data
 
+        settings = get_settings()
         candidate_downloads = candidate_signals.get("monthly_downloads", 0) or 0
         ratio = candidate_downloads / target_downloads if target_downloads > 0 else 0.0
-        disparity_by_downloads = target_downloads > 0 and ratio < _REPUTATION_RATIO_THRESHOLD
+        disparity_by_downloads = target_downloads > 0 and ratio < settings.reputation_ratio_threshold
 
         candidate_age = candidate_signals.get("age_days")
         target_created = target_meta.get("time", {}).get("created", "")
@@ -494,8 +496,8 @@ class Sentinel:
             except ValueError:
                 target_age = None
         disparity_by_age = (
-            isinstance(candidate_age, int) and candidate_age < _NEW_AGE_DAYS
-            and isinstance(target_age, int) and target_age > _MATURE_AGE_DAYS
+            isinstance(candidate_age, int) and candidate_age < settings.new_age_days
+            and isinstance(target_age, int) and target_age > settings.mature_age_days
         )
 
         confirmed = disparity_by_downloads or disparity_by_age

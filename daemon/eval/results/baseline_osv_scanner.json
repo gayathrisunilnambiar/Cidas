@@ -1,0 +1,74 @@
+{
+  "timestamp": "2026-07-17T11:37:03.749386+00:00",
+  "tool": "osv-scanner",
+  "osv_scanner_version": "osv-scanner version: 2.4.0\nosv-scalibr version: 0.4.5\ncommit: b56b5191101d5f27d4787d5583d8d01e9518a7af\nbuilt at: 2026-06-18T12:55:27Z",
+  "npm_binary": "/usr/bin/npm",
+  "corpora": [
+    "malicious",
+    "typosquat",
+    "hallucinated",
+    "benign"
+  ],
+  "total_records": 189,
+  "completion_rate": 0.4656,
+  "error_reasons": {
+    "version-not-found": 40,
+    "other": 21,
+    "package-not-found": 40
+  },
+  "metrics": {
+    "per_ground_truth": {
+      "malicious": {
+        "TP": 10,
+        "FP": 0,
+        "TN": 0,
+        "FN": 2,
+        "ERROR": 44,
+        "precision": 1.0,
+        "recall": 0.8333,
+        "f1": 0.9091
+      },
+      "typosquat": {
+        "TP": 5,
+        "FP": 0,
+        "TN": 0,
+        "FN": 15,
+        "ERROR": 40,
+        "precision": 1.0,
+        "recall": 0.25,
+        "f1": 0.4
+      },
+      "hallucinated": {
+        "TP": 0,
+        "FP": 0,
+        "TN": 0,
+        "FN": 6,
+        "ERROR": 17,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      "benign": {
+        "TP": 0,
+        "FP": 2,
+        "TN": 48,
+        "FN": 0,
+        "ERROR": 0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      }
+    },
+    "overall": {
+      "TP": 15,
+      "FP": 2,
+      "TN": 48,
+      "FN": 23,
+      "ERROR": 101,
+      "precision": 0.8824,
+      "recall": 0.3947,
+      "f1": 0.5455,
+      "false_positive_rate": 0.04
+    }
+  }
+}

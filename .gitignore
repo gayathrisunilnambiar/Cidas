@@ -11,6 +11,7 @@ __pycache__/
 .venv/
 venv/
 .guarddog-venv/
+.osv-scanner-bin/
 dist/
 build/
 *.egg-info/
