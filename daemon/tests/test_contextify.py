@@ -12,6 +12,7 @@ import pytest
 
 from daemon.models import PillarScore
 from daemon.pillars.contextify import Contextify
+from daemon.utils.npm_registry import RegistryLookup, RegistryResult
 
 
 @pytest.fixture
@@ -44,7 +45,8 @@ def test_unfamiliar_package_scores_high(contextify: Contextify, sample_project_p
     with (
         patch("daemon.pillars.contextify.embed_text", return_value=pkg_vec),
         patch("daemon.pillars.contextify.cosine_similarity", return_value=0.02),
-        patch("daemon.pillars.contextify.get_package_metadata", return_value=None),
+        patch("daemon.pillars.contextify.get_package_metadata",
+              return_value=RegistryResult(RegistryLookup.CONFIRMED_ABSENT)),
     ):
         risk, flags = contextify.compute_score(similarity=0.02, domain_count=len(domains))
 
@@ -74,7 +76,8 @@ async def test_score_with_mock_embeddings(contextify: Contextify, sample_project
     with (
         patch("daemon.pillars.contextify.embed_text", return_value=[0.5, 0.5, 0.5]),
         patch("daemon.pillars.contextify.cosine_similarity", return_value=0.75),
-        patch("daemon.pillars.contextify.get_package_metadata", return_value={"description": "utility library"}),
+        patch("daemon.pillars.contextify.get_package_metadata",
+              return_value=RegistryResult(RegistryLookup.EXISTS, {"description": "utility library"})),
     ):
         result = await contextify.score("lodash", str(sample_project_path))
 

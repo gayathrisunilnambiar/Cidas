@@ -3,15 +3,23 @@
 All functions are module-level coroutines (not methods) so they can be
 imported and mocked individually in tests without instantiating any class.
 
-A 404 from the registry is treated as "package not found" and returns None,
-which the calling pillar should treat as a high-risk signal.
+Registry lookups return a tri-state ``RegistryResult`` rather than a plain
+``dict | None``: a confirmed HTTP 404 is distinguished from an undetermined
+outcome (timeout, transport error, or a non-404 HTTP error status after
+retries are exhausted). Conflating the two used to mean a transient registry
+blip was treated identically to "this package does not exist," which forced
+a BLOCK-level score for real, popular packages during registry hiccups.
 """
 from __future__ import annotations
 
 import asyncio
+import io
 import re
+import tarfile
 import time
+from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Any
 
 import httpx
@@ -23,6 +31,81 @@ log = get_logger(__name__)
 
 _TIMEOUT = httpx.Timeout(5.0)
 _DOWNLOADS_BASE = "https://api.npmjs.org/downloads/point/last-month"
+
+_SECURITY_PLACEHOLDER_VERSION_RE = re.compile(r"-security\.\d+$")
+
+
+class _TokenBucketLimiter:
+    """Shared token-bucket rate limiter for outbound npm HTTP calls.
+
+    Retry-with-backoff (see _get's 429 handling) is reactive: it only helps
+    once a request has already been rejected, and cannot prevent a burst of
+    concurrent requests from tripping a hard rate limit in the first place.
+    Observed in practice: api.npmjs.org's downloads endpoint 429s heavily
+    when Sentinel's reputation-corroboration check fires many concurrent,
+    distinct (uncached) download-count lookups within the same few seconds
+    — e.g. scanning the typosquat corpus, where every candidate/target pair
+    is looked up for the first time in a tight burst. This limiter paces
+    every _get() call proactively so that burst never happens, independent
+    of whether any individual name benefits from the result cache.
+    """
+
+    def __init__(self, rate_per_sec: float, capacity: float) -> None:
+        self._rate = rate_per_sec
+        self._capacity = capacity
+        self._tokens = capacity
+        self._last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                self._last_refill = now
+                self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self._rate
+            await asyncio.sleep(wait)
+
+
+# 2 req/s sustained, burst of 2 — conservative relative to the bursts
+# (dozens of concurrent distinct requests within ~1s) observed to trip
+# api.npmjs.org's rate limit during a full-corpus evaluation run.
+_NPM_RATE_LIMITER = _TokenBucketLimiter(rate_per_sec=2.0, capacity=2.0)
+
+
+class RegistryLookup(Enum):
+    """Outcome of a registry lookup, distinguishing absence from ambiguity."""
+
+    EXISTS = "exists"
+    CONFIRMED_ABSENT = "confirmed_absent"
+    UNDETERMINED = "undetermined"
+
+
+@dataclass(frozen=True)
+class RegistryResult:
+    """Result of a registry document fetch.
+
+    ``data`` is populated only when ``status is RegistryLookup.EXISTS``.
+    """
+
+    status: RegistryLookup
+    data: dict[str, Any] | None = None
+
+
+def is_security_placeholder_version(version: str) -> bool:
+    """True if *version* matches npm's security-placeholder convention.
+
+    When npm's security team pulls a malicious or reserved release, it
+    republishes a stub under a version like ``"0.0.1-security.0"`` in its
+    place — the tarball resolves (HTTP 200) but its contents are an inert
+    placeholder, not the original package. See
+    https://docs.npmjs.com/policies/security.
+    """
+    return bool(_SECURITY_PLACEHOLDER_VERSION_RE.search(version or ""))
 
 # ── Per-package metadata single-flight cache ──────────────────────────────────
 #
@@ -39,11 +122,11 @@ _DOWNLOADS_BASE = "https://api.npmjs.org/downloads/point/last-month"
 # concurrent pillar fan-out — so it never serves meaningfully stale data
 # across genuinely separate scans.
 _METADATA_CACHE_TTL = 10.0
-_metadata_cache: dict[str, tuple[float, "asyncio.Future[dict[str, Any] | None]"]] = {}
+_metadata_cache: dict[str, tuple[float, "asyncio.Future[RegistryResult]"]] = {}
 _metadata_cache_lock = asyncio.Lock()
 
 
-async def _fetch_registry_doc_cached(name: str) -> dict[str, Any] | None:
+async def _fetch_registry_doc_cached(name: str) -> RegistryResult:
     """Single-flight, short-TTL cache around the full-document registry fetch."""
     now = time.monotonic()
     async with _metadata_cache_lock:
@@ -63,15 +146,12 @@ async def _fetch_registry_doc_cached(name: str) -> dict[str, Any] | None:
             if _metadata_cache.get(name) == (now, future):
                 _metadata_cache.pop(name, None)
         raise
-    if result is None:
-        # _get() also returns None (rather than raising) after exhausting
-        # its own retries on a transient timeout/transport failure — not
-        # just on a confirmed 404. Caching that outcome would mean a single
-        # network blip gets treated as "confirmed absent" by every caller
-        # for the rest of the TTL window (Sentinel escalates this to a
-        # forced BLOCK — empirically observed force-blocking real, popular
-        # packages during a live evaluation run). Don't cache failures; only
-        # a genuine successful fetch is worth sharing across pillars.
+    if result.status is RegistryLookup.UNDETERMINED:
+        # A transient timeout/transport/non-404-error outcome must not be
+        # cached — caching it would mean a single network blip is treated
+        # as authoritative by every fan-out caller for the rest of the TTL
+        # window. EXISTS and CONFIRMED_ABSENT are both stable facts and are
+        # safe (and desirable) to share across pillars via the cache.
         async with _metadata_cache_lock:
             if _metadata_cache.get(name) == (now, future):
                 _metadata_cache.pop(name, None)
@@ -83,16 +163,59 @@ def _clear_metadata_cache() -> None:
     _metadata_cache.clear()
 
 
-async def _get(url: str) -> dict[str, Any] | None:
-    """Make a single GET request; returns parsed JSON or None on error."""
+_MAX_RATE_LIMIT_RETRIES = 3
+_RATE_LIMIT_BACKOFF_BASE = 0.5  # seconds; linear backoff (base * attempt#)
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a numeric-seconds Retry-After header value. Returns None for
+    missing/non-numeric values (e.g. an HTTP-date) rather than raising —
+    callers fall back to a fixed backoff in that case."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _get(url: str) -> RegistryResult:
+    """Make a single GET request; returns a tri-state RegistryResult.
+
+    HTTP 429 (rate limited) is retried with backoff — up to
+    _MAX_RATE_LIMIT_RETRIES times, honoring Retry-After when present —
+    since a 429 is by definition transient, unlike other non-404 HTTP
+    errors. npm's downloads API (used by get_download_count) rate-limits
+    aggressively under sustained request volume; without this, a single
+    burst of 429s could cascade into spurious UNDETERMINED results across
+    an entire evaluation run.
+    """
+    rate_limit_attempts = 0
     for attempt in (1, 2):
         try:
             async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
-                resp = await client.get(url, headers={"Accept": "application/json"})
+                while True:
+                    await _NPM_RATE_LIMITER.acquire()
+                    resp = await client.get(url, headers={"Accept": "application/json"})
+                    if resp.status_code == 429 and rate_limit_attempts < _MAX_RATE_LIMIT_RETRIES:
+                        rate_limit_attempts += 1
+                        delay = _parse_retry_after(resp.headers.get("Retry-After"))
+                        if delay is None:
+                            delay = _RATE_LIMIT_BACKOFF_BASE * rate_limit_attempts
+                        log.debug(
+                            "GET %s rate-limited (429), retrying in %.1fs (attempt %d/%d)",
+                            url, delay, rate_limit_attempts, _MAX_RATE_LIMIT_RETRIES,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    break
                 if resp.status_code == 404:
-                    return None
+                    return RegistryResult(RegistryLookup.CONFIRMED_ABSENT)
+                if resp.status_code == 429:
+                    log.warning("GET %s still rate-limited after %d retries", url, rate_limit_attempts)
+                    return RegistryResult(RegistryLookup.UNDETERMINED)
                 resp.raise_for_status()
-                return resp.json()  # type: ignore[return-value]
+                return RegistryResult(RegistryLookup.EXISTS, resp.json())
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             # TransportError covers NetworkError plus RemoteProtocolError
             # ("server disconnected without sending a response") and other
@@ -101,34 +224,56 @@ async def _get(url: str) -> dict[str, Any] | None:
             # which used to propagate uncaught and 500 the whole /scan request.
             if attempt == 2:
                 log.warning("GET %s failed after 2 attempts: %s", url, exc)
-                return None
+                return RegistryResult(RegistryLookup.UNDETERMINED)
             log.debug("GET %s attempt %d failed, retrying: %s", url, attempt, exc)
         except httpx.HTTPStatusError as exc:
+            # A non-404 error status (5xx, etc.) is ambiguous, not a confirmed
+            # absence — the package may well exist; the registry just failed
+            # to serve it this time.
             log.warning("HTTP %s from %s", exc.response.status_code, url)
-            return None
-    return None  # unreachable, but satisfies mypy
+            return RegistryResult(RegistryLookup.UNDETERMINED)
+    return RegistryResult(RegistryLookup.UNDETERMINED)  # unreachable, but satisfies mypy
 
 
-async def get_package_metadata(name: str, version: str | None = None) -> dict[str, Any] | None:
-    """Return full package metadata from the registry.
+async def get_package_metadata(
+    name: str,
+    version: str | None = None,
+    *,
+    confirm_absence: bool = False,
+) -> RegistryResult:
+    """Return full package metadata from the registry as a RegistryResult.
 
-    If *version* is given, returns the version-specific package.json dict;
-    otherwise returns the full registry document for *name*.
+    If *version* is given, ``data`` is the version-specific package.json dict;
+    otherwise ``data`` is the full registry document for *name*. Only
+    populated when ``status is RegistryLookup.EXISTS``.
 
     In both cases a top-level ``unpackedSize`` key (int, bytes) is injected
-    from ``dist.unpackedSize`` of the resolved version.  Defaults to 0 when
-    the field is absent or the registry omits it.
+    into ``data`` from ``dist.unpackedSize`` of the resolved version.
+    Defaults to 0 when the field is absent or the registry omits it.
+
+    If *confirm_absence* is True and the first lookup comes back
+    CONFIRMED_ABSENT, one extra confirmatory re-fetch (bypassing the cache)
+    is made before returning — for callers where treating "not found" as a
+    high-consequence signal (e.g. Sentinel's BLOCK-floor gate) justifies the
+    extra latency. Callers that don't need that guarantee should leave this
+    False.
     """
-    meta = await _fetch_registry_doc_cached(name)
-    if meta is None:
-        return None
+    result = await _fetch_registry_doc_cached(name)
+    if confirm_absence and result.status is RegistryLookup.CONFIRMED_ABSENT:
+        async with _metadata_cache_lock:
+            _metadata_cache.pop(name, None)
+        result = await _fetch_registry_doc_cached(name)
+    if result.status is not RegistryLookup.EXISTS:
+        return result
+    meta = result.data
+    assert meta is not None
     if version:
         manifest = meta.get("versions", {}).get(version)
         if manifest is None:
-            return None
+            return RegistryResult(RegistryLookup.CONFIRMED_ABSENT)
         dist = manifest.get("dist") or {}
         manifest["unpackedSize"] = int(dist.get("unpackedSize") or 0)
-        return manifest
+        return RegistryResult(RegistryLookup.EXISTS, manifest)
     # Full registry document: inject unpackedSize and deprecation info from the latest version.
     latest = (meta.get("dist-tags") or {}).get("latest")
     if latest:
@@ -142,7 +287,7 @@ async def get_package_metadata(name: str, version: str | None = None) -> dict[st
         meta["unpackedSize"] = 0
         meta["deprecated"] = False
         meta["deprecation_message"] = ""
-    return meta
+    return RegistryResult(RegistryLookup.EXISTS, meta)
 
 
 async def get_package_size(name: str, version: str = "latest") -> int:
@@ -153,9 +298,10 @@ async def get_package_size(name: str, version: str = "latest") -> int:
     Returns 0 on any error — 404, timeout, or missing field.
     """
     try:
-        meta = await get_package_metadata(name)
-        if meta is None:
+        result = await get_package_metadata(name)
+        if result.status is not RegistryLookup.EXISTS:
             return 0
+        meta = result.data or {}
         dist_tags: dict = meta.get("dist-tags") or {}
         versions: dict = meta.get("versions") or {}
         cleaned = (version or "").lstrip("v=^~")
@@ -171,12 +317,56 @@ async def get_package_size(name: str, version: str = "latest") -> int:
         return 0
 
 
-async def get_download_count(name: str) -> int:
-    """Return last-month download count from the npm downloads API."""
-    data = await _get(f"{_DOWNLOADS_BASE}/{name}")
-    if data is None:
+# ── Download-count single-flight cache ────────────────────────────────────────
+#
+# Reputation-disparity corroboration (Sentinel) looks up the *target*
+# package's download count for every raw-distance/affix typosquat hit — and
+# a large fraction of a real corpus's typosquat candidates target the same
+# small set of popular packages (react, lodash, express, uuid, ...). Without
+# caching, that's hundreds of redundant identical calls to npm's downloads
+# API across one evaluation run, which measurably trips its rate limiting
+# (observed: sustained 429s under a live corpus run). A 5-minute TTL is safe
+# since monthly download counts don't meaningfully change on that timescale,
+# and long enough to cover an entire scan session's repeated lookups of the
+# same hot targets.
+_DOWNLOAD_CACHE_TTL = 300.0
+_download_cache: dict[str, tuple[float, "asyncio.Future[int]"]] = {}
+_download_cache_lock = asyncio.Lock()
+
+
+def _clear_download_cache() -> None:
+    """Test-only helper: reset the download-count cache between test cases."""
+    _download_cache.clear()
+
+
+async def _fetch_download_count(name: str) -> int:
+    result = await _get(f"{_DOWNLOADS_BASE}/{name}")
+    if result.status is not RegistryLookup.EXISTS or result.data is None:
         return 0
-    return int(data.get("downloads", 0))
+    return int(result.data.get("downloads", 0))
+
+
+async def get_download_count(name: str) -> int:
+    """Return last-month download count from the npm downloads API.
+
+    Single-flight cached per *name* for _DOWNLOAD_CACHE_TTL seconds — see
+    the cache docstring above for why this matters for corroboration.
+    """
+    now = time.monotonic()
+    async with _download_cache_lock:
+        cached = _download_cache.get(name)
+        if cached is not None and now - cached[0] < _DOWNLOAD_CACHE_TTL:
+            future = cached[1]
+        else:
+            future = asyncio.ensure_future(_fetch_download_count(name))
+            _download_cache[name] = (now, future)
+    try:
+        return await future
+    except Exception:
+        async with _download_cache_lock:
+            if _download_cache.get(name) == (now, future):
+                _download_cache.pop(name, None)
+        raise
 
 
 async def download_tarball(url: str, dest_path: str) -> bool:
@@ -207,6 +397,68 @@ async def download_tarball(url: str, dest_path: str) -> bool:
         return False
 
 
+async def tarball_has_member(
+    tarball_url: str,
+    member_basenames: frozenset[str],
+    *,
+    max_bytes: int = 2 * 1024 * 1024,
+) -> bool | None:
+    """Check whether *tarball_url* contains a tar entry whose basename is in
+    *member_basenames*, without extracting file contents or downloading the
+    whole archive.
+
+    Streams up to *max_bytes* into memory and iterates the tar's member
+    list (tolerating npm's ``package/`` path prefix). Returns:
+
+    - ``True``  — a matching member was found before the cap.
+    - ``False`` — the archive was read to a clean EOF within the cap with no
+      matching member (confirmed absent).
+    - ``None``  — undetermined: non-200 response, timeout/transport error,
+      the *max_bytes* cap was hit, or the buffered data couldn't be parsed
+      as a complete archive. A truncated/ambiguous read must never be
+      reported as ``False`` — callers should treat ``None`` as "could not
+      verify" and fail closed (e.g. force a fuller check) rather than
+      trusting an absence they can't actually confirm.
+    """
+    buf = io.BytesIO()
+    hit_cap = False
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), follow_redirects=True) as client:
+            async with client.stream("GET", tarball_url) as resp:
+                if resp.status_code != 200:
+                    log.warning("tarball listing GET %s returned HTTP %s", tarball_url, resp.status_code)
+                    return None
+                async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                    buf.write(chunk)
+                    if buf.tell() > max_bytes:
+                        hit_cap = True
+                        break
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        log.warning("tarball listing failed for %s: %s", tarball_url, exc)
+        return None
+
+    buf.seek(0)
+    found = False
+    reached_clean_eof = False
+    try:
+        with tarfile.open(fileobj=buf, mode="r|gz") as tf:
+            for member in tf:
+                basename = member.name.rsplit("/", 1)[-1]
+                if basename in member_basenames:
+                    found = True
+                    break
+            else:
+                reached_clean_eof = True
+    except (tarfile.TarError, OSError) as exc:
+        log.debug("tarball listing parse failed for %s: %s", tarball_url, exc)
+
+    if found:
+        return True
+    if hit_cap or not reached_clean_eof:
+        return None
+    return False
+
+
 _EXACT_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+")
 
 
@@ -218,9 +470,10 @@ async def get_direct_dependencies(name: str, version: str | None) -> dict[str, s
     ``dist-tags.latest`` version.  Returns an empty dict on any error so callers
     can degrade gracefully without special-casing failures.
     """
-    meta = await get_package_metadata(name)
-    if meta is None:
+    result = await get_package_metadata(name)
+    if result.status is not RegistryLookup.EXISTS or result.data is None:
         return {}
+    meta = result.data
     dist_tags: dict = meta.get("dist-tags", {})
     versions: dict = meta.get("versions", {})
 
@@ -242,61 +495,95 @@ async def get_direct_dependencies(name: str, version: str | None) -> dict[str, s
 # and diff analysis only ever needs the immediately-preceding entry.
 _MAX_HISTORY = 10
 
+# How far get_previous_version will walk backward past purged/unresolvable
+# versions before giving up. npm's security team typically purges only the
+# 1-2 malicious releases themselves, but a large batch compromise could in
+# principle wipe a longer run — this bounds the worst case so the walk
+# never silently diffs against a version many releases older than intended.
+_MAX_PREDECESSOR_WALKBACK = 20
 
-async def get_version_history(name: str) -> list[dict[str, Any]]:
-    """Return ``[{"version": str, "published": datetime}]`` oldest-first.
 
-    Reads ``meta["time"]`` from the registry document and pairs each version
-    string with its publish timestamp. Capped at the **10 most recent**
-    versions to keep diff analysis bounded. Returns ``[]`` on registry miss
-    or when no parseable timestamps are present.
+async def get_full_version_timeline(name: str) -> list[dict[str, Any]]:
+    """Return every version npm has recorded a publish timestamp for,
+    oldest-first, each tagged with whether its manifest is still resolvable
+    today: ``[{"version": str, "published": datetime, "resolvable": bool}]``.
+
+    Unlike ``get_version_history``, this is neither filtered to resolvable
+    versions nor capped — callers that need to locate a since-purged
+    version's position in publish order (e.g. ``get_previous_version``) need
+    the *unfiltered* timeline, since npm's ``time`` object typically still
+    records a purged version's original publish timestamp even after its
+    manifest has been removed from ``versions``. Returns ``[]`` on registry
+    miss or when no parseable timestamps are present.
     """
-    meta = await get_package_metadata(name)
-    if meta is None:
+    result = await get_package_metadata(name)
+    if result.status is not RegistryLookup.EXISTS or result.data is None:
         return []
+    meta = result.data
 
     times: dict = meta.get("time", {}) or {}
     versions: dict = meta.get("versions", {}) or {}
 
-    history: list[dict[str, Any]] = []
+    timeline: list[dict[str, Any]] = []
     for version, published_str in times.items():
         # 'created'/'modified' are document-level meta-keys, not real versions.
         if version in ("created", "modified"):
-            continue
-        # Skip orphaned timestamps that don't correspond to a real version.
-        if version not in versions:
             continue
         try:
             published = datetime.fromisoformat(str(published_str).replace("Z", "+00:00"))
         except (ValueError, AttributeError, TypeError):
             continue
-        history.append({"version": version, "published": published})
+        timeline.append({"version": version, "published": published, "resolvable": version in versions})
 
-    history.sort(key=lambda d: d["published"])
+    timeline.sort(key=lambda d: d["published"])
+    return timeline
+
+
+async def get_version_history(name: str) -> list[dict[str, Any]]:
+    """Return ``[{"version": str, "published": datetime}]`` oldest-first,
+    restricted to versions still resolvable today and capped at the **10
+    most recent** to keep diff analysis bounded. Returns ``[]`` on registry
+    miss or when no parseable timestamps are present.
+    """
+    timeline = await get_full_version_timeline(name)
+    history = [{"version": e["version"], "published": e["published"]} for e in timeline if e["resolvable"]]
     return history[-_MAX_HISTORY:]
 
 
 async def get_previous_version(name: str, current_version: str) -> str | None:
-    """Return the version published immediately before *current_version*.
+    """Return the nearest resolvable version published before *current_version*.
 
-    Returns ``None`` if *current_version* is the first release in the bounded
-    history window, isn't present in the registry, or the registry is
-    unreachable.
+    Walks backward from *current_version*'s position in the full publish
+    timeline (not the resolvable-only history), so a since-purged version —
+    e.g. a malicious release npm's security team removed — can still be
+    located by publish order even though its own manifest is gone. The
+    search for a predecessor then skips over any *other* purged versions in
+    between to find the nearest one that still resolves, bounded to
+    ``_MAX_PREDECESSOR_WALKBACK`` steps back.
+
+    Returns ``None`` if *current_version* has no recorded publish timestamp
+    at all, is the first release, or no resolvable predecessor is found
+    within the walkback bound.
     """
     if not current_version:
         return None
-    history = await get_version_history(name)
-    for i, entry in enumerate(history):
-        if entry["version"] == current_version:
-            return history[i - 1]["version"] if i > 0 else None
+    timeline = await get_full_version_timeline(name)
+    idx = next((i for i, e in enumerate(timeline) if e["version"] == current_version), None)
+    if idx is None or idx == 0:
+        return None
+    lo = max(0, idx - _MAX_PREDECESSOR_WALKBACK)
+    for j in range(idx - 1, lo - 1, -1):
+        if timeline[j]["resolvable"]:
+            return timeline[j]["version"]
     return None
 
 
 async def get_package_tarball_info(name: str, version: str | None) -> dict[str, Any] | None:
     """Return the dist/tarball metadata for a specific package version."""
-    meta = await get_package_metadata(name)
-    if meta is None:
+    result = await get_package_metadata(name)
+    if result.status is not RegistryLookup.EXISTS or result.data is None:
         return None
+    meta = result.data
     dist_tags: dict = meta.get("dist-tags", {})
     resolved_version = version or dist_tags.get("latest")
     if not resolved_version:

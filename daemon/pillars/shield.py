@@ -27,7 +27,13 @@ from ..config import get_admin_config, get_settings
 from ..models import PillarScore
 from ..utils.llm_verifier import verify_with_llm
 from ..utils.logger import get_logger
-from ..utils.npm_registry import download_tarball, get_package_metadata, get_package_tarball_info
+from ..utils.npm_registry import (
+    RegistryLookup,
+    download_tarball,
+    get_package_metadata,
+    get_package_tarball_info,
+    tarball_has_member,
+)
 
 log = get_logger(__name__)
 
@@ -59,6 +65,49 @@ def _scripts_and_deps_equal(current_manifest: dict, prev_manifest: dict) -> bool
         (current_manifest.get("scripts") or {}) == (prev_manifest.get("scripts") or {})
         and (current_manifest.get("dependencies") or {}) == (prev_manifest.get("dependencies") or {})
     )
+
+
+# ── Native-build auto-execution trigger files ─────────────────────────────────
+#
+# npm's install step auto-runs `node-gyp rebuild` whenever a `binding.gyp` is
+# present, independent of any `scripts` entry in package.json — the "Phantom
+# Gyp" campaign (StepSecurity/Wiz/Endor Labs, June 2026) added exactly this
+# file with no package.json change at all, evading manifest-first gating
+# entirely since that gate only compares scripts/dependencies. Treated as
+# equivalent to a lifecycle-script change: any presence transition forces the
+# full historical diff.
+#
+# Explicitly OUT OF SCOPE for this check (see docs/threat-model.md):
+#   - .node-gyp build-cache poisoning — no file-presence signal to check for.
+#   - prebuild-install / node-pre-gyp fetching prebuilt binaries from an
+#     arbitrary URL at install time — a content-level check, not a
+#     presence-level one; named as future work rather than silently uncovered.
+#   - Custom install.js-driven native builds — already covered, since those
+#     are invoked via a `scripts` entry and so already trip
+#     _scripts_and_deps_equal.
+_NATIVE_BUILD_TRIGGER_FILES: frozenset[str] = frozenset({"binding.gyp"})
+
+
+async def _native_trigger_transition(
+    cur_manifest: dict, prev_manifest: dict,
+) -> bool:
+    """True if a native-build auto-exec trigger file's presence differs
+    between *cur_manifest* and *prev_manifest*'s tarballs (added, removed, or
+    undeterminable). Fail-closed: any undetermined listing check (network
+    hiccup, cap exceeded, missing dist.tarball) is treated as "changed" so
+    this optimization never silently trusts an ambiguous read.
+    """
+    cur_url = (cur_manifest.get("dist") or {}).get("tarball")
+    prev_url = (prev_manifest.get("dist") or {}).get("tarball")
+    if not cur_url or not prev_url:
+        return True
+    cur_has = await tarball_has_member(cur_url, _NATIVE_BUILD_TRIGGER_FILES)
+    if cur_has is None:
+        return True
+    prev_has = await tarball_has_member(prev_url, _NATIVE_BUILD_TRIGGER_FILES)
+    if prev_has is None:
+        return True
+    return cur_has != prev_has
 
 
 # ── File-scan parameters ──────────────────────────────────────────────────────
@@ -305,12 +354,53 @@ _INJECTION_PATTERNS: list[re.Pattern[str]] = [
 class Shield:
     """Pillar 3: detect malicious scripts and prompt injection in package metadata."""
 
-    async def score(self, package_name: str, package_metadata: dict | None) -> PillarScore:
-        """Return a PillarScore for the candidate package."""
-        if package_metadata is None:
-            package_metadata = await get_package_metadata(package_name) or {}
+    async def score(
+        self, package_name: str, package_metadata: dict | None, version: str | None = None,
+    ) -> PillarScore:
+        """Return a PillarScore for the candidate package.
 
-        scripts = await self.fetch_install_scripts(package_name, package_metadata)
+        *version* is the exact version actually being installed/evaluated
+        (e.g. from a pinned ``npm install pkg@1.2.3``). When given and present
+        in the registry's ``versions`` map, every check below (scripts,
+        tarball file-scan, diff baseline) resolves against *that* version
+        instead of ``dist-tags.latest`` — a compromised release that has
+        since been unpublished or superseded by a clean fix would otherwise
+        be invisible to Shield, since it would silently scan whatever is
+        currently latest instead of the version actually requested.
+
+        If *version* is given but the package's registry document has a
+        real (non-empty) ``versions`` map that doesn't include it — e.g. the
+        exact version npm's security team purged after a compromise — Shield
+        cannot examine what was actually asked. It returns an explicit
+        ``requested_version_unresolved`` state instead of silently
+        substituting ``dist-tags.latest`` and scoring that: a scanner that
+        can't examine the thing it was asked to examine must say so, not
+        quietly examine something else and report as if it succeeded. This
+        mirrors the tri-state (exists / confirmed-absent / undetermined)
+        discipline already applied to registry-existence checks elsewhere.
+        """
+        if package_metadata is None:
+            meta_result = await get_package_metadata(package_name)
+            package_metadata = meta_result.data if meta_result.status is RegistryLookup.EXISTS else {}
+            package_metadata = package_metadata or {}
+
+        versions_map = package_metadata.get("versions") or {}
+        if version and versions_map and version not in versions_map:
+            return PillarScore(
+                score=0.0,
+                confidence=0.0,
+                flags=["requested_version_unresolved"],
+                metadata={
+                    "requested_version": version,
+                    "tarball_url": None,
+                    "file_scan_summary": {"files_scanned": 0, "flags": 0, "skipped": "requested_version_unresolved"},
+                    "diff_score": 0.0,
+                    "new_imports": [],
+                    "new_network_calls": False,
+                },
+            )
+
+        scripts = await self.fetch_install_scripts(package_name, package_metadata, version)
         readme = package_metadata.get("readme", "") or ""
         description = package_metadata.get("description", "") or ""
 
@@ -320,7 +410,7 @@ class Shield:
         primary_injection_score, injection_flags = self._scan_injection(description + "\n" + readme)
 
         # File scan — downloads the tarball and statically inspects .js files.
-        tarball_url = self._tarball_url_from_metadata(package_metadata)
+        tarball_url = self._tarball_url_from_metadata(package_metadata, version)
         file_score, file_flags, file_summary = await self.scan_package_files(tarball_url)
 
         # Secondary LLM verification: only fires when (a) admin enabled it via
@@ -364,7 +454,11 @@ class Shield:
         diff_new_imports: list[str] = []
         diff_new_network: bool = False
         if tarball_url:
-            current_v = (package_metadata.get("dist-tags") or {}).get("latest")
+            versions_for_current = package_metadata.get("versions") or {}
+            if version and version in versions_for_current:
+                current_v = version
+            else:
+                current_v = (package_metadata.get("dist-tags") or {}).get("latest")
             if current_v:
                 try:
                     from ..utils.diff_analyzer import diff_package_versions
@@ -399,6 +493,23 @@ class Shield:
                             and prev_manifest is not None
                             and _scripts_and_deps_equal(cur_manifest, prev_manifest)
                         )
+                        # Manifest equality alone isn't sufficient: the
+                        # "Phantom Gyp" pattern adds a binding.gyp with no
+                        # package.json change at all, relying on npm's
+                        # automatic node-gyp rebuild to execute a payload
+                        # outside this gate's view. Only pay this extra
+                        # network check in the branch that would otherwise
+                        # skip real work — packages whose manifests already
+                        # differ never reach here, since they already force
+                        # the full diff.
+                        if manifest_unchanged:
+                            native_check_on = admin_cfg.get(
+                                "shield_native_trigger_check", True,
+                            ) is not False
+                            if native_check_on and await _native_trigger_transition(
+                                cur_manifest, prev_manifest,
+                            ):
+                                manifest_unchanged = False
                         if not manifest_unchanged:
                             diff_result = await diff_package_versions(
                                 package_name, current_v, prev_v,
@@ -443,11 +554,13 @@ class Shield:
         )
 
     @staticmethod
-    def _tarball_url_from_metadata(metadata: dict) -> str | None:
-        """Pull dist.tarball for the latest version out of registry metadata."""
-        latest = (metadata.get("dist-tags") or {}).get("latest")
+    def _tarball_url_from_metadata(metadata: dict, version: str | None = None) -> str | None:
+        """Pull dist.tarball for *version* (or latest, if unset/unresolvable) out of registry metadata."""
         versions = metadata.get("versions") or {}
-        pkg = versions.get(latest) if latest else None
+        resolved = version if version and version in versions else None
+        if resolved is None:
+            resolved = (metadata.get("dist-tags") or {}).get("latest")
+        pkg = versions.get(resolved) if resolved else None
         if not pkg and versions:
             pkg = next(iter(versions.values()))
         dist = (pkg or {}).get("dist") or {}
@@ -611,15 +724,23 @@ class Shield:
                 hits[label] = _AST_PATTERN_SCORES[label]
         return list(hits.items())
 
-    async def fetch_install_scripts(self, package_name: str, metadata: dict) -> dict[str, str]:
-        """Extract lifecycle scripts from the package metadata or tarball info."""
-        # First try: scripts embedded in the registry metadata (dist-tags / latest version)
+    async def fetch_install_scripts(
+        self, package_name: str, metadata: dict, version: str | None = None,
+    ) -> dict[str, str]:
+        """Extract lifecycle scripts from the package metadata or tarball info.
+
+        Resolves *version*'s own manifest when given and present in the
+        registry document; otherwise falls back to dist-tags.latest (prior
+        behavior).
+        """
         dist_tags: dict = metadata.get("dist-tags", {})
         latest = dist_tags.get("latest")
         versions: dict = metadata.get("versions", {})
 
         pkg_json: dict = {}
-        if latest and latest in versions:
+        if version and version in versions:
+            pkg_json = versions[version]
+        elif latest and latest in versions:
             pkg_json = versions[latest]
         elif versions:
             pkg_json = next(iter(versions.values()))

@@ -16,6 +16,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from daemon.main import app
+from daemon.utils.npm_registry import RegistryLookup, RegistryResult
 
 # ── Sample registry metadata ──────────────────────────────────────────────────
 _SAMPLE_META: dict = {
@@ -48,10 +49,31 @@ def _reset_npm_metadata_cache():
     test's mock, since the cache is process-global for the daemon's actual
     request-deduplication purpose.
     """
-    from daemon.utils.npm_registry import _clear_metadata_cache
+    from daemon.utils.npm_registry import _clear_download_cache, _clear_metadata_cache
     _clear_metadata_cache()
+    _clear_download_cache()
     yield
     _clear_metadata_cache()
+    _clear_download_cache()
+
+
+@pytest.fixture(autouse=True)
+def _bypass_npm_rate_limiter(monkeypatch):
+    """Disable the real token-bucket pacing around _get() during tests.
+
+    The production limiter deliberately introduces real wall-clock delay to
+    stay under npm's rate limit — exactly what we don't want in a fast,
+    deterministic test suite that calls the real _get() body (with mocked
+    HTTP) dozens of times in a row. Rate-limiter *behavior* itself is
+    covered by dedicated unit tests against a fresh _TokenBucketLimiter
+    instance, not the shared module-level singleton.
+    """
+    from daemon.utils import npm_registry
+
+    async def _noop() -> None:
+        return None
+
+    monkeypatch.setattr(npm_registry._NPM_RATE_LIMITER, "acquire", _noop)
 
 
 @pytest.fixture
@@ -75,7 +97,10 @@ async def async_client() -> AsyncGenerator[AsyncClient, None]:
 def mock_npm_registry():
     """Patch all npm registry functions to return deterministic test data."""
     with (
-        patch("daemon.utils.npm_registry.get_package_metadata", new=AsyncMock(return_value=_SAMPLE_META)),
+        patch(
+            "daemon.utils.npm_registry.get_package_metadata",
+            new=AsyncMock(return_value=RegistryResult(RegistryLookup.EXISTS, _SAMPLE_META)),
+        ),
         patch("daemon.utils.npm_registry.get_download_count", new=AsyncMock(return_value=50_000)),
         patch("daemon.utils.npm_registry.get_package_tarball_info", new=AsyncMock(return_value={"tarball": "https://example.com"})),
         patch("daemon.utils.npm_registry.get_package_size", new=AsyncMock(return_value=12_345)),

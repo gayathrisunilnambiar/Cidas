@@ -12,7 +12,27 @@ Schema (per JSONL line)
     ground_truth  ("malicious" | "benign" | "typosquat" | "hallucinated")
     attack_type   ("install_script_exec" | "dependency_hijack" |
                    "protestware" | "credential_theft" | "typosquat" |
-                   "account_takeover" | "none")
+                   "account_takeover" | "worm_propagation" |
+                   "ci_pipeline_compromise" | "none")
+
+    ``worm_propagation`` vs. ``account_takeover`` vs. ``ci_pipeline_compromise``:
+    these three are easy to conflate under a single "supply-chain incident"
+    label but describe genuinely different propagation mechanisms, which
+    matters for per-attack-type recall breakdowns —
+      - ``worm_propagation``: the compromise is self-replicating with no
+        further attacker action per hop (steals the victim's own npm/cloud
+        tokens, auto-publishes malicious versions to every package that
+        token can reach, repeats). Only campaigns with a confirmed automated
+        propagation loop get this tag (e.g. Shai-Hulud).
+      - ``account_takeover``: a single maintainer's publishing credentials
+        are stolen (phishing, RAT-delivered credential theft, etc.) and the
+        attacker manually publishes malicious versions of packages that
+        account owns. No self-replication loop.
+      - ``ci_pipeline_compromise``: the attacker hijacks a project's own
+        CI/CD publish workflow (e.g. a malicious commit merged under a
+        fabricated identity, executed through the project's legitimate
+        GitHub Actions/OIDC trusted-publisher flow) rather than stealing
+        credentials directly.
     source        (dataset / advisory ID or "synthetic")
     notes         (free-text human annotation)
 
@@ -140,6 +160,101 @@ _MALICIOUS_RECORDS: list[tuple[str, str, str, str, str]] = [
      "Typosquat of electron; published cryptominer."),
     ("ffmepg", "*", "typosquat", "snyk-ffmepg",
      "Typosquat of ffmpeg; credential exfil postinstall."),
+
+    # ── Shai-Hulud (Sept 2025) — genuine self-propagating worm ─────────────
+    # Verified: Socket.dev "tinycolor-supply-chain-attack-affects-40-packages";
+    # CISA alert 2025/09/23; mechanism corroborated by CISA, Wiz, Unit 42,
+    # Securelist. Malicious postinstall ran TruffleHog to harvest secrets,
+    # checked cloud IMDS endpoints, exfiltrated to a public GitHub repo, then
+    # auto-published to every further package the harvested npm token could
+    # reach — no attacker action required per hop. This is a partial list;
+    # the full ~40-package set is at Socket's original post, pulled directly
+    # rather than guessed at from a truncated retrieval.
+    ("angulartics2", "14.1.2", "worm_propagation",
+     "Socket.dev: tinycolor-supply-chain-attack-affects-40-packages (Sept 2025); CISA alert 2025/09/23",
+     "Republished with Shai-Hulud worm payload after maintainer's npm token was harvested via a prior "
+     "compromised dependency and reused to auto-publish to every package that maintainer could update."),
+    ("@ctrl/tinycolor", "4.1.1", "worm_propagation",
+     "Socket.dev: tinycolor-supply-chain-attack-affects-40-packages (Sept 2025)",
+     "Reportedly the initial/index package in this wave per Socket's original report title; same "
+     "stolen-token auto-publish mechanism."),
+    ("@ctrl/tinycolor", "4.1.2", "worm_propagation",
+     "Socket.dev: tinycolor-supply-chain-attack-affects-40-packages (Sept 2025)",
+     "Second malicious version published within the same window."),
+    ("@ctrl/deluge", "7.2.2", "worm_propagation",
+     "Socket.dev: tinycolor-supply-chain-attack-affects-40-packages (Sept 2025)",
+     "Automated republish via stolen maintainer npm token; part of the same @ctrl/* family cascade."),
+    ("koa2-swagger-ui", "5.11.2", "worm_propagation",
+     "Socket.dev: tinycolor-supply-chain-attack-affects-40-packages (Sept 2025)",
+     "Automated republish via stolen maintainer npm token."),
+    ("json-rules-engine-simplified", "0.2.4", "worm_propagation",
+     "Socket.dev: tinycolor-supply-chain-attack-affects-40-packages (Sept 2025)",
+     "Automated republish via stolen maintainer npm token."),
+
+    # ── qix / chalk-debug compromise (Sept 2025) — account takeover, NOT a
+    # worm: single maintainer phished, attacker manually published these
+    # versions directly. No self-propagation loop was documented. Limited
+    # here to the two headline package/version pairs independently confirmed
+    # across Wiz, nodejs-security.com, Endor Labs, and Checkmarx — a broader
+    # ~18-package list exists but exact versions for most of it were only
+    # single-sourced (nodejs-security.com), so it's deliberately excluded
+    # pending cross-verification against the npm registry / GHSA entries.
+    ("debug", "4.4.2", "account_takeover",
+     "Wiz Threat Center: Qix npm package supply chain compromise; nodejs-security.com advisory (Sept 9 2025)",
+     "Maintainer 'qix' phished via a fake npmjs.help domain requesting a 2FA reset; attacker published "
+     "this version directly using stolen credentials plus a live TOTP code — no self-propagation."),
+    ("chalk", "5.6.1", "account_takeover",
+     "Wiz Threat Center: Qix npm package supply chain compromise; nodejs-security.com advisory (Sept 9 2025)",
+     "Same compromised-account mechanism as debug@4.4.2; fixed in chalk@5.6.2."),
+
+    # ── "Mini Shai-Hulud" / TanStack compromise (May 2026) — CI/CD pipeline
+    # compromise, not a worm and not a stolen-token takeover: a malicious
+    # commit was merged under a fabricated identity impersonating the
+    # Anthropic Claude GitHub App, and publish executed through TanStack's
+    # own legitimate GitHub Actions OIDC trusted-publisher workflow.
+    # Verified via GHSA-g7cv-rxg3-hmpx, CVE-2026-45321 (NVD), and independent
+    # corroboration (Snyk, StepSecurity, SentinelOne, Endor Labs, Tenable).
+    ("@tanstack/react-router", "1.169.5", "ci_pipeline_compromise",
+     "GHSA-g7cv-rxg3-hmpx (github.com/TanStack/router/security/advisories); CVE-2026-45321 (NVD)",
+     "Malicious commit merged under a fabricated identity impersonating the Anthropic Claude GitHub App; "
+     "published via TanStack's own legitimate GitHub Actions OIDC trusted-publisher workflow."),
+    ("@tanstack/react-router", "1.169.8", "ci_pipeline_compromise",
+     "GHSA-g7cv-rxg3-hmpx; CVE-2026-45321",
+     "Second malicious version in the same publish window (fixed in 1.169.9)."),
+    ("@tanstack/router-core", "1.169.5", "ci_pipeline_compromise",
+     "GHSA-g7cv-rxg3-hmpx; SentinelOne CVE-2026-45321 vulnerability entry",
+     "Same CI-workflow-hijack mechanism as react-router; part of the same 42-package/84-version batch."),
+    ("@tanstack/arktype-adapter", "1.166.12", "ci_pipeline_compromise",
+     "GHSA-g7cv-rxg3-hmpx",
+     "Same publish batch; fixed in 1.166.16."),
+    ("@tanstack/history", "1.161.9", "ci_pipeline_compromise",
+     "GHSA-g7cv-rxg3-hmpx",
+     "Same publish batch; fixed in 1.161.13."),
+
+    # ── Axios compromise (March 2026) — account takeover, NOT a worm: lead
+    # maintainer's long-lived npm token stolen via RAT delivered through
+    # targeted social engineering; attacker manually published, bypassing
+    # axios's normal GitHub Actions OIDC trusted-publisher flow entirely.
+    # Verified via axios/axios GitHub Issue #10636 (maintainers' own
+    # postmortem) plus CISA, Microsoft, Sophos, Trend Micro, StepSecurity,
+    # Huntress, SANS, and Arctic Wolf.
+    ("axios", "1.14.1", "account_takeover",
+     "axios/axios GitHub Issue #10636 (official postmortem, March 31 2026); CISA alert 2026/04/20",
+     "Lead maintainer's npm publishing credentials stolen via RAT delivered through targeted social "
+     "engineering; attacker manually published this version, bypassing the project's OIDC trusted-"
+     "publisher flow. Fixed/safe version: axios@1.14.0."),
+    ("axios", "0.30.4", "account_takeover",
+     "axios/axios GitHub Issue #10636; CISA alert 2026/04/20",
+     "Same compromised-account mechanism; legacy 0.x release line, published in the same ~3-hour window "
+     "as 1.14.1. Fixed/safe version: axios@0.30.3."),
+    ("plain-crypto-js", "4.2.1", "account_takeover",
+     "Microsoft Security Blog (Apr 1 2026); StepSecurity technical analysis (Mar 31 2026)",
+     "Injected as a new, never-imported dependency of the malicious axios versions; its postinstall hook "
+     "was the actual RAT dropper for macOS/Windows/Linux, while axios's own source was left unmodified."),
+    ("plain-crypto-js", "4.2.0", "account_takeover",
+     "Huntress blog (Mar 31 2026); Trend Micro (Mar 31 2026)",
+     "Decoy/seed version published ~18 hours before the malicious 4.2.1 release, from a separate "
+     "throwaway npm account, to build clean publishing history and reduce automated-scanner suspicion."),
 ]
 
 

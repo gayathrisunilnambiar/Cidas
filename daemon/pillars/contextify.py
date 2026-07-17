@@ -25,7 +25,7 @@ from pathlib import Path
 from ..models import PillarScore
 from ..utils.embeddings import cosine_similarity, embed_text
 from ..utils.logger import get_logger
-from ..utils.npm_registry import get_package_metadata
+from ..utils.npm_registry import RegistryLookup, get_package_metadata
 
 log = get_logger(__name__)
 
@@ -129,9 +129,9 @@ class Contextify:
     async def fetch_package_description(self, package_name: str) -> str | None:
         """Return the npm registry description for the candidate package."""
         try:
-            meta = await get_package_metadata(package_name)
-            if meta:
-                return meta.get("description") or None
+            result = await get_package_metadata(package_name)
+            if result.status is RegistryLookup.EXISTS and result.data:
+                return result.data.get("description") or None
         except Exception as exc:
             log.debug("description fetch failed for %s: %s", package_name, exc)
         return None

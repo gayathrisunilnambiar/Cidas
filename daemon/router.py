@@ -130,7 +130,7 @@ async def _append_transitive(req: PackageScanRequest, response: ScanResponse) ->
 
     async def _score_one(dep: dict) -> TransitiveDependencyResult | None:
         try:
-            sen = await _sentinel.score(dep["name"], req.ai_suggested)
+            sen = await _sentinel.score(dep["name"], req.ai_suggested, dep.get("version"))
             return TransitiveDependencyResult(
                 name=dep["name"],
                 version=dep["version"],
@@ -206,6 +206,11 @@ async def health() -> dict:
                 "drifted_pillars": report.drifted_pillars,
                 "sufficient_data": report.sufficient_data,
                 "baseline_loaded": report.baseline_loaded,
+                # PSI is reported alongside KL for comparison; it does not
+                # currently drive `status`/`drifted_pillars` (see
+                # utils/drift_monitor.py's check_drift docstring).
+                "overall_psi": round(report.overall_psi, 4),
+                "pillar_psi": report.pillar_psi,
             }
         except Exception as e:  # noqa: BLE001
             drift_data = {"status": "unavailable", "error": str(e)}
@@ -355,8 +360,8 @@ async def scan(req: PackageScanRequest) -> ScanResponse:
     # Run all three pillars concurrently
     ctx_score, sen_score, shi_score = await asyncio.gather(
         _contextify.score(req.package_name, req.project_path),
-        _sentinel.score(req.package_name, req.ai_suggested),
-        _shield.score(req.package_name, None),
+        _sentinel.score(req.package_name, req.ai_suggested, req.version),
+        _shield.score(req.package_name, None, req.version),
     )
 
     settings = get_settings()

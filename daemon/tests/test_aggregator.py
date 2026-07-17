@@ -235,27 +235,44 @@ def test_known_supply_chain_incident_always_blocks(aggregator: Aggregator, setti
 
 def test_stage1_gates_returns_block_threshold_for_package_not_found(settings) -> None:
     sen = _ps(0, flags=["package_not_found"])
-    assert Aggregator._stage1_gates(sen, settings) == float(settings.block_threshold)
+    assert Aggregator._stage1_gates(sen, _ps(0), settings) == float(settings.block_threshold)
 
 
 def test_stage1_gates_returns_block_threshold_for_known_incident(settings) -> None:
     sen = _ps(0, flags=["known_supply_chain_incident"])
-    assert Aggregator._stage1_gates(sen, settings) == float(settings.block_threshold)
+    assert Aggregator._stage1_gates(sen, _ps(0), settings) == float(settings.block_threshold)
+
+
+def test_stage1_gates_returns_block_threshold_for_npm_security_placeholder(settings) -> None:
+    """A resolved version matching npm's '-security.N' placeholder convention
+    (npm's security team pulled and replaced this exact version) must always
+    block, regardless of typosquat/reputation status."""
+    sen = _ps(0, flags=["npm_security_placeholder_version"])
+    assert Aggregator._stage1_gates(sen, _ps(0), settings) == float(settings.block_threshold)
 
 
 def test_stage1_gates_returns_warn_threshold_for_typosquat_only(settings) -> None:
     sen = _ps(0, flags=["typosquat_detected"])
-    assert Aggregator._stage1_gates(sen, settings) == float(settings.warn_threshold)
+    assert Aggregator._stage1_gates(sen, _ps(0), settings) == float(settings.warn_threshold)
 
 
 def test_stage1_gates_prioritizes_block_over_warn_when_both_conditions_present(settings) -> None:
     sen = _ps(0, flags=["package_not_found", "typosquat_detected"])
-    assert Aggregator._stage1_gates(sen, settings) == float(settings.block_threshold)
+    assert Aggregator._stage1_gates(sen, _ps(0), settings) == float(settings.block_threshold)
 
 
 def test_stage1_gates_returns_none_when_no_gate_fires(settings) -> None:
     sen = _ps(50, flags=["zero_downloads"])
-    assert Aggregator._stage1_gates(sen, settings) is None
+    assert Aggregator._stage1_gates(sen, _ps(0), settings) is None
+
+
+def test_stage1_gates_returns_warn_threshold_for_shield_version_unresolved(settings) -> None:
+    """Shield couldn't examine the actual requested version (e.g. npm purged
+    it after a compromise) — meaningful enough to warrant a WARN floor, but
+    not confirmed malicious on its own, so not a BLOCK."""
+    sen = _ps(0)
+    shi = _ps(0, flags=["requested_version_unresolved"])
+    assert Aggregator._stage1_gates(sen, shi, settings) == float(settings.warn_threshold)
 
 
 def test_stage2_score_matches_aggregate_when_no_gate_fires(aggregator: Aggregator, settings) -> None:

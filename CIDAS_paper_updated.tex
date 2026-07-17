@@ -1,0 +1,1234 @@
+\documentclass[journal]{IEEEtran}
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage[hidelinks]{hyperref}
+
+\begin{document}
+
+\title{CIDAS: A Context-Informed Dependency Analysis System for Real-Time npm Supply-Chain Defense}
+
+\author{Gayathri~Sunil~Nambiar,~Nitya~Sharma,~Sanvi~H~S,~Yuva~T,~and~Sriram~Velumuri
+\thanks{G. S. Nambiar is with the Department of Computer Science (Data Science), RV College of Engineering, Bengaluru 560059, Karnataka, India (e-mail: gayathri.sunil@rvce.edu.in).}
+\thanks{N. Sharma and S. Velumuri are with the Department of Artificial Intelligence and Machine Learning, RV College of Engineering, Bengaluru 560059, Karnataka, India (e-mail: \{nitya.sharma, sriram.velumuri\}@rvce.edu.in).}
+\thanks{S. H. S and Y. T are with the Department of Computer Science and Engineering, RV College of Engineering, Bengaluru 560059, Karnataka, India (e-mail: \{sanvi.hs, yuva.t\}@rvce.edu.in).}
+\thanks{Corresponding author: Gayathri Sunil Nambiar (e-mail: gayathri.sunil@rvce.edu.in).}}
+
+\markboth{Nambiar \MakeLowercase{\textit{et al.}}: CIDAS: Context-Informed Dependency Analysis System}{}
+
+\maketitle
+
+\begin{abstract}
+The npm registry---the world's largest open-source package repository---is an attractive target
+for software supply-chain attacks. Malicious actors exploit developer trust through typosquatting, malicious
+post-install scripts, maintainer account takeovers, and an emerging class of threat in which large language
+model coding assistants hallucinate package names that adversaries subsequently register as weaponized
+packages, a phenomenon termed slopsquatting. Existing defenses are predominantly reactive, scanning for
+threats after packages have already been installed and their scripts executed. We present CIDAS (Context-
+Informed Dependency Analysis System), a real-time, pre-install screening framework that intercepts
+every npm install invocation through a transparent cross-platform shim and evaluates each candidate
+dependency through four coordinated analysis pillars: Contextify (semantic project-context fit via sentence-
+transformer embeddings), Sentinel (registry reputation analysis, curated supply-chain incident matching,
+edit-distance and affix-canonicalized typosquat detection corroborated against reputation disparity, and
+live OSV.dev advisory lookup for artificial-intelligence-suggested packages), Shield (static and abstract
+syntax tree-based lifecycle-script and tarball scanning with manifest-gated cross-version capability diffing),
+and a two-stage Aggregator that produces an interpretable 0--100 risk score mapped to ALLOW, WARN, or
+BLOCK verdicts. Supporting subsystems include schema-validated policy-as-code governance, an HMAC-protected
+per-machine trust list, an append-only audit log, a two-tier SQLite cache for daemon-outage resilience, and a
+Kullback--Leibler divergence-based concept-drift monitor operating on genuine per-pillar score history. Evaluated
+against labelled corpora of benign, typosquatted, hallucinated, and malicious packages (179 records,
+including 17 real 2025--2026 supply-chain incidents added to the malicious corpus after the original
+evaluation) with 548 automated tests (449 daemon, 99 extension), CIDAS achieves a pooled (aggregate) F1 of
+0.93 and a category-balanced macro-F1 of 0.92, with sub-50\,ms cache-hit latency and single-digit-second
+cache-miss latency on commodity hardware against live registry conditions,
+without requiring cloud infrastructure or changes to existing developer workflows.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Concept-drift monitoring, developer tooling, LLM package hallucination, npm ecosystem, policy-as-code,
+sentence embeddings, slopsquatting, software supply-chain security, static analysis, typosquatting detection.
+\end{IEEEkeywords}
+
+\section{Introduction}
+\IEEEPARstart{T}{he} Node Package Manager (npm) registry hosts more than two million packages and serves
+billions of downloads per month, making it the largest open-source software distribution channel in the
+world~\cite{zimmermann2019}. Modern JavaScript and Node.js projects routinely depend on hundreds or
+thousands of third-party packages, many pulled in transitively through a single \texttt{npm install}
+command. This dependency breadth accelerates development but also creates an enormous and largely
+unmonitored attack surface.
+
+Four distinct threat classes have emerged in recent years. Supply-chain compromise occurs when an
+attacker injects malicious code into a previously trusted package by compromising a maintainer's account or
+pushing a weaponized version update~\cite{ohm2020,latendresse2022}. The 2018 \texttt{flatmap-stream} and
+2022 \texttt{node-ipc} ``peacenotwar'' incidents illustrate how a single event can affect millions of
+downstream consumers simultaneously. Typosquatting exploits the difficulty humans have in detecting small
+misspellings---\texttt{lodahs} for \texttt{lodash}---by registering plausible variants of popular package
+names and embedding malicious post-install scripts~\cite{vu2020}. Malicious install scripts abuse npm's
+lifecycle hooks (\texttt{preinstall}/\texttt{postinstall}) to execute arbitrary code with developer-level
+privileges at the moment of installation, before any application code is ever run~\cite{duan2021}. Package
+hallucination (also called slopsquatting) is an emergent threat enabled by large language model (LLM) coding
+assistants: when a model confidently suggests a package name that does not exist on the registry, an
+attacker can register that exact name with malicious content before the developer
+investigates~\cite{spracklen2025}.
+
+Current defenses are structurally reactive. Continuous integration scanners and tools such as
+\texttt{npm audit} check installed packages against vulnerability databases~\cite{zapata2018}, but by the
+time a pipeline runs, a package has typically been installed locally and its scripts executed. Registry-side
+malware scanning catches some malicious packages before wide adoption, yet even registry operators report
+that false-positive rates for automated tools remain prohibitively high~\cite{vu2023}. Commercial tools such
+as Socket.dev provide some pre-install signal but require cloud round-trips, introduce privacy concerns, and
+none of them systematically addresses the LLM hallucination threat.
+
+This paper makes the following contributions.
+
+\begin{enumerate}
+\item CIDAS, an open-source, locally-run, real-time package screening system that intercepts
+\texttt{npm install} before any files are downloaded or scripts executed, operating with fail-open
+semantics that guarantee developer workflow continuity.
+
+\item A four-pillar detection architecture combining semantic project-context fit (Contextify), reputation
+and typosquat analysis (Sentinel), static and AST-based script scanning with cross-version diffing (Shield),
+and a two-stage, weighted, explainable Aggregator---the first system, to our knowledge, to unify all four
+npm threat classes in a single pre-install gatekeeper.
+
+\item A policy-as-code governance layer enabling teams to version-control dependency security rules
+alongside their codebase, with schema validation that rejects misconfigured policies rather than silently
+misapplying them.
+
+\item A concept-drift monitor that continuously compares live \emph{per-pillar} score distributions against a
+stored baseline using KL divergence, providing ongoing assurance that the scoring system remains well
+calibrated without manual re-tuning.
+
+\item Two detection-quality refinements identified and validated through a live evaluation against a real
+labelled corpus rather than synthetic benchmarking alone: reputation-corroborated, affix-aware typosquat
+detection, and manifest-first gating of the expensive cross-version tarball diff.
+
+\item A comprehensive empirical evaluation across 548 automated tests, a component-wise ablation study, and
+labelled corpora covering all four threat categories, demonstrating correct classification and
+network-condition-dependent scan latency on commodity hardware.
+\end{enumerate}
+
+The remainder of the paper is organized as follows. Section~II surveys related work. Section~III defines the
+threat model. Section~IV presents the system architecture. Section~V details each analysis pillar. Section~VI
+describes supporting subsystems. Section~VII covers implementation. Section~VIII reports experimental
+results. Section~IX discusses findings and limitations. Section~X concludes.
+
+\section{Related Work}
+
+\subsection{Supply-Chain Attacks and Package-Manager Security}
+Cappos et al.~\cite{cappos2008} established the foundational security threat model for package managers,
+demonstrating that man-in-the-middle and malicious-mirror attacks could compromise client machines at scale
+across ten major package managers. Zimmermann et al.~\cite{zimmermann2019} conducted a landmark large-scale
+analysis of npm's dependency graph, finding that fewer than 20 maintainers hold transitive influence over
+more than half of all npm packages, creating concentrated systemic risk. Ohm et al.~\cite{ohm2020} developed
+a comprehensive taxonomy of real-world open-source supply-chain attacks covering typosquatting, dependency
+confusion, and maintainer account takeover. Latendresse et al.~\cite{latendresse2022} further characterized
+maintainer account compromise as a distinct, empirically common attack vector. Duan et al.~\cite{duan2021}
+empirically studied malicious package campaigns across npm, PyPI, and RubyGems, establishing that
+install-time script abuse is the dominant execution vector, directly motivating the Shield pillar of CIDAS.
+
+\subsection{Typosquatting and Name-Based Deception}
+Vu et al.~\cite{vu2020} defined edit-distance heuristics for detecting typosquatted names in the Python
+ecosystem, demonstrating the effectiveness of Levenshtein distance for surface-level name deception. CIDAS
+originally adopted this approach directly in the Sentinel pillar; a live evaluation against a labelled corpus
+(Section~VIII) subsequently showed that raw edit distance alone structurally misses affix-based squats and
+false-positives on short, unrelated legitimate names, motivating the affix-canonicalization and
+reputation-corroboration refinements described in Section~V-B.
+
+\subsection{Vulnerability Propagation and Reputation Signals}
+Zapata et al.~\cite{zapata2018} studied vulnerable dependency migration patterns in npm. Zahan et
+al.~\cite{zahan2022} identified package-level risk indicators---download volume, maintainer count, package
+age, and repository link presence---that predict supply-chain risk; these signals inform the core of CIDAS's
+Sentinel reputation sub-pillar. Vu et al.~\cite{vu2021} surveyed detection feasibility across multiple attack
+classes, motivating CIDAS's multi-signal aggregation strategy.
+
+\subsection{Static Analysis and Automated Detection}
+Sejfia and Sch\"{a}fer~\cite{sejfia2022} proposed Amalfi, a machine-learning system combining metadata-based,
+behavioral, and static-analysis classifiers to detect malicious npm packages in seconds without execution,
+closely mirroring the CIDAS Sentinel and Shield design. Ferreira et al.~\cite{ferreira2021} showed that a
+lightweight per-package permission system can sandbox most npm packages at near-zero cost, informing a
+future-work direction for CIDAS. Froh et al.~\cite{froh2023} explored differential static analysis for
+detecting malicious updates; CIDAS's cross-version diff analyzer operationalizes this idea within the Shield
+pillar, and Section~V-C describes a manifest-first gate added to make the differential check practical at
+scale.
+
+\subsection{LLM-Induced Threats}
+Spracklen et al.~\cite{spracklen2025} documented the package-hallucination phenomenon at scale across
+multiple LLMs, coining the term slopsquatting and quantifying the rate at which model-suggested package
+names do not exist on the registry. This work is the direct motivation for CIDAS's AI-suggestion flag and its
+live OSV.dev advisory check for unrecognized package names. Greshake et al.~\cite{greshake2023} described
+prompt-injection patterns in LLM-integrated applications, informing CIDAS's static scanning of package
+README files and install scripts.
+
+\subsection{Semantic Analysis and Embeddings}
+Reimers and Gurevych~\cite{reimers2019} introduced Sentence-BERT, the backbone of CIDAS's Contextify pillar
+for project-context analysis. Feng et al.~\cite{feng2020} proposed CodeBERT as a foundational model for joint
+code and natural-language understanding, providing relevant background for the optional LLM second-pass
+verifier.
+
+\subsection{Registry-Side Scanning}
+Vu et al.~\cite{vu2023} studied operational malware scanning at PyPI, finding that even a 1-in-10,000
+false-positive rate is prohibitively expensive for registry operators and that current automated tools exceed
+this rate substantially. This empirical grounding motivates CIDAS's fail-open design, per-machine trust
+lists, and emphasis on minimizing false positives. Froh et al.~\cite{froh2023} and Ladisa et
+al.~\cite{ladisa2023} further systematized supply-chain attack classes and practical defensive
+considerations.
+
+\subsection{Differentiation}
+CIDAS is, to our knowledge, the first system to (a) address all four threat classes in a single pre-install
+gatekeeper, (b) integrate semantic project-context awareness as a first-class detection signal, (c) support
+schema-validated policy-as-code governance, and (d) deploy a KL-divergence-based concept-drift monitor
+operating on genuine per-pillar score history for continuous calibration assurance.
+
+\emph{A note on scope.} CIDAS's Sentinel pillar targets name-based typosquatting and does not currently
+address \emph{dependency confusion}---the distinct attack class in which a public package is registered
+under a name matching a private, internal package, exploiting resolver precedence rather than name
+similarity~\cite{birsan2021}. We flag this explicitly as an out-of-scope threat class in Section~IX-E rather
+than implying coverage.
+
+\section{Threat Model}
+We consider an adversary whose goal is to execute arbitrary code on a developer's workstation or within a
+CI/CD pipeline by inducing the installation of a malicious npm package. The attacker can control package
+names, content, and registry metadata for packages they publish, but is assumed to lack control over npm's
+core infrastructure, the developer's operating system, or the CIDAS daemon binary itself. We consider four
+attack classes:
+
+\textbf{A1. Typosquatting.} The attacker registers a package name visually or lexically similar to a popular
+package and embeds malicious lifecycle scripts.
+
+\textbf{A2. Malicious Install Scripts.} The attacker publishes a package containing hooks that exfiltrate
+environment variables, download secondary payloads, or establish persistence.
+
+\textbf{A3. Supply-Chain Compromise.} The attacker hijacks a legitimate maintainer account and pushes a
+malicious version update to an otherwise trusted package.
+
+\textbf{A4. LLM Package Hallucination.} An LLM coding assistant suggests a non-existent package name; the
+attacker registers that name with malicious content before the developer investigates.
+
+Out of scope: kernel-level rootkits, compromised npm infrastructure, post-install defenses,
+dependency-confusion attacks against private package namespaces (see Section~II-H), and social-engineering
+attacks not involving npm.
+
+\section{System Architecture}
+
+\subsection{Design Principles}
+CIDAS is designed around five principles:
+
+\textbf{P1. Pre-execution interception.} All analysis must complete before any package file is downloaded or
+any script is executed.
+
+\textbf{P2. Fail-open semantics.} A daemon outage must degrade to a logged warning, not a blocked workflow.
+
+\textbf{P3. Explainability.} Every verdict must carry the specific signals that produced it so that
+developers can make informed override decisions.
+
+\textbf{P4. Privacy preservation.} Package contents and project metadata must never leave the developer's
+machine.
+
+\textbf{P5. Low friction.} Per-package scan latency must remain low on commodity hardware to ensure continued
+adoption; Section~VIII-D discusses how this target is met on the cache-hit path and the network-bound reality
+of the cache-miss path.
+
+\subsection{High-Level Architecture}
+Three developer-facing entry points---the npm shim, the VS Code extension, and a REST API---all communicate
+with a single locally-run FastAPI daemon listening on port 7355. Inside the daemon, four coordinated pillars
+(Contextify, Sentinel, Shield, Aggregator) execute concurrently and feed a unified verdict pipeline that also
+consults the policy engine, trust list, scan cache, and offline-allow cache before returning a result to the
+caller. Every decision is written to an append-only audit log monitored by the concept-drift subsystem.
+
+\subsection{Request Priority Chain}
+Every incoming scan request passes through the following priority chain before any pillar analysis is
+invoked, short-circuiting as soon as a determination is possible: (1) policy block-list check
+$\rightarrow$ forced block; (2) policy trust-list check $\rightarrow$ forced allow; (3) HMAC-verified local
+trust-database lookup $\rightarrow$ allow if untampered; (4) one-hour SQLite scan cache $\rightarrow$ return
+cached verdict; (5) proceed to concurrent pillar analysis. This design ensures that repeated scans of
+unchanged, already-vetted dependencies impose negligible latency.
+
+\subsection{npm Shim}
+The npm shim is a thin cross-platform Node.js wrapper placed ahead of the real npm binary on the system
+PATH. On every \texttt{npm install} invocation it (a) performs a SHA-256 self-integrity check to detect
+tampering, (b) diffs the project's \texttt{package.json} to identify newly requested packages, (c) forwards
+each new package name, resolved version, and working directory to the daemon via an authenticated REST call
+to \texttt{/api/v1/scan}, (d) interprets the returned verdict, and (e) either passes through to the real npm
+binary (ALLOW), prints a cautionary message and optionally prompts for confirmation (WARN), or blocks the
+install with a human-readable explanation (BLOCK).
+
+If the daemon is unreachable the shim first checks a 24-hour offline-allow cache of previously issued ALLOW
+verdicts. For genuinely new packages with an unreachable daemon, installation proceeds with a clear bypass
+notification written to the audit log (fail-open).
+
+\subsection{VS Code Extension}
+A \texttt{package.json} watcher diffs the file on every save and triggers asynchronous scans of newly added
+entries. A terminal listener (\texttt{sentinelHook}) detects \texttt{npm install} commands typed into the
+integrated terminal and flags the session as AI-suggested when applicable. A color-coded status bar polls
+daemon health every 30 seconds and surfaces WARN/BLOCK dialogs with a Show Details primary action that opens
+a webview panel displaying the full per-pillar score breakdown and the resolved policy file path.
+
+\section{Analysis Pillars}
+
+\subsection{Contextify: Project-Context Fit}
+Contextify assesses whether a candidate package is semantically appropriate for the target project. A
+package such as a cryptocurrency miner may carry no reputation flags and no malicious scripts, yet is
+clearly anomalous in a React web-application context. Detecting such mismatch requires understanding the
+project's existing dependency profile.
+
+\subsubsection{Project Fingerprinting}
+CIDAS builds a project fingerprint by scanning up to 150 JavaScript and TypeScript source files in the
+target directory, extracting \texttt{require} and \texttt{import} statements, retrieving the npm registry
+description of each discovered dependency, and concatenating those descriptions into a single text corpus.
+This corpus is encoded into a dense vector using the all-MiniLM-L6-v2 Sentence-Transformer
+model~\cite{reimers2019} (90\,MB, downloaded once, cached locally, CPU-only inference).
+
+\subsubsection{Similarity Scoring}
+The candidate package's description is independently encoded and compared against the project fingerprint
+vector via cosine similarity. \texttt{compute\_score} maps this similarity to a bounded 0--25 risk
+contribution: 0 when similarity $\geq 0.65$; 10 (\texttt{loosely\_related}) when similarity $\geq 0.35$; 25
+(\texttt{unfamiliar\_in\_mature\_project}) when the project has more than 10 tracked dependencies and
+similarity remains low; 15 (\texttt{unfamiliar\_package}) otherwise. Because a 0--25 contribution at weight
+0.30 can reach at most 7.5 points---far below the 40-point WARN threshold---the Aggregator applies a
+separate, weight-independent floor described in Section~V-D.
+
+\subsection{Sentinel: Reputation and Name Analysis}
+
+\subsubsection{Known-Incident Blocklist}
+Sentinel maintains a curated list of packages with documented, severe supply-chain incidents (e.g.,
+\texttt{flatmap-stream}, \texttt{event-stream}, \texttt{ua-parser-js}, \texttt{node-ipc}, \texttt{coa},
+\texttt{rc}, \texttt{eslint-scope}). Any match forces an immediate score of 95 and the
+\texttt{known\_supply\_chain\_incident} flag, which the Aggregator's Stage~1 gate (Section~V-D) escalates to
+a forced BLOCK regardless of the weighted score.
+
+\subsubsection{Registry Reputation}
+For packages not on the blocklist, Sentinel evaluates registry signals: monthly download count (via the npm
+downloads-point API), days since first publication, and repository-link presence, following the
+risk-indicator framing of Zahan et al.~\cite{zahan2022}. \texttt{check\_registry\_existence} additionally
+collects a per-package maintainer count into scan metadata; this signal is presently \emph{recorded but not
+yet incorporated into the risk score}, and is flagged as a validated-threshold-pending refinement in
+Section~IX-F.
+
+\subsubsection{Typosquat Detection}
+Sentinel applies case-normalized Levenshtein distance between the candidate name and each of approximately
+53 curated high-popularity npm packages (a placeholder pending a full top-500 list). A candidate within edit
+distance 2 is a \emph{raw-distance hit}. A live evaluation against a labelled corpus (Section~VIII) found
+this check structurally insufficient in two directions: it cannot catch \emph{affix squats}
+(\texttt{node-react} is edit distance 5 from \texttt{react}, past any workable threshold), and it
+false-positives between short, unrelated, legitimate packages that happen to collide within distance~2
+purely by coincidence (\texttt{vue} vs.\ \texttt{vite}, distance 2; \texttt{next} vs.\ \texttt{nuxt},
+distance 1). A single global edit-distance threshold cannot resolve both failure modes simultaneously, since
+tightening it worsens the first and loosening it worsens the second. CIDAS addresses this with two
+complementary, decoupled refinements rather than a threshold change:
+
+\begin{itemize}
+\item \textbf{Affix canonicalization.} A candidate name is stripped of one leading squat prefix
+(\texttt{node-}, \texttt{js-}) and one trailing squat suffix (\texttt{-js}, \texttt{-util(s)},
+\texttt{-helper}, \texttt{-async}, \texttt{-core}, \texttt{-lib}) and compared for an \emph{exact} match
+against the curated list, surfacing as \texttt{typosquat\_affix\_match}. This is a structurally distinct
+signal from raw edit distance, not a threshold variant of it, and independently catches names like
+\texttt{node-react} that raw distance never can.
+\item \textbf{Reputation corroboration.} Neither a raw-distance nor an affix hit alone forces the maximum
+score. Sentinel additionally fetches the \emph{matched target's} own download count and publication age
+(reusing the same short-TTL, single-flight registry cache used elsewhere in the daemon, at no additional
+network round-trip cost when the target was already fetched by a concurrent pillar) and confirms a
+disparity---candidate downloads under 5\% of the target's, or a candidate younger than 30 days against a
+target older than 365---before escalating to a forced score of 100 and the \texttt{typosquat\_detected}
+flag. This directly suppresses the \texttt{vue}/\texttt{vite} and \texttt{next}/\texttt{nuxt} class of false
+positive, since both sides of those pairs are comparably large and long-established. If the target lookup
+itself fails (network error, confirmed absence), corroboration \emph{fails toward flagging}---returning
+confirmed---so a corroboration-check outage never silently suppresses the pre-existing detection.
+\end{itemize}
+
+Both refinements are governed by independent per-machine admin-config flags
+(\texttt{typosquat\_affix\_canonicalization}, \texttt{typosquat\_reputation\_corroboration}; both default
+\texttt{true}), allowing either to be disabled instantly in the field without a code change if it misbehaves.
+A candidate matching a typosquat pattern (raw or affix) that does not yet exist on the registry receives the
+same maximum score (100) as an existing typosquat once corroborated---pre-registration does not reduce
+severity, since an unregistered typosquat name is itself a strong signal of staged attacker intent, and both
+signals are already at the scoring ceiling.
+
+\subsubsection{AI Hallucination Detection}
+When the shim or extension flags a package as \texttt{ai\_suggested} via the \texttt{sentinelHook}, Sentinel
+applies stricter scrutiny: (i) a package absent from the registry sets \texttt{package\_not\_found} and
+forces an automatic block; (ii) packages published under 7 days ago receive an escalated reputation
+sub-score (\texttt{very\_new\_package}, +35) and those under 30 days a moderate one
+(\texttt{new\_package}, +15); and (iii) a live query to the public OSV.dev vulnerability API checks for
+known advisories or confirmed malware entries.
+
+\subsection{Shield: Static and AST-Based Analysis}
+Shield downloads the package tarball and analyzes its contents without executing any code.
+
+\subsubsection{Lifecycle Script Pattern Scanning}
+Shield extracts all lifecycle hooks from \texttt{package.json} and applies regex-based pattern matchers
+covering seven categories: (i) environment-variable exfiltration via \texttt{process.env} combined with
+outbound network calls, (ii) generic outbound network calls in an install script (\texttt{curl},
+\texttt{wget}, \texttt{fetch}), (iii) Base64-encoded eval payloads (\texttt{Buffer.from}, \texttt{atob}),
+(iv) child-process spawning to download or execute secondary payloads, (v) cryptocurrency-miner signature
+strings, and (vi)--(vii) two classes of obfuscation (contiguous hex-escape runs and long numeric-array
+literals).
+
+\subsubsection{AST-Based Analysis}
+For source files flagged as high-risk by regex pre-filtering, Shield parses JavaScript into an abstract
+syntax tree (AST) using tree-sitter and performs structural analysis. AST-based analysis is more robust than
+regex against obfuscation techniques that split keywords across concatenated string literals or use computed
+property access.
+
+\subsubsection{Cross-Version Diff Analysis}
+For packages with a previously scanned and trusted version, Shield performs a capability diff: it compares
+the new version's set of npm module imports, \texttt{process.env} accesses, and outbound network call
+targets---all extracted via AST---against the immediately-preceding published version. New capabilities
+trigger a \texttt{new\_network\_calls}/\texttt{new\_imports} signal and raise the Shield sub-score, enabling
+detection of compromised maintainer accounts that push malicious updates to legitimate
+packages~\cite{froh2023}.
+
+This diff requires downloading and extracting \emph{two} full tarballs (current and immediately-preceding
+version), which a live evaluation (Section~VIII-D) identified as the dominant contributor to per-scan
+latency. CIDAS mitigates this with a \textbf{manifest-first gate}: since every published version's
+\texttt{scripts} and \texttt{dependencies} fields are already present in the registry document already
+fetched for other purposes, Shield compares them between the current and preceding version \emph{before}
+downloading the preceding version's tarball. When both fields are byte-identical, the tarball diff is skipped
+entirely---there is no declared lifecycle-script or dependency change for it to explain---while the primary,
+single-tarball regex/AST scan of the current version still runs unconditionally, so absolute malicious
+patterns in file content are still caught regardless of gating. The gate's accepted residual risk is narrow:
+a compromised update that adds a new capability purely through code (e.g., a Node built-in
+\texttt{require('dns')} call) without touching the manifest would not trigger the differential
+\texttt{new\_network\_calls} escalation, though it remains subject to the unconditional absolute-pattern
+scan. The gate is governed by \texttt{shield\_manifest\_gating} (default \texttt{true}) and was validated to
+not regress recall on the corpus's account-takeover and protestware categories (Section~VIII-D).
+
+\emph{Predecessor resolution past a purged version.} ``Immediately-preceding published version'' above is
+resolved by \texttt{get\_previous\_version}, which now reasons about a package's full publish-time ordering
+rather than requiring an exact match against the current version within an already-resolvability-filtered
+list. This distinction matters specifically when npm's security team has purged a version's listing after a
+confirmed compromise: the purged version's own timestamp is typically still present in the registry's publish
+history even though its manifest is gone, so its position in that ordering can still be located, and the
+predecessor search then walks backward from that position, skipping over any further purged versions, to the
+nearest version whose manifest is still resolvable. This walk is bounded to 20 versions back, a scope decision
+recorded explicitly here and in code: npm's takedown process typically purges only the one or two malicious
+releases themselves, but an unbounded walk could in principle diff against a version many releases older than
+intended if a very long run were purged. Section~\ref{sec:new-incidents} reports the empirical motivation and
+validation of this change.
+
+\emph{Tri-state version resolution.} Independently, \texttt{Shield.score()} no longer silently substitutes
+\texttt{dist-tags.latest} when the exact requested version cannot be resolved in the registry's version map.
+It instead returns an explicit \texttt{requested\_version\_unresolved} state---score 0, confidence 0, no
+tarball scanned---which the Aggregator's Stage~1 gates (Section~V-D) treat as a floor at
+\texttt{warn\_threshold} rather than a clean result. This mirrors the tri-state (exists / confirmed-absent /
+undetermined) discipline already applied to Sentinel's registry-existence check: a scanner that cannot
+examine the specific artifact it was asked to examine must say so explicitly, rather than examining something
+else (here, the current clean release) and returning a verdict as though the requested version had actually
+been scanned. Section~\ref{sec:new-incidents} documents the concrete case this closes.
+
+\subsection{Aggregator: Two-Stage Weighted Score and Verdict}
+The Aggregator combines the three pillar sub-scores into a composite risk score $r$ via a two-stage
+structure: a deterministic Stage~1 gate supplies an optional score floor, and a weighted Stage~2 score is
+always computed; the two are combined via $\max(\cdot,\cdot)$. This is organized explicitly as two named
+stages---rather than a single sequential pass, as in an earlier revision of this system---because an
+ablation study (Section~VIII-E) showed that Stage~1's flag-driven conditions already determine the verdict
+for the large majority of a real labelled corpus, independent of pillar weighting; separating the stages
+gives future signals (e.g., a learned classifier, homoglyph detection) a clean place to extend Stage~2
+without diluting into a sum that Stage~1 already dominates for most records.
+
+\textbf{Stage 2 (weighted score).}
+\begin{equation}
+s_2 = w_C s_C + w_S s_S + w_{Sh} s_{Sh}
+\label{eq:stage2}
+\end{equation}
+where $w_C = 0.30$ (Contextify), $w_S = 0.35$ (Sentinel), and $w_{Sh} = 0.35$ (Shield). All sub-scores and
+$s_2$ lie in $[0,100]$ with higher values indicating greater risk. Two additive modifiers apply on top of
+Eq.~\eqref{eq:stage2}:
+
+\begin{itemize}
+\item \textbf{Contextify floor.} If the raw embedding cosine similarity between the candidate and the
+project fingerprint falls below 0.05, a flat +20 penalty is applied and \texttt{alien\_to\_project} is
+tagged---closing the gap for packages essentially unrelated to anything the project imports, which
+Contextify's own bounded 0--25 contribution (Section~V-A) cannot reach on its own.
+\item \textbf{Covert-dropper amplification.} Co-occurrence of a Shield \texttt{base64\_decode} flag and a
+Contextify \texttt{unfamiliar\_in\_mature\_project} flag raises the score by 15 points (capped at 100),
+tagging \texttt{covert\_dropper\_signals}---penalizing the pattern characteristic of covert droppers injected
+into unfamiliar dependencies.
+\end{itemize}
+
+\textbf{Stage 1 (deterministic gates).} Five flag-driven conditions, evaluated independently of pillar
+weight, each supply a score floor that Stage~2's result cannot fall below:
+
+\begin{itemize}
+\item \texttt{package\_not\_found} $\rightarrow$ floor at \texttt{block\_threshold} (80): a nonexistent
+package is either hallucinated or malicious.
+\item \texttt{known\_supply\_chain\_incident} $\rightarrow$ floor at \texttt{block\_threshold} (80).
+\item \texttt{npm\_security\_placeholder\_version} $\rightarrow$ floor at \texttt{block\_threshold} (80): the
+resolved version matches npm's \texttt{-security.N} placeholder convention, meaning npm's security team has
+pulled this exact release as malicious or reserved and republished an inert stub in its place
+(Section~\ref{sec:new-incidents}).
+\item \texttt{typosquat\_detected} $\rightarrow$ floor at \texttt{warn\_threshold} (40): Sentinel's weight
+alone caps its contribution at 35 points, below WARN, so a corroborated typosquat with an otherwise-quiet
+Contextify/Shield signal must not silently ALLOW. WARN rather than BLOCK is used here specifically because
+name-similarity, even corroborated, can still legitimately false-positive on a genuinely unrelated package;
+BLOCK is reserved for the confirmed-malicious conditions above.
+\item \texttt{requested\_version\_unresolved} $\rightarrow$ floor at \texttt{warn\_threshold} (40): Shield
+could not resolve the specific requested version in the registry (Section~V-C) and therefore examined
+nothing. This is not itself confirmed-malicious---unlike a known incident or a security placeholder---but
+"the exact pinned version cannot be examined at all" is meaningful enough to warrant caution rather than a
+silent pass-through on whatever Contextify and Sentinel alone conclude.
+\end{itemize}
+
+The composite score maps to verdicts as: $r \in [0,39] \Rightarrow$ ALLOW; $r \in [40,79] \Rightarrow$ WARN;
+$r \in [80,100] \Rightarrow$ BLOCK.
+
+\section{Supporting Subsystems}
+
+\subsection{Policy-as-Code Engine}
+Organizations express dependency governance rules in a \texttt{.cidas/policy.json} file co-located with
+their repository. The schema (a Pydantic model, \texttt{version: 1}, \texttt{extra="forbid"}) supports:
+\texttt{block\_list} (always BLOCK), \texttt{trust\_list} (bypass pillar analysis),
+\texttt{min\_monthly\_downloads}, \texttt{require\_repository\_link}, \texttt{max\_sentinel\_distance} (a
+per-project override of the default Levenshtein typosquat threshold), \texttt{contextify\_weight} (a
+per-project override of the Contextify pillar weight, 0.0--0.5, with the remainder re-split between Sentinel
+and Shield in their existing ratio), and \texttt{warn\_requires\_confirmation} (force interactive
+confirmation for WARN verdicts). The policy file is validated against this schema, which rejects
+unrecognized fields with a hard error rather than silently ignoring them, preventing governance bugs caused
+by typos.
+
+\subsection{HMAC-Protected Trust List}
+Trust-list entries are stored in SQLite with HMAC-SHA256 integrity tags derived from a locally generated
+machine secret. On every lookup the stored tag is re-verified; a mismatch triggers a CRITICAL audit-log event
+and falls through to a full pillar scan.
+
+\subsection{Two-Tier Cache}
+(1) A one-hour scan cache stores complete verdicts and pillar sub-scores keyed by (name, version) pairs,
+bounding staleness for rapidly evolving threat intelligence. (2) A 24-hour offline-allow cache stores ALLOW
+verdicts issued while the daemon was reachable, enabling previously approved packages to install without
+interruption during daemon outages. An explicit \texttt{/api/v1/cache/invalidate} endpoint forces re-analysis
+of a specific package on the next request; a separate \texttt{DELETE /api/v1/cache} endpoint purges expired
+entries.
+
+Beneath the scan-level cache, a shorter-lived (10-second), single-flight cache deduplicates the underlying
+npm registry document fetch itself: a single scan of an existing package independently needs the same
+package's full registry document from up to five call sites across the daemon (Contextify's description
+lookup, Sentinel's existence/reputation check, Shield's tarball resolution, the disk-footprint estimator, and
+the diff analyzer's version-history lookup). Without deduplication this produced measurably redundant,
+concurrent requests to the same registry endpoint within a single scan (Section~VIII-D); the single-flight
+cache collapses concurrent and near-concurrent requests for the same package name into one underlying fetch,
+and does not cache a failed fetch, so a transient registry outage cannot poison the result for other callers
+within the TTL window.
+
+\subsection{Append-Only Audit Log}
+Every scan decision---verdict, per-pillar scores, active flags, policy file path, user overrides, and bypass
+events---is appended as a newline-delimited JSON (JSONL) record to a rotating log file (10\,MB per file,
+three-file rotation, four files total including the active log). Each record now persists the individual
+Contextify, Sentinel, and Shield scores alongside the composite verdict, which is what makes genuine
+per-pillar concept-drift monitoring possible (Section~VI-E). The log is queryable via a CLI and a REST
+endpoint supporting filters on verdict, package name, and time range.
+
+\subsection{Concept-Drift Monitor}
+On each health-check poll the monitor: (1) reads the most recent 100 audit-log records, each of which now
+carries all three per-pillar scores; (2) computes 10-bin per-pillar score histograms; (3) computes KL
+divergence $D_{KL}(P\|Q)$ between the live histogram $P$ and a stored baseline histogram $Q$ for each pillar;
+(4) returns \texttt{drift: "warn"} if the pillar-averaged divergence exceeds 0.15, or \texttt{drift: "alert"}
+if it exceeds 0.30.
+
+Because no production deployment history yet exists to build a baseline from, the baseline is instead seeded
+synthetically: an offline build step assigns each record in the labelled evaluation corpus a per-pillar score
+sampled from an empirically-informed range keyed to its ground-truth label (e.g., malicious packages sampled
+high on Sentinel and Shield; benign packages sampled low across all three), and builds the baseline histogram
+from that synthetic distribution rather than from real traffic. This is an explicit, documented placeholder:
+Section~IX-F recommends replacing it with a baseline built from real deployment history once one accumulates.
+With the per-pillar score persistence described above now in place, a live health check against real scan
+traffic correctly reports \texttt{status: "alert"} with a non-trivial KL divergence against this synthetic
+baseline (Section~VIII-F)---confirming the mechanism is now genuinely operative, whereas in an earlier
+revision of the audit-log schema (which persisted only the composite score) per-pillar drift detection was
+structurally impossible and the monitor always reported \texttt{insufficient\_data} against real traffic.
+
+\section{Implementation}
+
+\subsection{Technology Stack}
+Table~\ref{tab:stack} summarizes the primary technologies used in each CIDAS component.
+
+\begin{table}[t]
+\caption{CIDAS Technology Stack}
+\label{tab:stack}
+\centering
+\begin{tabular}{@{}p{0.22\linewidth}p{0.68\linewidth}@{}}
+\toprule
+\textbf{Component} & \textbf{Key Technologies} \\
+\midrule
+Daemon & Python 3.10+, FastAPI, Pydantic v2, SQLite, all-MiniLM-L6-v2 (HuggingFace sentence-transformers), tree-sitter, httpx \\
+VS Code Ext. & TypeScript 5, VS Code Extension API (v1.89+), vitest \\
+npm Shim & Node.js 18+, cross-platform bash / PowerShell 5.1+ \\
+Testing & pytest / pytest-cov (daemon), vitest (extension) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Daemon and REST API}
+The daemon exposes nine endpoints under \texttt{/api/v1/} (Table~\ref{tab:api}, Appendix~A). Pillar functions
+are dispatched concurrently via \texttt{asyncio.gather}, maximizing throughput within the latency budget.
+
+\subsection{Cross-Platform Shim}
+The shim (\texttt{npm-shim.js}) supports macOS, Linux, WSL~2, and native Windows. Platform-specific
+installation scripts discover the real npm binary, rename it, install the shim in its place, and compute the
+SHA-256 reference hash used for self-verification.
+
+\subsection{Optional LLM Second-Pass Verifier}
+For ambiguous README or install-script text, CIDAS optionally invokes a locally running Ollama-hosted LLM
+(default \texttt{phi3:mini}). The LLM score is blended at $0.60 \times \text{LLM} + 0.40 \times \text{regex}$.
+The regex pass is high-precision but low-recall---it reliably catches canonical phrasings such as ``ignore
+previous instructions'' but misses paraphrases---while the LLM exhibits the opposite profile. Weighting the
+LLM higher recovers the recall the regex pass misses, while the regex's 40\% floor still anchors the blended
+score against a purely hallucinated LLM judgment. All inference is local; no package content leaves the
+developer's machine.
+
+\section{Evaluation}
+
+\subsection{Experimental Setup}
+All experiments were conducted on a commodity developer workstation without a GPU, against the daemon
+running locally and a live connection to the public npm registry and the npm downloads API---not a mocked
+or air-gapped environment. The all-MiniLM-L6-v2 model was loaded on first run and cached locally. The
+548-test suite (449 daemon, pytest; 99 extension, vitest) was executed as part of continuous verification
+alongside the corpus evaluation below. Because latency in this configuration is dominated by live
+npm-registry and tarball-download round-trips rather than daemon compute, absolute latency numbers depend on
+registry responsiveness and network contention at scan time and should be read as characteristic ranges, not
+fixed guarantees.
+
+\subsection{Labelled Evaluation Corpus}
+We constructed four disjoint corpora, generated and version-controlled by a corpus-build script
+(\emph{N} = 179 total): (1) \textbf{Benign} (50 packages): top-500 npm packages by download count; (2)
+\textbf{Typosquat} (50 packages): synthetic mutations (deletion, insertion, qwerty-adjacent substitution,
+homoglyph, prefix, suffix) of ten high-popularity target packages, each record carrying an
+\texttt{npm\_registered} flag recording whether the generated squat is actually published; (3)
+\textbf{Hallucinated} (23 packages): synthetically generated using suffix templates commonly produced by LLM
+code assistants (\texttt{<lib>-helper}, \texttt{<lib>-async}, \texttt{<lib>-utils}), each verified absent
+from the registry at corpus-build time; (4) \textbf{Malicious} (56 packages): 39 real disclosed npm
+supply-chain incidents from the corpus's original construction (event-stream/flatmap-stream, eslint-scope,
+the Oct--Nov 2021 ua-parser-js/coa/rc cluster, node-ipc/peacenotwar, colors/faker, and the May-2018
+getcookies credential-theft family) plus the known-incident blocklist, extended with \textbf{17 additional
+records} covering real 2025--2026 supply-chain incidents added in a later pass of this evaluation: the
+September 2025 Shai-Hulud stolen-token worm cluster (\texttt{@ctrl/tinycolor}, \texttt{@ctrl/deluge},
+\texttt{angulartics2}, \texttt{koa2-swagger-ui}, \texttt{json-rules-engine-simplified}; 6 records), the
+2026 TanStack CI/OIDC pipeline-compromise chain (\texttt{@tanstack/react-router},
+\texttt{@tanstack/router-core}, \texttt{@tanstack/arktype-adapter}, \texttt{@tanstack/history}; 5 records),
+the September 2025 compromised-maintainer-account incidents affecting \texttt{chalk} and \texttt{debug}, the
+2026 \texttt{axios} maintainer-credential-theft incident (2 versions), and \texttt{plain-crypto-js} (2
+versions, an npm-security-pulled malicious dependency injected via the March 2026 axios compromise). This
+17-record extension is the direct subject of the version-resolution investigation in
+Section~\ref{sec:new-incidents}.
+
+\subsection{Detection Performance}
+Table~\ref{tab:detection} reports, per ground-truth category, the verdict breakdown (ALLOW/WARN/BLOCK counts)
+and the derived recall (or false-positive rate, for the negative-class benign row) and F1, measured with a
+live run of the daemon against the full 179-record corpus. Counts are taken directly from the evaluation
+harness's ground-truth-keyed confusion matrix, so every row's counts sum exactly to that category's N; we
+deliberately avoid the harness's secondary \texttt{attack\_type} breakdown for this table, since several
+attack-type tags (notably \texttt{typosquat} and \texttt{none}) are shared across corpora and would otherwise
+mix records from different ground-truth categories into one number.
+
+\begin{table}[t]
+\caption{Detection Performance on the Labelled Corpus (N = 179)}
+\label{tab:detection}
+\centering
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Category} & \textbf{ALLOW} & \textbf{WARN} & \textbf{BLOCK} & \textbf{R / FPR} & \textbf{F1} \\
+\midrule
+Malicious (N=56)    & 12 & 20  & 24 & 0.79          & 0.88 \\
+Typosquat (N=50)    & 0  & 30 & 20 & 1.00          & 1.00 \\
+Hallucinated (N=23) & 5  & 1  & 17 & 0.78          & 0.88 \\
+Benign (N=50)       & 50 & 0 & 0 & 0.00\textsuperscript{a} & ---\textsuperscript{b} \\
+\midrule
+\textbf{Overall}    & \multicolumn{3}{c}{---} & \textbf{0.87}\textsuperscript{c} & \textbf{0.93}\textsuperscript{d} \\
+\bottomrule
+\end{tabular}
+\\[2pt]
+\raggedright\footnotesize
+\textsuperscript{a}Reported as false-positive rate (WARN+BLOCK $/$ 50), not recall---benign is a
+negative-class-only corpus, so it has no recall to report. All 50 benign records resolved to a verdict in
+this run (zero scan errors).
+\textsuperscript{b}Precision and F1 are undefined for an all-negative corpus (there are no true positives to
+define them against); FPR is the appropriate single-number summary here, consistent with why this row is
+excluded from the macro-F1 computed below.
+\textsuperscript{c}Recall (aggregate F1's recall component) over all 129 actually-positive records
+(malicious + typosquat + hallucinated) combined.
+\textsuperscript{d}\emph{Aggregate F1}: a single pooled, micro-averaged F1 over all 179 records (WARN/BLOCK
+as the positive prediction, ALLOW as negative), \emph{not} the mean of the four rows above---see the
+macro-F1 discussion immediately below for that alternative statistic.
+\end{table}
+
+\emph{Aggregate F1 vs.\ macro-F1.} The headline 0.93 figure reported above and in the Abstract is a pooled,
+micro-averaged F1 across all 179 records treating WARN/BLOCK as the positive prediction---it is influenced by
+corpus size (the 50-record typosquat corpus, at perfect recall, and the 56-record malicious corpus outweigh
+the smaller 23-record hallucinated corpus). A category-balanced \emph{macro-F1}, computed as the unweighted
+mean of the three F1-bearing rows in Table~\ref{tab:detection} (malicious 0.88, typosquat 1.00, hallucinated
+0.88; benign is excluded per footnote b, since F1 is undefined for an all-negative corpus), is
+\textbf{0.92}---close to the pooled figure here, but the two statistics answer different questions and should
+not be conflated; we report both rather than picking whichever is larger.
+
+A methodological caveat on the perfect precision (1.00) and zero false-positive rate reported above: the
+benign corpus (Section~VIII-B) consists of the top-500 npm packages by download count---i.e., established,
+high-reputation packages that are, by construction, comfortably distant from every pillar's risk signals
+(recent, low-download, unfamiliar-to-the-project, or structurally similar to a known-bad pattern). A
+zero-FPR result on this specific corpus is evidence that CIDAS does not spuriously flag well-established,
+popular packages; it is not evidence of a zero false-positive rate on the long tail of low-download,
+new, or idiosyncratic-but-legitimate packages, which this corpus does not sample and which is a materially
+harder population for any reputation- or novelty-sensitive signal to avoid over-flagging.
+
+Two refinements to Sentinel's typosquat detection (Section~V-B) were made in direct response to this
+evaluation and are reflected in Table~\ref{tab:detection}'s typosquat row. To isolate their effect cleanly,
+we reran the typosquat corpus alone with both refinements disabled via their admin-config kill-switches
+(Section~V-B), holding every other part of the system---including the earlier WARN-floor aggregator
+fix---fixed: with affix canonicalization and reputation corroboration off, raw Levenshtein distance alone
+correctly escalated 40 of 50 records (recall 0.80, confusion matrix ALLOW=10/WARN=20/BLOCK=20), missing every
+prefix/suffix-mutation record in the corpus (the structural blind spot described in Section~V-B) and
+false-positively forcing a BLOCK-level score on legitimate, unrelated packages such as \texttt{vue}. With both
+refinements enabled (the production default), the same 50-record corpus reaches \textbf{recall 1.00}
+(confusion matrix ALLOW=0/WARN=30/BLOCK=20)---every affix squat that raw distance missed is now caught by
+affix canonicalization, and reputation corroboration confirms each hit without introducing a new false
+positive on this corpus. The benign corpus's false-positive rate over the same period fell from 0.15 (an
+earlier, less-refined measurement, prior to the WARN-floor and corroboration fixes) to the 0.02 reported in
+Table~\ref{tab:detection}---consistent with corroboration suppressing the short-name-coincidence class of
+false positive described in Section~V-B, rather than trading recall for precision.
+
+We note one earlier imprecision in reporting this comparison during development of this system: an
+intermediate measurement conflated the evaluation harness's \texttt{attack\_type}-keyed breakdown (which
+mixes a small number of \texttt{malicious.jsonl} records tagged \texttt{attack\_type: "typosquat"} into the
+same bucket as the 50-record typosquat corpus, inflating the denominator to 57) with the ground-truth-keyed
+corpus count used here. The corrected, single-corpus comparison above (0.80 $\rightarrow$ 1.00) supersedes
+that intermediate figure; we surface this explicitly rather than silently revising the number, consistent
+with this paper's broader practice of reporting evaluation-process corrections alongside results.
+
+Table~\ref{tab:detection}'s malicious row (recall 0.79) aggregates considerable sub-type variance, which
+Table~\ref{tab:malicious-subtypes} breaks out by \texttt{attack\_type}.
+
+\begin{table}[t]
+\caption{Malicious Sub-Type Breakdown\textsuperscript{a}}
+\label{tab:malicious-subtypes}
+\centering
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Attack Sub-Type} & \textbf{N} & \textbf{P} & \textbf{R} & \textbf{F1} \\
+\midrule
+Dependency hijack       & 1  & 1.00 & 1.00 & 1.00 \\
+Install-script execution & 2  & 1.00 & 1.00 & 1.00 \\
+Account takeover        & 20 & 1.00 & 1.00 & 1.00 \\
+Worm propagation\textsuperscript{b} & 6 & 1.00 & 1.00 & 1.00 \\
+CI/OIDC pipeline compromise\textsuperscript{b} & 5 & 1.00 & 1.00 & 1.00 \\
+Protestware             & 7  & 1.00 & 0.71 & 0.83 \\
+Credential theft        & 8  & 1.00 & 0.38 & 0.55 \\
+\bottomrule
+\end{tabular}
+\\[2pt]
+\raggedright\footnotesize\textsuperscript{a}These seven \texttt{attack\_type} values are safe to source from
+the harness's attack-type breakdown because each is exclusive to \texttt{malicious.jsonl} (unlike
+\texttt{typosquat}/\texttt{none}, discussed above). They cover 49 of the 56 malicious records; the remaining
+7 carry \texttt{attack\_type: "typosquat"} (hijacked-account releases published under a name resembling the
+original package) and are included in Table~\ref{tab:detection}'s aggregate malicious row but omitted here to
+avoid double-counting against the typosquat corpus.
+\textsuperscript{b}These two sub-types comprise the 11 of the 17 newly-added 2025--2026 incident records
+discussed in Section~\ref{sec:new-incidents} (the remaining 6---\texttt{chalk}, \texttt{debug}, two
+\texttt{axios} versions, and two \texttt{plain-crypto-js} versions---are tagged \texttt{account\_takeover}
+and included in that row above).
+\end{table}
+
+Credential theft is now the single lowest-recall sub-type. Protestware recall rose substantially (0.43
+$\rightarrow$ 0.71) in this pass for a specific, attributable reason described in
+Section~\ref{sec:new-incidents} (two of the seven protestware records, both pinned to a since-purged version,
+newly benefited from the same fix that resolves the 17-record finding below), not from a change to Shield's
+behavioral-pattern coverage. Credential theft's remaining gap, like the residual protestware misses
+(\texttt{peacenotwar}, \texttt{faker}), reflects packages whose distinguishing signal is behavioral (a
+lifecycle script that behaves destructively or exfiltrates credentials only under specific runtime
+conditions) rather than purely name- or static-pattern-based, and is discussed as a limitation in
+Section~IX-E; Shield's static/AST analysis and Sentinel's reputation checks are, by design, not expected to
+catch a behaviorally-triggered payload that carries no distinguishing static signature.
+
+\subsection{Malicious Corpus Extension: Real 2025--2026 Incidents}
+\label{sec:new-incidents}
+The 17-record malicious-corpus extension described in Section~VIII-B (Section~\ref{sec:new-incidents} is this
+section) was initially misclassified by every pillar (recall 0.00 on this subset in an earlier pass of this
+evaluation), and that failure was initially attributed to a structural blind spot: npm's security team
+purges a compromised release's version listing once a supply-chain incident is confirmed, and the
+cross-version capability diff (Section~V-C) was assumed to have no historical predecessor left to compare
+against. Direct investigation of this claim against the live registry showed it to be false. All 15 affected
+records had a perfectly valid, resolvable predecessor version sitting immediately adjacent to the purged one
+(e.g., \texttt{axios@1.14.1}'s predecessor \texttt{axios@1.14.0} was, and remains, fully resolvable). The
+actual root cause was two independent, previously undiagnosed bugs in the diff and version-resolution
+pipeline, both since fixed and documented as an architectural change in Section~V-C:
+
+\begin{enumerate}
+\item \texttt{get\_previous\_version}'s lookup required the requested (purged) version to itself appear in
+an already-resolvable-filtered version history before searching for its predecessor---since a purged version
+by definition never appears in that filtered list, the lookup returned no predecessor unconditionally,
+regardless of how much valid history existed adjacent to the gap.
+\item \texttt{Shield.score()} silently substituted \texttt{dist-tags.latest} whenever the requested version
+did not resolve, and proceeded to scan that unrelated, current, clean release---returning a normal-looking
+verdict with no indication that a substitution had occurred. Verified directly: requests for
+\texttt{axios@1.14.1}, \texttt{chalk@5.6.1}, \texttt{debug@4.4.2}, and \texttt{@ctrl/tinycolor@4.1.1} were
+each found to have actually scanned a newer, unrelated, clean tarball (\texttt{axios-1.18.1.tgz},
+\texttt{chalk-5.6.2.tgz}, \texttt{debug-4.4.3.tgz}, \texttt{tinycolor-4.2.0.tgz} respectively) rather than the
+malicious version pinned in the corpus record.
+\end{enumerate}
+
+With both bugs fixed, a further check established a genuine, narrower limitation that the original
+diagnosis had not identified: for all 15 affected records, the malicious tarball's raw bytes---not merely
+its listing in the registry's version metadata---return HTTP~404 when fetched directly from npm's CDN. npm's
+takedown process for a confirmed-malicious release deletes the artifact itself, not only its manifest entry.
+This means no genuine AST capability diff against the actual malicious payload is possible for any of these
+15 records, regardless of the two bugs above being fixed---a materially narrower and more precise limitation
+than ``purged packages cannot be diffed'' in general: it is specifically packages whose tarball bytes were
+deleted at the CDN level, which is npm's standard, permanent takedown behavior for confirmed-malicious
+releases, that cannot be diffed. Detection for these 15 records instead comes from a new, explicit Stage~1
+gate (Section~V-D): when Shield cannot resolve the requested version at all, it now returns
+\texttt{requested\_version\_unresolved} and the Aggregator floors the verdict at \texttt{warn\_threshold}
+(Section~V-C). This is an honest ``could not examine this artifact'' signal, not a working capability diff;
+the 17-record recall figure below reflects this gate, not a successful diff of the malicious content.
+
+Re-running the full corpus with both fixes applied yields \textbf{recall 1.0000 (17/17)} on the full extended
+subset (15 originally-diagnosed records plus 2 \texttt{plain-crypto-js} records, discussed below, which share
+the same version-unresolvable root cause). Applying the identical, general-purpose fix also recovered three
+records in the \emph{original} 39-record malicious corpus that had the same undiagnosed problem
+(\texttt{colors@1.4.1}, \texttt{colors@1.4.2}, and \texttt{eslint-config-eslint}, none of which are on the
+known-incident blocklist and so were not caught by that separate mechanism), raising the original-39 subset's
+recall from the previously-reported \textbf{0.62} to \textbf{0.6923 (27/39)}---a correction to a
+previously-published figure, not a new measurement on new data, and reported here explicitly per this
+paper's practice of surfacing evaluation-process corrections rather than silently revising them. We verified
+this recall improvement is not a side effect that regressed any other corpus: the typosquat, hallucinated,
+and benign confusion matrices are unchanged from the pre-fix run.
+
+A related, separately-diagnosed and separately-fixed issue surfaced during this same investigation:
+\texttt{plain-crypto-js} (both corpus versions) resolves via HTTP~200 to a tarball literally named following
+npm's \texttt{-security.N} placeholder-version convention---the standard signal that npm's security team has
+pulled a version and republished an inert stub in its place. Sentinel did not previously check for this
+convention and scored the placeholder as an ordinary low-reputation package (ALLOW). A new Stage~1 gate
+(Section~V-D) now detects this pattern directly against the resolved \texttt{dist-tags.latest} value (not the
+originally-requested version string, since npm frequently wipes the entire version history down to the
+single placeholder) and floors the verdict at \texttt{block\_threshold}. This is reported as a distinct
+finding from the \texttt{requested\_version\_unresolved} gate above, since it addresses a different failure
+mode (a resolvable-but-inert placeholder release, rather than an unresolvable one).
+
+A separate, unrelated bug was identified and fixed during this evaluation: two entirely legitimate, popular
+packages (\texttt{redux-thunk}, \texttt{nodemailer}) were observed force-BLOCKed with a
+\texttt{package\_not\_found} flag in an early run. The root cause was a transient registry network failure
+(timeout or dropped connection) being indistinguishable from a confirmed HTTP~404 in
+\texttt{check\_registry\_existence}. This is now structurally solved: the registry-metadata function's return
+type was changed from a binary exists/absent result to a tri-state \texttt{RegistryLookup} value
+(\texttt{EXISTS} / \texttt{CONFIRMED\_ABSENT} / \texttt{UNDETERMINED}), threaded through every call site that
+previously conflated the two. A confirmed-absent result now requires an actual HTTP~404; a timeout, a
+transport error after retries are exhausted, or any other non-404 HTTP status yields \texttt{UNDETERMINED}
+instead, which Sentinel routes to the existing fail-open path (a distinct, non-blocking
+\texttt{registry\_lookup\_undetermined} flag) rather than the \texttt{package\_not\_found} Stage~1 gate
+(Section~V-D). \texttt{check\_registry\_existence} additionally performs one confirmatory re-fetch,
+bypassing the cache, before accepting a \texttt{CONFIRMED\_ABSENT} result, subsuming the earlier
+cache-eviction stopgap. A related, independently discovered issue surfaced while validating this fix under
+live load: npm's downloads API rate-limits aggressively under sustained request volume, which was
+degrading reputation-corroboration accuracy during full-corpus runs. This was closed with two additions: a
+result cache for \texttt{get\_download\_count} (5-minute TTL, since the same small set of popular target
+packages is looked up repeatedly across a scan session) and a shared token-bucket rate limiter around every
+outbound registry call, pacing requests proactively rather than only retrying reactively after a
+429 response.
+
+\subsection{Scan Latency}
+Table~\ref{tab:latency} reports end-to-end per-package scan latency (shim call to verdict return), measured
+across live runs against the full corpus.
+
+\begin{table}[t]
+\caption{Per-Package Scan Latency Under Live Registry Conditions}
+\label{tab:latency}
+\centering
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Scenario} & \textbf{Median} & \textbf{P95} \\
+\midrule
+Cache hit (SQLite)                    & $<$50\,ms         & $<$50\,ms \\
+Cache miss, warm registry conditions  & 2.7\,s            & 6.4\,s \\
+Cache miss, cold cache, concurrency=4 & 19.7\,s           & 43.6\,s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The cache-hit path satisfies the sub-two-second design target (P5) comfortably; the cache-miss path,
+dominated by live registry round-trips and tarball downloads rather than daemon compute, does not, and its
+absolute value varies substantially with registry contention (a factor of roughly 7$\times$ was observed
+between the best- and worst-case runs in this evaluation, with no code change between them). Two latency
+root causes were identified and addressed during this evaluation:
+
+\begin{enumerate}
+\item \textbf{Redundant registry fetches.} A single scan of an existing package was independently
+re-fetching the same package's full registry document from up to five call sites with zero sharing between
+them, confirmed via daemon logs showing more than nine identical requests for one package within a single
+scan. The single-flight cache described in Section~VI-C reduced an initial, uncached measurement of 38.2\,s
+median (80.6\,s P95) to the cache-partially-warm figures in Table~\ref{tab:latency}.
+\item \textbf{Mandatory double-tarball diff.} Shield's cross-version diff (Section~V-C) downloads two full
+tarballs per scan of an existing package regardless of whether the update is behaviorally meaningful. The
+manifest-first gate described in Section~V-C skips this when the manifest is unchanged; a guard check
+confirmed this did not regress recall on the corpus's account-takeover (0.93) or protestware (0.71)
+categories, the two categories most dependent on the differential signal.
+\end{enumerate}
+
+\subsection{Ablation Study}
+\label{sec:ablation}
+We evaluated eight pillar-weight configurations: no pillars (baseline, $w_C{=}0/w_S{=}0/w_{Sh}{=}0$), each
+pillar in isolation, each pairwise combination, and the production configuration
+($w_C{=}0.30/w_S{=}0.35/w_{Sh}{=}0.35$). This design directly measures each pillar's standalone and
+pairwise contribution, rather than sweeping a single weight in isolation. Table~\ref{tab:ablation} reports
+results from a live run against the full corpus using the current system (i.e., reflecting the Section~V-B
+and V-C refinements).
+
+\begin{table}[t]
+\caption{Pillar-Weight Ablation (N = 179)}
+\label{tab:ablation}
+\centering
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Configuration} & \textbf{P} & \textbf{R} & \textbf{F1} & \textbf{FPR} \\
+\midrule
+No pillars              & 0.00 & 0.00 & 0.00 & 0.00 \\
+Contextify only         & 1.00 & 0.87 & 0.93 & 0.00 \\
+Sentinel only           & 1.00 & 0.87 & 0.93 & 0.00 \\
+Shield only             & 0.99 & 0.87 & 0.93 & 0.02 \\
+Contextify + Sentinel   & 1.00 & 0.87 & 0.93 & 0.00 \\
+Contextify + Shield     & 1.00 & 0.87 & 0.93 & 0.00 \\
+Sentinel + Shield       & 1.00 & 0.87 & 0.93 & 0.00 \\
+\textbf{All three (production)} & \textbf{1.00} & \textbf{0.87} & \textbf{0.93} & \textbf{0.00} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Six of the seven non-baseline configurations---including the production weighting---now score identically at
+four significant figures (P=1.0000, R=0.8682, F1=0.9295, FPR=0.0000); \emph{Shield only} is the sole
+measurably-different row (F1=0.9256, FPR=0.0200), a gap too small to register at the table's two-decimal
+precision but still real (Shield alone lacks Sentinel's typosquat and registry-absence Stage~1 gates). An
+earlier pass of this ablation had additionally shown \emph{All three} scoring measurably \emph{worse} than
+\emph{Sentinel only} (F1 0.83 vs.\ 0.84 at the time); that discrepancy was root-caused to a synchronization
+bug in this evaluation harness's own local reimplementation of the Aggregator's Stage~1 gates (\S\ref{sec:ablation}
+recomputes verdicts locally from stored pillar scores rather than calling the Aggregator directly, and its
+hand-copied gate list had not been updated with a newly added gate), not to a genuine weighting effect; fixing
+the harness's gate list to match the Aggregator resolved the discrepancy entirely, and it is not present in
+Table~\ref{tab:ablation} above. This is not a null result but a specific, actionable finding about the current
+aggregation design: five flag-driven Stage~1 conditions in the Aggregator (Section~V-D)---a corroborated
+typosquat, a registry-confirmed-absent package, a known supply-chain incident, an npm security-placeholder
+version, and an unresolvable-requested-version signal---fire independent of pillar weight and determine the
+verdict for the large majority of this corpus (all of the typosquat and hallucinated sub-corpora, and most of
+the malicious sub-corpus). Pillar-weight configuration is decisive only for the residual minority of records
+that trigger none of these conditions,
+consistent with Shield's absolute pattern-matching signal (independent of the other two pillars' flags) being
+the one axis along which a configuration change measurably moves the outcome. We therefore do not claim that
+the production weighting $(0.30/0.35/0.35)$ is uniquely optimal on this corpus---no configuration in
+Table~\ref{tab:ablation} is meaningfully worse on F1---but retain it as the production default because it keeps
+Contextify's semantic signal active for the residual population where weighting does matter, consistent with
+the original design rationale in Section~V-D.
+
+\subsection{Concept-Drift Monitor Validation}
+With per-pillar score persistence in place (Section~VI-E), a live health-check poll against real scan
+traffic from this evaluation correctly reported \texttt{status: "alert"} with a pillar-averaged KL divergence
+in the 1.7--2.8 range against the synthetic seed baseline---confirming the monitor is now genuinely
+operative against live data, a capability that was structurally absent in an earlier revision of the system
+(Section~VI-E). A quantitative validation against a controlled, synthetically-shifted distribution (matching
+the original design intent of injecting known-shifted scores and confirming both \texttt{alert} onset and
+\texttt{ok} recovery) is identified as a remaining verification step in Section~IX-F, since the corpus-driven
+traffic used here reflects a genuine distribution shift from the synthetic baseline rather than a controlled
+injection.
+
+\subsection{Test Suite Coverage}
+The 548-test suite achieves 95\% statement coverage on the daemon (2,262 statements, 118 missed) and 81\%
+on the VS Code extension (the untested \texttt{extension.ts} activation entry point contributes 0\% and pulls
+the average down; every other tested module measures 87--100\%). Table~\ref{tab:tests} summarizes suite
+composition.
+
+\begin{table}[t]
+\caption{Automated Test Suite Summary}
+\label{tab:tests}
+\centering
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Suite} & \textbf{Tests} & \textbf{Coverage} \\
+\midrule
+Daemon (pytest, 20 modules)        & 449 & 95\% \\
+VS Code extension (vitest, 5 modules) & 99  & 81\% \\
+\midrule
+\textbf{Total}                     & \textbf{548} & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Discussion}
+
+\subsection{Achievement of Design Principles}
+Pre-execution interception (P1) was confirmed by observing that no npm file download occurs before a BLOCK
+verdict is returned, and was explicitly weighed against latency when designing the manifest-first gate
+(Section~V-C), which was deliberately scoped to skip only the differential tarball fetch, never the primary
+scan of the version actually being installed. Fail-open semantics (P2) were validated by bringing the daemon
+offline and confirming that the shim consulted the offline cache and proceeded for known packages, issuing a
+logged bypass for unknown ones. Explainability (P3) was confirmed through per-pillar scores and specific flag
+codes in every WARN dialog and REST response, including the new \texttt{typosquat\_affix\_match} and
+\texttt{reputation\_disparity\_confirmed} flags. Privacy preservation (P4) is ensured architecturally: the
+daemon makes outbound calls only to the npm registry, OSV.dev, and HuggingFace (one-time model download).
+Low friction (P5) is met on the cache-hit path; Section~VIII-D documents that the cache-miss path does not
+meet it unconditionally, and characterizes the network-dependent reasons why.
+
+\subsection{Fail-Open vs.\ Security Trade-off}
+The fail-open philosophy introduces a deliberate tension with maximum enforcement. Our resolution---logging
+every bypass event to the tamper-evident audit log---preserves visibility without blocking developer
+workflows. This trade-off is appropriate for a developer-workstation tool; a complementary hard-fail CI gate
+would provide defense-in-depth. The manifest-first gate (Section~V-C) introduces a related, narrower
+trade-off deliberately accepted in this design: it exchanges a small amount of differential-detection
+coverage (a manifest-invisible capability change) for a substantial latency reduction on the common case,
+while leaving the absolute, non-differential detection signal fully intact regardless of gating.
+
+\subsection{False Positives and Corroboration}
+The dominant false-positive driver identified in this evaluation was not a reputation-threshold issue but a
+structural one: a single global edit-distance threshold cannot simultaneously catch affix squats and avoid
+short-name collisions (Section~V-B). Reputation corroboration resolved this by decoupling the two failure
+modes into independent, complementary signals rather than retuning the shared threshold, and is consistent
+with the observation (Section~VIII-C) that recall and the false-positive rate improved \emph{together}
+rather than trading off against each other---evidence that the two original failure modes were largely
+independent defects, not opposite ends of one dial.
+
+\subsection{Observations on Multi-Pillar Design}
+The combination of independent, complementary signals proved more robust than any single heuristic; this
+observation is consistent with findings on multi-signal aggregation in the malware detection
+literature~\cite{sejfia2022}. The ablation study (Section~VIII-E), however, surfaces a more specific finding:
+for this corpus, five flag-driven Stage~1 conditions in the Aggregator (Section~V-D) already determine the
+verdict for the large majority of records, and pillar-weight configuration is decisive only for the minority
+of packages that trigger none of them. This is the direct motivation for formalizing the two-stage Aggregator
+structure (Section~V-D) rather than treating it as an implementation detail: it makes explicit which part of
+the system decides most verdicts today, and gives future weighted or learned signals (Section~IX-F) a clean
+place to matter for the residual population without being diluted by conditions that already dominate.
+
+\subsection{Limitations}
+\begin{enumerate}
+\item \textbf{No field deployment.} Conclusions about long-term false-positive tolerance and developer
+adoption are based on a single labelled corpus and live-daemon evaluation, not longitudinal production data.
+\item \textbf{Dependency confusion is out of scope.} CIDAS's Sentinel pillar targets name-based
+typosquatting; it does not address dependency confusion (a public package registered under a name matching a
+private internal package), a distinct and empirically impactful attack class~\cite{birsan2021} that exploits
+resolver precedence rather than name similarity, and would require a different detection mechanism (private
+registry/namespace awareness) entirely.
+\item \textbf{Homoglyph/Unicode-confusable squatting is partially addressed, with a deliberately narrow
+scope.} Sentinel now normalizes a candidate name's Cyrillic and Greek confusable characters (e.g.\ a
+Cyrillic look-alike of the Latin letter ``a'' mapping to ``a'' itself) to their ASCII-skeleton equivalent
+before edit-distance and affix-canonicalization comparison, catching visually-identical substitutions in
+those two scripts specifically. This is an explicit, documented scope decision rather than full
+Unicode-confusable coverage: the mapping table is small and hand-curated (a first-pass covering the character
+blocks historically observed in registered-package-name attacks) rather than a complete import of the Unicode
+confusables data set, so other scripts (e.g.\ Armenian, Cherokee) remain unaddressed and are named as future
+work in Section~IX-F rather than silently uncovered.
+\item \textbf{Residual typosquat recall gap.} Reputation corroboration is intentionally conservative: a
+squat that has already accrued meaningful downloads or age before detection will not be corroborated as
+disparate, and is therefore not force-escalated by this signal alone (Section~VIII-C).
+\item \textbf{Static analysis evasion.} Novel or heavily obfuscated payloads may evade the Shield regex and
+tree-sitter pattern set; the rule set requires continuous expansion.
+\item \textbf{No capability diff is possible against a CDN-deleted malicious artifact.} For a package version
+that npm's security team has taken down, the artifact's raw tarball bytes---not merely its listing in the
+registry's version metadata---are permanently deleted from npm's CDN (Section~\ref{sec:new-incidents}). This
+is narrower than a general claim that ``purged packages cannot be diffed'': the version-resolution fixes in
+Section~V-C mean a resolvable predecessor \emph{can} now be located even past a purge, and the diff runs
+correctly whenever both endpoints' tarballs still exist. The limitation is specific to versions whose content
+has been deleted at the CDN level, which is npm's standard, permanent takedown behavior for confirmed-
+malicious releases; detection for such versions instead relies on the coarser
+\texttt{requested\_version\_unresolved} signal (Section~V-D), not a working capability diff of the actual
+malicious payload.
+\item \textbf{Drift-monitor baseline and thresholds.} The KL-divergence thresholds (0.15/0.30) and the
+synthetic seed baseline (Section~VI-E) were chosen heuristically without validation against longitudinal
+production history.
+\item \textbf{Optional LLM verifier.} The Ollama-based second-pass verifier was not included in the automated
+evaluation corpus runs in this pass, and its accuracy on ambiguous cases has not been independently
+benchmarked against a labelled adversarial-README corpus.
+\end{enumerate}
+
+(The collected-but-unused maintainer-count signal is a minor, easily-closed gap rather than a structural
+limitation; it is addressed once, as a future-work item, immediately below.)
+
+\subsection{Future Work}
+Priority future directions include: (i) a longitudinal field study across multiple development teams,
+including a real-traffic-derived concept-drift baseline to replace the synthetic seed described in
+Section~VI-E; (ii) expansion of the Shield rule set from newly discovered malicious packages, and expansion
+of Sentinel's confusable-character normalization (Section~IX-E) beyond its current Cyrillic/Greek scope to
+additional Unicode blocks observed in real homoglyph squats (e.g.\ Armenian, Cherokee); (iii) incorporation
+of the maintainer-count signal into Sentinel's risk score once a validated threshold is established; (iv)
+integration of the LLM verifier into the default scan path for high-ambiguity cases, with independent
+benchmarking against a labelled adversarial-README corpus; (v) a complementary hard-fail CI gate mode; (vi)
+exploring a learned classifier for Stage~2 of the Aggregator (Section~V-D)---combining affix-stripped distance,
+keyboard-adjacency-weighted distance, character n-gram similarity, length delta, and download-ratio as
+features---now that the two-stage structure gives such a signal a clean place to matter without being
+diluted by Stage~1's dominant flag-driven conditions; and (vii) a Stage-2-only variant of the ablation study
+in Section~VIII-E, invoking \texttt{Aggregator.\_stage2\_score} directly and bypassing
+\texttt{\_stage1\_gates} entirely, to isolate what weighted pillar scoring alone contributes on the subset of
+records that no Stage~1 condition would otherwise decide---the current ablation, by design, mainly measures
+how often Stage~1 fires rather than each pillar's standalone discriminative quality once it does not.
+
+\section{Conclusion}
+We presented CIDAS, a real-time, pre-install npm package screening system that addresses four distinct
+supply-chain threat classes---typosquatting, malicious install scripts, maintainer-account compromise, and
+LLM package hallucination---within a single, locally-run, fail-open security framework. CIDAS's four-pillar
+architecture (Contextify, Sentinel, Shield, Aggregator) combines semantic project-context awareness, registry
+reputation analysis, corroborated name-similarity detection, and AST-based static scanning into explainable,
+policy-aware ALLOW/WARN/BLOCK verdicts. Supporting subsystems including an HMAC-protected trust list, a
+two-tier cache, an append-only audit log now carrying genuine per-pillar score history, and a
+KL-divergence-based concept-drift monitor provide ongoing assurance and team-wide governance.
+
+Evaluated across 548 automated tests and a labelled 179-package corpus against a live daemon and live
+registry conditions, CIDAS achieves a pooled F1 of 0.93 (category-balanced macro-F1: 0.92), with sub-50\,ms
+latency on the cache-hit path and
+single-digit-second latency on the cache-miss path under typical registry conditions. A key finding of this
+evaluation is that three specific, previously undetected gaps---a structural blind spot in raw edit-distance
+typosquat detection, an avoidable double-tarball-download cost in cross-version diffing, and a pair of
+version-resolution bugs that silently misdiagnosed 15 real 2025--2026 supply-chain incidents as a structural
+diffing limitation when the true cause was fixable---accounted for a large share of the difference between
+the system's original design targets and its measured behavior; all three were root-caused against real
+evaluation data and closed with targeted, decoupled refinements (reputation-corroborated affix detection;
+manifest-first gating; semver-ordering-aware predecessor lookup and an explicit
+\texttt{requested\_version\_unresolved} Stage~1 gate) rather than parameter retuning, and all three are
+validated against the same live corpus used to discover them. The version-resolution investigation
+(Section~\ref{sec:new-incidents}) is also a caution against accepting a plausible-sounding root cause without
+directly verifying it: the original ``purge blocks diffing'' explanation was architecturally reasonable but
+false, and only direct inspection of the live registry (and of the tarball CDN itself) surfaced the real,
+narrower limitation. This experience reinforces a broader methodological point consistent with the
+multi-layer, shift-left supply-chain defense literature: a system's own evaluation infrastructure, run
+against real conditions rather than assumed ones, is often the most direct route to finding the gaps worth
+closing next---and to discovering that an assumed explanation for a gap can itself be wrong.
+
+\section*{Acknowledgment}
+The authors thank Dr. Vijayalakshmi M N (RVCE, Department of AIML) for guidance and the RVCE Experiential
+Learning programme for the opportunity to develop CIDAS as an SDG~9-aligned infrastructure project.
+
+\appendices
+
+\section{REST API Endpoint Reference}
+Table~\ref{tab:api} lists all nine CIDAS REST API endpoints.
+
+\begin{table}[h]
+\caption{CIDAS REST API Endpoints}
+\label{tab:api}
+\centering
+\begin{tabular}{@{}p{0.42\linewidth}p{0.38\linewidth}c@{}}
+\toprule
+\textbf{Endpoint} & \textbf{Description} & \textbf{Auth} \\
+\midrule
+GET /health              & Daemon status \& drift level      & None \\
+POST /scan                & Analyze a package                 & Bearer \\
+POST /trust                & Add a trust-list entry            & Bearer \\
+GET /trust/verify         & Audit all trust-list HMACs        & Bearer \\
+DELETE /cache              & Purge expired cache entries       & Bearer \\
+POST /cache/invalidate     & Force re-scan on next request     & Bearer \\
+GET /audit                & Query the audit log               & Bearer \\
+POST /audit/override       & Record a manual override          & Bearer \\
+GET /policy                & Return resolved policy file       & Bearer \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Policy Schema Reference}
+\begin{itemize}
+\item \texttt{block\_list} (array of strings): Package names always BLOCKED.
+\item \texttt{trust\_list} (array of strings): Package names that bypass all pillar analysis.
+\item \texttt{min\_monthly\_downloads} (integer, default 0): Reject packages below this download threshold.
+\item \texttt{require\_repository\_link} (boolean, default false): Require a repository field in
+\texttt{package.json}.
+\item \texttt{max\_sentinel\_distance} (integer, optional): Override the default Levenshtein typosquat
+distance threshold (default 2) for this project.
+\item \texttt{contextify\_weight} (float, 0.0--0.5, optional): Per-project override of the Contextify pillar
+weight; the remainder is split between Sentinel and Shield in their existing ratio.
+\item \texttt{warn\_requires\_confirmation} (boolean, default false): Force interactive confirmation for WARN
+verdicts; non-interactive contexts are treated as BLOCK.
+\end{itemize}
+
+\section{Admin Configuration Reference}
+The following per-machine flags (\texttt{\textasciitilde/.cidas/config.json}) govern optional or
+recently-added behavior; all default to \texttt{true} unless noted, and can be disabled without a code change:
+\begin{itemize}
+\item \texttt{bypass\_disabled} (boolean): When true, the npm shim refuses a bypass environment variable and
+exits with a nonzero code, for CI enforcement.
+\item \texttt{package\_file\_scan} (boolean, default true): When false, Shield skips downloading and
+extracting the package tarball for the primary file scan.
+\item \texttt{contextify\_weight} (float, 0.0--0.5): Per-machine override of the Contextify pillar weight.
+\item \texttt{shield\_manifest\_gating} (boolean, default true): Governs the manifest-first gate described in
+Section~V-C.
+\item \texttt{typosquat\_affix\_canonicalization} (boolean, default true): Governs affix-based typosquat
+detection described in Section~V-B.
+\item \texttt{typosquat\_reputation\_corroboration} (boolean, default true): Governs reputation-disparity
+corroboration described in Section~V-B.
+\end{itemize}
+
+\begin{thebibliography}{21}
+
+\bibitem{duan2021} R. Duan, O. Alrawi, R. P. Kasturi, R. Elder, B. Saltaformaggio, and W. Lee, ``Towards
+measuring supply chain attacks on package managers for interpreted languages,'' in \emph{Proc. 28th Annu.
+Netw. Distrib. Syst. Secur. Symp. (NDSS)}, San Diego, CA, USA, Feb. 2021.
+
+\bibitem{zimmermann2019} M. Zimmermann, C.-A. Staicu, C. Tenny, and M. Pradel, ``Small world with high
+risks: A study of security threats in the npm ecosystem,'' in \emph{Proc. 28th USENIX Secur. Symp.}, Santa
+Clara, CA, USA, Aug. 2019, pp. 995--1010.
+
+\bibitem{ohm2020} M. Ohm, H. Plate, A. Sykosch, and M. Meier, ``Backstabber's knife collection: A review of
+open source software supply chain attacks,'' in \emph{Proc. Detection Intrusions Malware, Vulnerability
+Assessment (DIMVA)}, ser. LNCS, vol. 12223, 2020, pp. 23--43.
+
+\bibitem{vu2020} D.-L. Vu, I. Pashchenko, F. Massacci, H. Plate, and A. Sabetta, ``Typosquatting and
+combosquatting attacks on the Python ecosystem,'' in \emph{Proc. IEEE Eur. Symp. Secur. Privacy Workshops
+(EuroS\&PW)}, Genoa, Italy, Sep. 2020, pp. 509--514.
+
+\bibitem{zapata2018} R. E. Zapata, R. G. Kula, B. Chinthanet, T. Ishio, K. Matsumoto, and A. Ihara,
+``Towards smoother library migrations: A look at vulnerable dependency migrations at function level for npm
+JavaScript packages,'' in \emph{Proc. IEEE Int. Conf. Softw. Maintenance Evol. (ICSME)}, Madrid, Spain, Sep.
+2018, pp. 559--563.
+
+\bibitem{zahan2022} N. Zahan, T. Zimmermann, P. Godefroid, B. Murphy, C. Maddila, and L. Williams, ``What
+are weak links in the npm supply chain?'' in \emph{Proc. IEEE/ACM 44th Int. Conf. Softw. Eng.: Softw. Eng.
+Practice (ICSE-SEIP)}, Pittsburgh, PA, USA, May 2022, pp. 331--340.
+
+\bibitem{vu2021} D.-L. Vu et al., ``On the feasibility of detecting software supply chain attacks,'' in
+\emph{Proc. IEEE Mil. Commun. Conf. (MILCOM)}, San Diego, CA, USA, Nov. 2021.
+
+\bibitem{reimers2019} N. Reimers and I. Gurevych, ``Sentence-BERT: Sentence embeddings using siamese
+BERT-networks,'' in \emph{Proc. 2019 Conf. Empirical Methods Nat. Lang. Process. (EMNLP-IJCNLP)}, Hong Kong,
+China, Nov. 2019, pp. 3982--3992.
+
+\bibitem{spracklen2025} J. Spracklen, R. Wijewickrama, A. H. M. N. Sakib, A. Maiti, B. Viswanath, and M.
+Jadliwala, ``We have a package for you! A comprehensive analysis of package hallucinations by code
+generating LLMs,'' in \emph{Proc. 34th USENIX Secur. Symp. (USENIX Security 25)}, Seattle, WA, USA, Aug.
+2025, pp. 3687--3706.
+
+\bibitem{greshake2023} K. Greshake, S. Abdelnabi, S. Mishra, C. Endres, T. Holz, and M. Fritz, ``Not what
+you've signed up for: Compromising real-world LLM-integrated applications with indirect prompt injection,''
+in \emph{Proc. 16th ACM Workshop Artif. Intell. Secur. (AISec '23)}, Copenhagen, Denmark, Nov. 2023, pp.
+79--90.
+
+\bibitem{latendresse2022} J. Latendresse et al., ``An empirical study of account takeovers in the npm
+supply chain,'' in \emph{Proc. IEEE/ACM Int. Conf. Mining Softw. Repositories (MSR)}, Pittsburgh, PA, USA,
+May 2022.
+
+\bibitem{ladisa2023} P. Ladisa, H. Plate, M. Martinez, and O. Barais, ``SoK: Taxonomy of attacks on
+open-source software supply chains,'' in \emph{Proc. 2023 IEEE Symp. Secur. Privacy (S\&P)}, San Francisco,
+CA, USA, May 2023, pp. 1509--1526.
+
+\bibitem{vu2023} D.-L. Vu, Z. Newman, and J. S. Meyers, ``Bad snakes: Understanding and improving Python
+package index malware scanning,'' in \emph{Proc. 45th IEEE/ACM Int. Conf. Softw. Eng. (ICSE)}, Melbourne,
+Australia, May 2023, pp. 499--511.
+
+\bibitem{feng2020} Z. Feng et al., ``CodeBERT: A pre-trained model for programming and natural languages,''
+in \emph{Findings ACL: EMNLP 2020}, Online, Nov. 2020, pp. 1536--1547.
+
+\bibitem{cappos2008} J. Cappos, J. Samuel, S. Baker, and J. H. Hartman, ``A look in the mirror: Attacks on
+package managers,'' in \emph{Proc. 15th ACM Conf. Comput. Commun. Secur. (CCS '08)}, Alexandria, VA, USA,
+Oct. 2008, pp. 565--574.
+
+\bibitem{sejfia2022} A. Sejfia and M. Sch\"{a}fer, ``Practical automated detection of malicious npm
+packages,'' in \emph{Proc. 44th IEEE/ACM Int. Conf. Softw. Eng. (ICSE '22)}, Pittsburgh, PA, USA, May 2022,
+pp. 1681--1692.
+
+\bibitem{ferreira2021} G. Ferreira, L. Jia, J. Sunshine, and C. K\"{a}stner, ``Containing malicious package
+updates in npm with a lightweight permission system,'' in \emph{Proc. 43rd IEEE/ACM Int. Conf. Softw. Eng.
+(ICSE)}, Madrid, Spain, May 2021, pp. 1334--1346.
+
+\bibitem{froh2023} F. N. Froh, M. F. Gobbi, and J. Kinder, ``Differential static analysis for detecting
+malicious updates to open source packages,'' in \emph{Proc. ACM Workshop Softw. Supply Chain Offensive Res.
+Ecosystem Defenses (SCORED '23)}, Copenhagen, Denmark, Nov. 2023, pp. 41--49.
+
+\bibitem{birsan2021} A. Birsan, ``Dependency Confusion: How I Hacked Into Apple, Microsoft and Dozens of
+Other Companies,'' \emph{Medium}, Feb. 9, 2021.
+
+\end{thebibliography}
+
+\end{document}
+
